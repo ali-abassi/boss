@@ -97,6 +97,20 @@ class HerdrTests(unittest.TestCase):
         finally:
             os.environ.clear(); os.environ.update(old)
 
+    def test_dead_agent_uses_checkpoint_fallback_instead_of_false_reconnect(self):
+        old = os.environ.copy(); os.environ.update(self.env)
+        try:
+            from helm import herdr
+            item = {"id": "p-dead", "project": "p", "session": None}
+            first = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
+            item["session"] = first
+            os.environ["FAKE_HERDR_AGENT_STATUS"] = "dead"
+            replacement = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
+            self.assertFalse(replacement["reconnected"])
+            self.assertNotEqual(replacement["agent_session_id"], first["agent_session_id"])
+        finally:
+            os.environ.clear(); os.environ.update(old)
+
     def test_ask_notifies_captain(self):
         self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
         self.helm("task", "p", "thing [fake:ask]")

@@ -4,7 +4,10 @@ A rule matches on kind (ship|scout), project id regex, and required labels.
 Nothing here asks a model anything.
 """
 from __future__ import annotations
+import os
 import re
+import shutil
+import subprocess
 from .paths import dispatch_file
 from .util import read_json, write_json, HelmError
 
@@ -58,17 +61,40 @@ def resolve(item: dict, project: dict) -> dict:
             continue
         graph = rule.get("graph") or (project["mode"] if item["kind"] == "ship" else "scout")
         level = (item.get("rigor") or {}).get("level")
-        known_scope = (item.get("scope") or {}).get("paths") not in (None, ["unknown"])
-        if item["kind"] == "ship" and not rule.get("graph") and (known_scope or "high-risk" in labels or "quick" in labels):
+        if item["kind"] == "ship" and not rule.get("graph"):
             if level == "high-risk": graph = "no-mistakes"
             elif level == "quick": graph = "local-only"
         models = {**cfg.get("models", {}), **rule.get("models", {}), **(item.get("model_overrides") or {})}
         thinking = {**cfg.get("thinking", {}), **rule.get("thinking", {}), **(item.get("thinking_overrides") or {})}
-        missing = [p for p in PHASES if p not in models]
+        missing = [p for p in PHASES if p not in models or p not in thinking]
         if missing:
-            raise HelmError(f"dispatch rule '{rule.get('name')}' leaves phases without a model: {missing}")
+            raise HelmError(f"dispatch rule '{rule.get('name')}' leaves phases without a model/thinking level: {missing}")
+        bad = {p: thinking[p] for p in PHASES if thinking[p] not in ("off", "minimal", "low", "medium", "high", "xhigh")}
+        if bad:
+            raise HelmError(f"invalid thinking levels: {bad}")
         override = sorted((item.get("model_overrides") or {}).keys())
         rationale = (f"captain override for {', '.join(override)}; " if override else "") + f"deterministic rule {rule.get('name', '?')}"
         return {"rule": rule.get("name", "?"), "graph": graph, "models": models, "thinking": thinking,
                 "rationale": rationale, "resolved": True}
     raise HelmError(f"no dispatch rule matches kind={item['kind']} labels={sorted(labels)}")
+
+
+def assert_available(decision: dict) -> None:
+    """Validate against an authoritative configured inventory when one is supplied."""
+    raw = os.environ.get("HELM_AVAILABLE_MODELS")
+    if raw is None and os.environ.get("HELM_PIW"):
+        return  # deterministic test runner supplies model evidence in its fixture
+    if raw is None:
+        if not shutil.which("pi"):
+            raise HelmError("cannot validate resolved models: pi is unavailable")
+        result = subprocess.run(["pi", "--list-models"], text=True, capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=30)
+        if result.returncode:
+            raise HelmError("cannot validate resolved models: `pi --list-models` failed")
+        available = {f"{parts[0]}/{parts[1]}" for line in result.stdout.splitlines()
+                     if len(parts := line.split()) >= 2}
+    else:
+        available = {m.strip() for m in raw.split(",") if m.strip()}
+    missing = sorted(set(decision.get("models", {}).values()) - available)
+    if missing:
+        raise HelmError("resolved model unavailable: " + ", ".join(missing) + "; refusing silent substitution")

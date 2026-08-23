@@ -8,7 +8,7 @@ helm setup [--import-login]        own Pi home + Codex login (pi-firstmate does 
 helm add PATH [--id ID] [--mode M] [--authority N] [--test CMD] [--protected GLOBS] [--base BRANCH]
 helm set ID [--mode M] [--authority N] [--test CMD]
 helm projects
-helm task PROJECT "request" [--kind ship|scout] [--scope GLOBS] [--model PROVIDER/MODEL] [--thinking high]
+helm task PROJECT "request" [--kind ship|scout] [--scope GLOBS] [--model PROVIDER/MODEL] [--thinking high] [--max-tokens N] [--max-cost N] [--max-seconds N]
 helm work [--all] · helm show ID · helm inspect ID · helm inbox [--hints]
 helm steer ID "guidance" · helm pause ID · helm resume ID · helm interrupt ID · helm recover ID
 helm away ID on|off · helm scope ID "src/api/**,tests/api/**"

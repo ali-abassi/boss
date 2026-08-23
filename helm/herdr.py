@@ -61,9 +61,40 @@ def _result(out: dict, key: str) -> dict:
     return value
 
 
+LIVE_STATES = {"idle", "done", "working", "blocked"}
+
+
 def agent_get(target: str) -> dict | None:
+    """Return only a positively live agent; a stale/dead/unknown record is not reconnectable."""
     out = _cli("agent", "get", target)
-    return _result(out, "agent") if out else None
+    if not out:
+        return None
+    agent = _result(out, "agent")
+    state = agent.get("agent_status") or agent.get("status") or agent.get("state")
+    if state not in LIVE_STATES or not agent.get("pane_id"):
+        return None
+    return agent
+
+
+def _reported_model(agent: dict) -> str | None:
+    model = agent.get("model") or (agent.get("metadata") or {}).get("model")
+    provider = agent.get("provider") or (agent.get("metadata") or {}).get("provider")
+    if model and "/" not in str(model) and provider:
+        return f"{provider}/{model}"
+    return str(model) if model else None
+
+
+def validate_agent(agent: dict, model: str, thinking: str) -> None:
+    """Fail closed when Herdr cannot attest the frozen model and thinking level."""
+    from .util import HelmError
+    actual_model = _reported_model(agent)
+    actual_thinking = agent.get("thinking") or agent.get("thinking_level") or (agent.get("metadata") or {}).get("thinking")
+    if actual_model is None or actual_thinking is None:
+        raise HelmError("Herdr agent omitted model/thinking metadata; refusing an unverifiable session")
+    if actual_model != model or str(actual_thinking) != thinking:
+        raise HelmError(f"agent drift: resolved {model} thinking={thinking}, got {actual_model} thinking={actual_thinking}")
+    if not agent.get("agent_session_id"):
+        raise HelmError("Herdr agent omitted its durable session identity")
 
 
 def agent_read(target: str, lines: int = 120) -> str:
@@ -87,7 +118,12 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
     if not reviewer and existing.get("agent_name"):
         live = agent_get(existing["agent_name"])
         if live:
-            return {**existing, **live, "reconnected": True}
+            validate_agent(live, model, thinking)
+            if existing.get("agent_session_id") and live.get("agent_session_id") != existing["agent_session_id"]:
+                from .util import HelmError
+                raise HelmError("Herdr agent name now refers to a different session; refusing identity drift")
+        if live:
+            return {**existing, **live, "reconnected": True, "liveness_validated_at": now()}
     import re
     base = re.sub(r"[^a-z0-9_-]", "-", item["id"].lower())[-24:].lstrip("-") or "item"
     name = (("review-" + secrets.token_hex(3)) if reviewer else "impl-" + base)[:32]
@@ -100,13 +136,23 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
     args = ["agent", "start", name, "--kind", "pi", "--pane", tab["pane_id"], "--timeout", "60000",
             "--", "--model", model, "--thinking", thinking]
     agent = _result(cli_required(*args), "agent")
-    # Persist only identities returned by Herdr. report-agent-session data, when present,
-    # is included by agent get; no locally generated session id is ever treated as one.
-    return {**tab, **agent, "agent_name": agent.get("name") or name, "created": now(), "reconnected": False}
+    try:
+        validate_agent(agent, model, thinking)
+    except BaseException:
+        close_tab(tab["tab_id"])
+        raise
+    # Persist only identities returned by Herdr; no locally generated id is treated as one.
+    return {**tab, **agent, "agent_name": agent.get("name") or name, "created": now(),
+            "reconnected": False, "liveness_validated_at": now(), "resolved_model": model,
+            "resolved_thinking": thinking}
 
 
 def prompt_agent(target: str, text: str, timeout: int) -> dict:
     return _result(cli_required("agent", "prompt", target, text, "--wait", "--timeout", str(timeout * 1000)), "agent")
+
+
+def wait_agent(target: str, timeout: int) -> dict:
+    return _result(cli_required("agent", "wait", target, "--timeout", str(timeout * 1000)), "agent")
 
 
 def prompt_agent_monitored(target: str, text: str, timeout: int, monitor) -> tuple[dict, object | None]:

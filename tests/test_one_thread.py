@@ -127,7 +127,7 @@ class OneThreadTest(unittest.TestCase):
         # 8. Every delegation is auditable: who ran it, which graph, which model, what it cost.
         for i in ids:
             it = by_id[i]
-            self.assertIn(it["dispatch"]["graph"], ("local-only", "scout"))
+            self.assertIn(it["dispatch"]["graph"], ("local-only", "no-mistakes", "scout"))
             self.assertTrue(it["dispatch"]["models"]["implement"])
             self.assertTrue((self.home / "work" / i / "steps.yaml").is_file())
             self.assertTrue(all(r["run_dir"] and Path(r["run_dir"]).is_dir() for r in it["runs"]))

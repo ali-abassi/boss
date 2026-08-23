@@ -1,11 +1,11 @@
-"""One disposable git worktree per attempt. Never touches the captain's checkout branch."""
+"""One persistent git worktree per item. Never touches the captain's checkout branch."""
 from __future__ import annotations
 import os
 import shutil
 import subprocess
 from pathlib import Path
 from .paths import worktree_root
-from .util import git, HelmError
+from .util import git, sh, now, HelmError
 
 
 def branch_name(work_id: str) -> str:
@@ -27,7 +27,9 @@ def create(project: dict, work_id: str) -> Path:
     if git(repo, "rev-parse", "--verify", "--quiet", base, check=False) == "":
         raise HelmError(f"base ref '{base}' not found in {repo}")
     br = branch_name(work_id)
-    git(repo, "branch", "-f", br, base)
+    if git(repo, "rev-parse", "--verify", "--quiet", br, check=False) == "":
+        git(repo, "branch", br, base)
+    git(repo, "worktree", "prune", check=False)
     git(repo, "worktree", "add", "--quiet", str(wt), br)
     link_deps(repo, wt)
     return wt
@@ -88,12 +90,53 @@ def remove(project: dict, work_id: str, delete_branch: bool = False) -> None:
         git(repo, "branch", "-D", branch_name(work_id), check=False)
 
 
+def integrate_latest(project: dict, wt: Path) -> dict:
+    """Rebase a clean item branch onto the latest configured base, without data loss."""
+    base_sha = git(project["path"], "rev-parse", project["base"])
+    before = git(wt, "rev-parse", "HEAD")
+    if status_paths(wt):
+        return {"at": now(), "base_sha": base_sha, "before_sha": before, "head_sha": before,
+                "deferred": True, "reason": "uncommitted checkpoint preserved"}
+    if sh(["git", "-C", str(wt), "merge-base", "--is-ancestor", base_sha, "HEAD"], check=False).returncode:
+        r = sh(["git", "-C", str(wt), "rebase", base_sha], check=False)
+        if r.returncode:
+            sh(["git", "-C", str(wt), "rebase", "--abort"], check=False)
+            raise HelmError(f"latest-base integration conflicted: {r.stderr.strip()[-500:]}")
+    return {"at": now(), "base_sha": base_sha, "before_sha": before, "head_sha": git(wt, "rev-parse", "HEAD"),
+            "deferred": False}
+
+
+def base_is_ancestor(project: dict, wt: Path) -> bool:
+    base_sha = git(project["path"], "rev-parse", project["base"])
+    return sh(["git", "-C", str(wt), "merge-base", "--is-ancestor", base_sha, "HEAD"], check=False).returncode == 0
+
+
+def status_paths(wt: Path, *, allow_ask: bool = False) -> list[str]:
+    """Return every tracked or untracked mutation, excluding only managed dependency links."""
+    out = []
+    for line in git(wt, "status", "--porcelain", "--untracked-files=all", "--ignored=matching", check=False).splitlines():
+        path = line[3:].split(" -> ")[-1]
+        if not path:
+            continue
+        top = path.split("/", 1)[0]
+        if top in DEP_DIRS and (wt / top).is_symlink():
+            continue
+        if allow_ask and path == ".helm-ask.json":
+            continue
+        out.append(path)
+    return sorted(set(out))
+
+
+def signature(wt: Path) -> dict:
+    return {"sha": git(wt, "rev-parse", "HEAD", check=False), "dirty": status_paths(wt)}
+
+
 def has_commits(project: dict, wt: Path) -> bool:
     return git(wt, "rev-list", "--count", f"{project['base']}..HEAD") not in ("", "0")
 
 
 def is_clean(wt: Path) -> bool:
-    return git(wt, "status", "--porcelain", "--untracked-files=no") == ""
+    return not status_paths(wt)
 
 
 def changed_files(project: dict, wt: Path) -> list[str]:

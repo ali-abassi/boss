@@ -116,9 +116,9 @@ Claude Code. That's the whole surface; the machinery underneath is in
 | **Delivery** per repo | a branch for you to merge (default) · a pull request · or the careful mode: plan, protected-path gate, two independent reviews, then a PR. You pick by saying so ("open PRs for api") |
 | **Authority** per repo | investigate only · build · open PRs · merge on your word. Starts at build; raised only when you ask |
 | **Models** | GPT-5.6 Sol with high thinking by default. Resolution, overrides, and rationale are pinned before execution; unavailable or drifted models fail instead of silently swapping |
-| **Retries** | a failed gate discards the worktree, keeps the evidence, retries up to 3 times |
+| **Retries** | failed, paused, interrupted, and blocked work keeps the same branch/worktree/checkpoint; unchanged repeated failures pause instead of retrying blindly |
 | **Questions** | a worker that needs a decision stops and asks; it does not guess |
-| **Evidence** | every task keeps its brief, exact graph, checkpoint, real session identity, exact-SHA reviews, tests, output, tokens and cost; inspection recursively redacts secrets |
+| **Evidence** | every task keeps its brief, exact graph, checkpoint, real session identity, exact-SHA reviews, tests, output, tokens and cost; inspection recursively redacts secrets. See [the control-plane architecture](docs/control-plane.md) |
 
 ## Status
 

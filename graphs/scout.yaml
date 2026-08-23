@@ -19,7 +19,7 @@ steps:
       full report as Markdown to {run}/report.md, then reply REPORT WRITTEN.
 
       {input}
-    gate: test -s "$RUN/report.md" && git -C "@{CWD}" status --porcelain --untracked-files=no | grep -q . && exit 1 || test -s "$RUN/report.md"
+    gate: test -s "$RUN/report.md" && test -z "$(git -C "@{CWD}" status --porcelain --untracked-files=all)"
     retries: 1
     retry_on: [model_error]
     timeout: @{TIMEOUT}

@@ -102,6 +102,49 @@ class HelmTests(unittest.TestCase):
         self.helm("retry", it["id"]); self.helm("run-once", mode="ok")
         self.assertEqual(self.show(it["id"])["status"], "ready")
 
+    def test_dirty_ship_and_mutating_scout_fail_without_losing_work(self):
+        self.add(mode="local-only")
+        dirty = self.task("leave an unreviewed file [fake:dirty]", **{"max-attempts": 1})
+        self.helm("run-once", check=False)
+        item = self.show(dirty["id"]); self.assertEqual(item["status"], "failed")
+        wt = self.home / "worktrees" / "p" / dirty["id"]
+        self.assertTrue((wt / "unreviewed.txt").exists(), "failed work must be preserved")
+        scout = self.task("inspect only [fake:scout-write]", kind="scout")
+        self.helm("run-once", check=False)
+        item = self.show(scout["id"]); self.assertNotEqual(item["status"], "done")
+        self.assertTrue((self.home / "worktrees" / "p" / scout["id"] / "scout-wrote.txt").exists())
+
+    def test_budget_threshold_pauses_and_preserves_checkpoint(self):
+        self.add(mode="local-only")
+        item = self.task("bounded work", **{"max-cost": 0.001})
+        self.helm("run-once")
+        item = self.show(item["id"])
+        self.assertEqual(item["status"], "paused"); self.assertIn("budget", item["ask"]["question"].lower())
+        self.assertTrue((self.home / "worktrees" / "p" / item["id"]).exists())
+
+    def test_uncommitted_mutation_invalidates_ready_promotion(self):
+        self.add(mode="local-only", authority=3)
+        item = self.task(); self.helm("run-once")
+        wt = self.home / "worktrees" / "p" / item["id"]
+        (wt / "after-review.txt").write_text("not reviewed")
+        r = self.helm("promote", item["id"], "--confirm", check=False)
+        self.assertNotEqual(r.returncode, 0); self.assertIn("mutated after verification", r.stderr)
+        self.helm("inspect", item["id"])
+        inspected = self.show(item["id"])
+        self.assertEqual(inspected["status"], "paused")
+
+    def test_later_commit_invalidates_exact_sha_reviews(self):
+        self.add(mode="local-only", authority=3)
+        item = self.task("change auth handling")
+        self.helm("run-once"); item = self.show(item["id"])
+        self.assertEqual(len(item["reviews"]), 2)
+        wt = self.home / "worktrees" / "p" / item["id"]
+        (wt / "later.txt").write_text("later")
+        subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "later"], check=True)
+        r = self.helm("promote", item["id"], "--confirm", check=False)
+        self.assertNotEqual(r.returncode, 0); self.assertIn("mutated after verification", r.stderr)
+
     def test_scout_writes_report_and_cleans_up(self):
         self.add(mode="no-mistakes", authority=0)
         it = self.task("why is login flaky?", kind="scout")
@@ -111,6 +154,17 @@ class HelmTests(unittest.TestCase):
         self.assertEqual(it["status"], "done")
         self.assertTrue((self.home / "work" / it["id"] / "report.md").exists())
         self.assertFalse((self.home / "worktrees" / "p" / it["id"]).exists())
+
+    def test_observed_sensitive_scope_escalates_and_reruns_stronger_graph(self):
+        self.add(mode="local-only")
+        item = self.task("update generated metadata [fake:sensitive]")
+        self.helm("run-once")
+        midway = self.show(item["id"])
+        self.assertEqual(midway["status"], "queued"); self.assertEqual(midway["rigor"]["level"], "high-risk")
+        self.helm("run-once")
+        item = self.show(item["id"])
+        self.assertEqual(item["status"], "ready"); self.assertEqual(item["dispatch"]["graph"], "no-mistakes")
+        self.assertEqual(len(item["reviews"]), 2)
 
     def test_dispatch_labels_pick_models_and_templates_render(self):
         self.add(mode="no-mistakes", authority=1)

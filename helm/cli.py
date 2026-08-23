@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from . import registry, dispatch, work, deliver, worktree, herdr, board, control, scope, __version__
 from .paths import home, projects_file, dispatch_file, GRAPHS
-from .util import HelmError, log
+from .util import HelmError, log, now
 
 
 def out(obj, as_json: bool, text: str | None = None):
@@ -293,16 +293,38 @@ def cmd_task(a):
     if not text.strip():
         raise HelmError("empty task")
     it = work.create(a.project, text, a.kind, a.labels.split(",") if a.labels else [], a.max_attempts,
-                     a.scope.split(",") if a.scope else None, a.model, a.thinking)
+                     a.scope.split(",") if a.scope else None, a.model, a.thinking,
+                     a.max_tokens, a.max_cost, a.max_seconds)
     out(it, a.json, f"{it['id']} queued → {it['rigor']['level']} rigor · graph {it['dispatch']['graph']} (rule {it['dispatch']['rule']})")
 
 
 def cmd_inspect(a):
     it = work.load(a.id)
+    project = registry.get(it["project"])
+    wt = worktree.worktree_root() / project["id"] / it["id"]
+    verified = ((it.get("verification") or [{}])[-1]).get("fingerprint")
+    if wt.exists() and verified and verified != worktree.signature(wt):
+        def invalidate(item):
+            for review in item.get("reviews", []):
+                review["valid"] = False; review["invalidated_at"] = now()
+            item["phase"] = "integrity-invalid"
+            if item["status"] in ("ready", "pr-open"):
+                item["status"] = "paused"
+                item["ask"] = {"question": "The reviewed worktree mutated. Recover and rerun verification?",
+                               "context": "Exact-SHA approval was invalidated."}
+        it = control.cas_update(a.id, invalidate)
     recent = ""
     session = it.get("session") or {}
     if session.get("agent_name") and herdr.inside():
         recent = herdr.agent_read(session["agent_name"], a.lines)
+    if not recent and it.get("runs"):
+        run_dir = Path(it["runs"][-1].get("run_dir") or "")
+        chunks = []
+        if run_dir.is_dir():
+            for path in sorted(p for p in run_dir.iterdir() if p.is_file() and p.suffix in (".md", ".txt", ".stdout", ".stderr", ".json"))[-6:]:
+                try: chunks.append(path.read_text()[-4000:])
+                except (OSError, UnicodeError): pass
+        recent = "\n".join(chunks)
     data = control.inspection(it, recent)
     out(data, a.json, json.dumps(data, indent=2))
 
@@ -312,7 +334,11 @@ def cmd_control(a):
     session = it.get("session") or {}
     target = session.get("agent_name")
     value = " ".join(getattr(a, "value", []) or [])
+    if a.action == "away" and value.lower() not in ("on", "off", "true", "false", "1", "0"):
+        raise HelmError("away requires on or off")
     it = control.request(a.id, a.action, value if a.action == "steer" else (value.lower() in ("on", "true", "1") if a.action == "away" else None))
+    event_id = (it.get("controls", {}).get("events") or [{}])[-1].get("id")
+    delivered = a.action not in ("steer", "pause", "interrupt")
     if a.action in ("steer", "pause", "interrupt") and target and herdr.inside():
         if a.action == "interrupt":
             herdr.interrupt_agent(target)
@@ -321,6 +347,7 @@ def cmd_control(a):
             herdr.steer_agent(target, "Cooperatively checkpoint current work, commit safe progress if appropriate, then pause for resume.")
         else:
             herdr.steer_agent(target, value)
+        delivered = True
     if a.action in ("pause", "interrupt"):
         def paused(x):
             x["controls"]["paused"] = True; x["phase"] = "paused"
@@ -332,6 +359,8 @@ def cmd_control(a):
             x["controls"]["paused"] = False; x["controls"]["recovery_requested"] = False
             if a.action == "recover": x["attempts"] = 0
         it = control.cas_update(a.id, resumed)
+    if delivered and event_id:
+        it = control.consume(a.id, [event_id])
     out(control.redact(it), a.json, f"{a.id}: {a.action} recorded")
 
 
@@ -524,6 +553,7 @@ def main(argv=None):
     p.add_argument("--labels", help="comma-separated dispatch labels, e.g. cheap,hard"); p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--scope", help="comma-separated declared path/glob claims; unknown serializes")
     p.add_argument("--model", help="captain override for implement/scout provider/model"); p.add_argument("--thinking", choices=("off","minimal","low","medium","high","xhigh"))
+    p.add_argument("--max-tokens", type=int); p.add_argument("--max-cost", type=float); p.add_argument("--max-seconds", type=int)
     p = S("work", cmd_work, "list work items"); p.add_argument("--all", action="store_true")
     p = S("show", cmd_show, "show one item with history"); p.add_argument("id")
     p = S("inspect", cmd_inspect, "secret-safe live item inspection"); p.add_argument("id"); p.add_argument("--lines", type=int, default=120)

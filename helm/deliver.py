@@ -9,12 +9,13 @@ def after_success(it: dict, project: dict, wt: Path) -> None:
     from .work import transition
     head = git(wt, "rev-parse", "HEAD")
     it["head_sha"] = head
-    # Herdr-backed reviewed modes require genuine fresh reviewer records bound to
-    # exactly the post-integration commit. Test/headless adapters never fabricate them.
-    if it.get("session") and it.get("dispatch", {}).get("graph") in ("direct-pr", "no-mistakes"):
+    if not worktree.is_clean(wt):
+        raise HelmError("delivery refused: worktree has uncommitted or untracked mutations")
+    # Every execution path requires genuine fresh reviewer evidence bound to the final SHA.
+    if it.get("dispatch", {}).get("graph") in ("direct-pr", "no-mistakes"):
         required = 2 if it["dispatch"]["graph"] == "no-mistakes" else 1
         reviews = it.get("reviews") or []
-        if len(reviews) < required or any(r.get("verdict") != "accept" or r.get("sha") != head or not r.get("reviewer") for r in reviews):
+        if len(reviews) != required or any(r.get("verdict") != "accept" or r.get("sha") != head or r.get("valid") is False or not r.get("reviewer") for r in reviews):
             raise HelmError("independent approval is missing or not bound to the exact delivery SHA")
     mode = project["mode"]
     has_origin = bool(git(project["path"], "remote", "get-url", "origin", check=False))
@@ -55,11 +56,16 @@ def promote(it: dict, project: dict, confirm: bool) -> str:
     repo = Path(project["path"])
     wt = worktree.worktree_root() / project["id"] / it["id"]
     if wt.exists():
+        if not worktree.is_clean(wt):
+            raise HelmError("worktree mutated after verification; approval is invalid")
         current = git(wt, "rev-parse", "HEAD")
         if it.get("head_sha") and current != it["head_sha"]:
             raise HelmError("branch mutated after verification; approval is invalid")
-        if it.get("reviews") and any(r.get("sha") != current for r in it["reviews"]):
+        if it.get("reviews") and any(r.get("sha") != current or r.get("verdict") != "accept" for r in it["reviews"]):
             raise HelmError("review approval is not bound to the current commit SHA")
+        verified = ((it.get("verification") or [{}])[-1]).get("fingerprint")
+        if verified and verified != worktree.signature(wt):
+            raise HelmError("worktree fingerprint changed after verification; approval is invalid")
         base_now = git(repo, "rev-parse", project["base"])
         reviewed_base = ((it.get("verification") or [{}])[-1]).get("base_sha")
         if reviewed_base and reviewed_base != base_now:
@@ -75,7 +81,7 @@ def promote(it: dict, project: dict, confirm: bool) -> str:
             herdr.close_agent_tab(it["session"])
         return it["pr_url"]
     # local fast-forward into the captain's checkout: only when it is clean and on base.
-    if git(repo, "status", "--porcelain", "--untracked-files=no"):
+    if git(repo, "status", "--porcelain", "--untracked-files=all"):
         raise HelmError(f"{repo} has uncommitted changes; commit or stash them first")
     current = git(repo, "symbolic-ref", "--short", "HEAD", check=False)
     if current != project["base"]:

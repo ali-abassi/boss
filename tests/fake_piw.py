@@ -23,12 +23,12 @@ brief = Path(argv[argv.index("--input-file") + 1]).read_text()
 (run_dir / "input.txt").write_text(brief)
 mode = os.environ.get("FAKE_PIW_MODE", "ok")
 # Per-item behaviour can be requested from inside the brief, so one daemon can serve a mixed queue.
-for marker in ("ask", "fail", "ok"):
+for marker in ("ask", "fail", "dirty", "sensitive", "scout-write", "ok"):
     if f"[fake:{marker}]" in brief:
         mode = marker
 if mode == "ask" and "Captain guidance" in brief:
     mode = "ok"          # the question was answered; a real worker would proceed too
-if "workflow: helm-scout" in text:
+if "workflow: helm-scout" in text and mode != "scout-write":
     mode = "scout"
 (run_dir / "mode.txt").write_text(mode)
 # Evidence for concurrency assertions: when this "worker" started and finished, and where.
@@ -49,11 +49,19 @@ if mode == "ask":
 if mode == "fail":
     (run_dir / "verify.stderr").write_text("FAIL test_thing: expected 2 got 3")
     done(False, ["verify"])
-if mode == "scout":
+if mode in ("scout", "scout-write"):
     (run_dir / "report.md").write_text("# Report\n\nfindings…\n")
+    if mode == "scout-write": Path(cwd, "scout-wrote.txt").write_text("forbidden\n")
     done(True, [])
+# The stand-in emits actual reviewer-node evidence; the control plane never invents verdicts.
+if "review_correctness" in text:
+    (run_dir / "review_correctness.json").write_text(json.dumps({"verdict": "accept", "notes": "fake reviewer evidence"}))
+if "review_adversarial" in text:
+    (run_dir / "review_adversarial.json").write_text(json.dumps({"verdict": "accept", "notes": "fake reviewer evidence"}))
 # ok: make a commit in the worktree, honouring guidance if present
 Path(cwd, "helm-change.txt").write_text("changed\n" + ("guided\n" if "Captain guidance" in brief else ""))
+if mode == "sensitive": Path(cwd, "package-lock.json").write_text(json.dumps({"generated": time.time()}))
 subprocess.run(["git", "-C", cwd, "add", "-A"], check=True)
 subprocess.run(["git", "-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "helm: fake change"], check=True)
+if mode == "dirty": Path(cwd, "unreviewed.txt").write_text("must not deliver\n")
 done(True, [])

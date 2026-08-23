@@ -13,9 +13,10 @@ if args[:2] == ["tab", "create"]:
 elif args[:2] == ["agent", "start"]:
     name, pane = args[2], args[args.index("--pane") + 1]
     model = args[args.index("--model") + 1] if "--model" in args else None
+    thinking = args[args.index("--thinking") + 1] if "--thinking" in args else None
     print(json.dumps({"result": {"agent": {"name": name, "pane_id": pane, "tab_id": pane.replace(":p", ":t"),
                                                 "workspace_id": "w1", "agent_status": "idle",
-                                                "agent_session_id": f"real-{name}", "model": model}}}))
+                                                "agent_session_id": f"real-{name}-{pane}", "model": model, "thinking": thinking}}}))
 elif args[:2] == ["agent", "get"]:
     target = args[2]; starts = []
     for line in open(os.environ["FAKE_HERDR_LOG"]):
@@ -24,12 +25,22 @@ elif args[:2] == ["agent", "get"]:
     if not starts: sys.exit(1)
     call = starts[-1]; pane = call[call.index("--pane") + 1]
     model = call[call.index("--model") + 1] if "--model" in call else None
+    thinking = call[call.index("--thinking") + 1] if "--thinking" in call else None
+    status = os.environ.get("FAKE_HERDR_AGENT_STATUS", "idle")
     print(json.dumps({"result": {"agent": {"name": target, "pane_id": pane, "tab_id": pane.replace(":p", ":t"),
-                                                "workspace_id": "w1", "agent_status": "idle",
-                                                "agent_session_id": f"real-{target}", "model": model}}}))
-elif args[:2] == ["agent", "prompt"]:
+                                                "workspace_id": "w1", "agent_status": status,
+                                                "agent_session_id": f"real-{target}-{pane}", "model": model, "thinking": thinking}}}))
+elif args[:2] in (["agent", "prompt"], ["agent", "wait"]):
+    starts = []
+    for line in open(os.environ["FAKE_HERDR_LOG"]):
+        call = json.loads(line)
+        if call[:3] == ["agent", "start", args[2]]: starts.append(call)
+    call = starts[-1] if starts else []
+    model = call[call.index("--model") + 1] if "--model" in call else None
+    thinking = call[call.index("--thinking") + 1] if "--thinking" in call else None
     print(json.dumps({"result": {"agent": {"name": args[2], "pane_id": "w1:p-agent", "workspace_id": "w1",
-                                                "agent_status": "idle"}}}))
+                                                "agent_status": "idle", "agent_session_id": f"real-{args[2]}-w1:p-agent",
+                                                "model": model, "thinking": thinking}}}))
 elif args[:2] == ["workspace", "list"]:
     print(json.dumps({"result": {"workspaces": [{"workspace_id": "w1", "label": "First Mate"}]}}))
 elif args[:2] == ["tab", "list"]:
