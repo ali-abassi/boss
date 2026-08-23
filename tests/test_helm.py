@@ -179,6 +179,13 @@ class HelmTests(unittest.TestCase):
         files = subprocess.run(["git", "-C", str(wt), "diff", "--name-only", "main...HEAD"], capture_output=True, text=True).stdout
         self.assertNotIn("node_modules", files); self.assertNotIn(".venv", files)
 
+    def test_pr_mode_without_origin_leaves_a_branch_instead_of_crashing(self):
+        self.add(mode="no-mistakes", authority=3)
+        it = self.task(); self.helm("run-once")
+        it = self.show(it["id"])
+        self.assertEqual(it["status"], "ready")
+        self.assertIn("no origin remote", it["history"][-1]["note"])
+
 
 if __name__ == "__main__":
     unittest.main()

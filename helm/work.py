@@ -133,7 +133,8 @@ def _execute(it: dict, timeout: int) -> dict:
     wt = worktree.create(project, it["id"])
     brief = d / "brief.md"
     brief.write_text(brief_text(it, project))
-    dp = it["dispatch"]
+    dp = dispatch.resolve(it, project)      # fresh each attempt so rule/model changes apply; recorded for audit
+    it["dispatch"] = dp
     steps = graphs.render(dp["graph"], d, cwd=wt, branch=it["branch"], project=project,
                           models=dp["models"], thinking=dp["thinking"], timeout=timeout)
     graphs.validate(steps)

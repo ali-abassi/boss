@@ -42,8 +42,8 @@ class DispatchTests(Isolated):
                                      "rules": [{"name": "only-web", "project": "web-.*"}]})
         with self.assertRaises(SystemExit):                                # no rule for api
             dispatch.resolve({"kind": "ship", "labels": []}, {"id": "api", "mode": "local-only"})
-        with self.assertRaises(SystemExit):                                # rule matches but phases lack models
-            dispatch.resolve({"kind": "ship", "labels": []}, {"id": "web-1", "mode": "local-only"})
+        d = dispatch.resolve({"kind": "ship", "labels": []}, {"id": "web-1", "mode": "local-only"})
+        self.assertTrue(all(d["models"].values()), "missing phases inherit shipped defaults")
 
 
 class RenderTests(Isolated):

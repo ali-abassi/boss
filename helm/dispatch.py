@@ -38,7 +38,10 @@ def load() -> dict:
     data = read_json(dispatch_file())
     if data is None:
         write_json(dispatch_file(), DEFAULT)
-        data = DEFAULT
+        return DEFAULT
+    # An older file keeps its choices but inherits defaults for phases it never mentions.
+    data["models"] = {**DEFAULT["models"], **(data.get("models") or {})}
+    data["thinking"] = {**DEFAULT["thinking"], **(data.get("thinking") or {})}
     return data
 
 

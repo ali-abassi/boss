@@ -8,9 +8,12 @@ from .util import git, sh, HelmError, log
 def after_success(it: dict, project: dict, wt: Path) -> None:
     from .work import transition
     mode = project["mode"]
-    if mode == "local-only" or project["authority"] < 2:
+    has_origin = bool(git(project["path"], "remote", "get-url", "origin", check=False))
+    if mode == "local-only" or project["authority"] < 2 or not has_origin:
         note = f"branch {it['branch']} ready in {wt}"
-        if mode != "local-only":
+        if mode != "local-only" and project["authority"] >= 2 and not has_origin:
+            note += " (no origin remote: PR not possible)"
+        elif mode != "local-only" and project["authority"] < 2:
             note += " (authority < 2: PR not opened)"
         transition(it, "ready", note)
         return
