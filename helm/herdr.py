@@ -342,6 +342,15 @@ def _verify_runtime_attestation(agent: dict, model: str, thinking: str, *,
         raise HelmError("Pi runtime attestation contains invalid process/session paths")
     if pid <= 0 or session_file.parent != session_dir or not session_file.name.endswith(f"_{data['session_id']}.jsonl"):
         raise HelmError("Pi runtime attestation contains an escaped or invalid session file")
+    process_identity = data.get("process_identity")
+    if (not isinstance(process_identity, dict) or process_identity.get("pid") != pid
+            or process_identity.get("owner") != data.get("session_id")):
+        raise HelmError("Pi runtime attestation has no exact process-birth identity")
+    from . import processes
+    process_evidence = processes.probe(process_identity, expected_kind=processes.PI_AGENT_KIND)
+    if process_evidence.get("state") != "live":
+        raise HelmError("Pi runtime process identity is not live: " +
+                        str(process_evidence.get("reason") or process_evidence.get("state")))
     events_path = Path(str(data.get("events_file"))).resolve()
     expected_events = Path(str(agent.get("agent_events_path"))).resolve()
     if events_path != expected_events or events_path.parent != path.parent or events_path.is_symlink() or not events_path.is_file():
@@ -360,7 +369,13 @@ def _verify_runtime_attestation(agent: dict, model: str, thinking: str, *,
     else:
         info = process_info
     foreground = info.get("foreground_processes") or []
-    if pid not in {entry.get("pid") for entry in foreground}:
+    foreground_pids = set()
+    for entry in foreground:
+        try:
+            foreground_pids.add(int(entry.get("pid")))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if pid not in foreground_pids:
         raise HelmError("Pi runtime attestation PID is not the live Herdr pane process")
     digest = hashlib.sha256(raw).hexdigest()
     if agent.get("attestation_sha256") and agent["attestation_sha256"] != digest:
@@ -417,6 +432,10 @@ def exact_agent_liveness(identity: dict, evidence: dict | None = None, *,
                                               process_info=process_info)
         if not runtime:
             raise HelmError("durable Pi runtime attestation is missing")
+        pinned_process = identity.get("attested_process_identity")
+        if (not isinstance(pinned_process, dict)
+                or runtime.get("process_identity") != pinned_process):
+            raise HelmError("durable Pi process-birth identity is missing or changed")
         session = session_evidence(candidate)
         if (session.get("agent_session_id") is not None
                 and str(session["agent_session_id"]) != str(durable_session)):
@@ -765,6 +784,7 @@ def _finalize_launch(item: dict, launch_id: str, session: dict, *, reviewer: boo
                       pane_id=session.get("pane_id"), workspace_id=session.get("workspace_id"),
                       attestation_sha256=session.get("attestation_sha256"),
                       attested_pid=session.get("attested_pid"),
+                      attested_process_identity=session.get("attested_process_identity"),
                       agent_session_path=session.get("agent_session_path"),
                       agent_events_path=session.get("agent_events_path"),
                       agent_events_inode=session.get("agent_events_inode"),
@@ -848,6 +868,7 @@ def _reconnect_reserved_launch(item: dict, launch: dict, model: str, thinking: s
         raise HelmError("reserved live Pi agent emitted no runtime attestation")
     agent.update(agent_session_path=runtime["session_file"], model=runtime["model"], thinking=runtime["thinking"],
                  attested_pid=runtime["pid"], attestation_sha256=runtime["sha256"],
+                 attested_process_identity=runtime["process_identity"],
                  runtime_attested_at=runtime["attested_at"], reconnected=True,
                  liveness_validated_at=now(), resolved_model=model, resolved_thinking=thinking,
                  work_id=item.get("id"), launch_id=launch.get("launch_id"))
@@ -1029,6 +1050,7 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
             raise HelmError("Pi emitted no runtime attestation")
         agent.update(agent_session_path=runtime["session_file"], model=runtime["model"],
                      thinking=runtime["thinking"], attested_pid=runtime["pid"],
+                     attested_process_identity=runtime["process_identity"],
                      attestation_sha256=runtime["sha256"], runtime_attested_at=runtime["attested_at"],
                      sandbox_verified=True, event_public_key=runtime["event_public_key"],
                      event_public_key_sha256=runtime["event_public_key_sha256"])

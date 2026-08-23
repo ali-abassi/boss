@@ -26,6 +26,7 @@ OPEN = ("queued", "running", "paused", "needs-you", "ready", "pr-open")
 MAX_REVIEW_DIFF_BYTES = 200_000
 MODEL_BUDGET_NODES = ("implement", "scout", "review_correctness", "review_adversarial")
 BUDGET_NODES = (*MODEL_BUDGET_NODES, "verify")
+MAX_BUDGET_RECEIPTS = 10_000
 
 
 def valid_budget_value(value) -> bool:
@@ -65,13 +66,166 @@ def validate_node_budgets(value: dict | None) -> dict:
             raise HelmError(f"node budget '{node}' has unknown fields: {', '.join(sorted(unknown))}")
         limits = {key: raw.get(key) for key in ("tokens", "cost", "seconds")}
         for key, limit in limits.items():
-            if limit is not None and not valid_budget_value(limit):
+            if (limit is not None and (not valid_budget_value(limit)
+                                       or key == "tokens" and not float(limit).is_integer())):
                 raise HelmError(f"{node} {key} budget must be positive")
         if node == "verify" and any(limits[key] is not None for key in ("tokens", "cost")):
             raise HelmError("verify is a non-model node; only its seconds budget is meaningful")
         if any(limit is not None for limit in limits.values()):
             normalized[node] = limits
     return normalized
+
+
+def budget_state_error(it: object) -> str | None:
+    """Validate the complete persisted budget contract without mutating it.
+
+    This is the single authority used by item loading, CAS writes, the runtime
+    pre-turn gate, and doctor.  A malformed number or evidence flag must never
+    reach a comparison where NaN/None could turn a safety check into False.
+    """
+    if not isinstance(it, dict):
+        return "item budget state is not an object"
+    historical = bool(it.get("attempts") or it.get("runs") or it.get("session")
+                      or it.get("agent_launches"))
+
+    raw_budgets = it.get("budgets", {})
+    if raw_budgets is None:
+        raw_budgets = {}
+    if not isinstance(raw_budgets, dict) or set(raw_budgets) - {"tokens", "cost", "seconds"}:
+        return "item budgets are malformed"
+    budgets = {key: raw_budgets.get(key) for key in ("tokens", "cost", "seconds")}
+    for key, limit in budgets.items():
+        if (limit is not None and (not valid_budget_value(limit)
+                                   or key == "tokens" and not float(limit).is_integer())):
+            return f"item budget {key} is malformed"
+
+    raw_usage = it.get("usage", {})
+    if raw_usage is None:
+        raw_usage = {}
+    if not isinstance(raw_usage, dict):
+        return "item usage is malformed"
+    for key in ("tokens", "cost", "seconds", "implementer_tokens", "implementer_cost",
+                "reviewer_tokens", "reviewer_cost"):
+        if key in raw_usage and not _valid_usage_value("tokens" if key.endswith("tokens") else
+                                                       "cost" if key.endswith("cost") else key,
+                                                       raw_usage[key]):
+            return f"item usage {key} is malformed"
+    for key in ("tokens", "cost"):
+        flag = f"{key}_evidence_complete"
+        complete = raw_usage.get(flag)
+        if flag in raw_usage and not isinstance(complete, bool):
+            return f"item usage {key}_evidence_complete is malformed"
+
+    seconds_receipts = raw_usage.get("seconds_receipts", {})
+    if (not isinstance(seconds_receipts, dict) or len(seconds_receipts) > MAX_BUDGET_RECEIPTS
+            or any(not isinstance(receipt_id, str) or not receipt_id
+                   or not _valid_usage_value("seconds", measured)
+                   for receipt_id, measured in seconds_receipts.items())):
+        return "item usage seconds receipts are malformed"
+
+    receipts = raw_usage.get("receipts", {})
+    if (not isinstance(receipts, dict) or len(receipts) > MAX_BUDGET_RECEIPTS
+            or any(not isinstance(session_id, str) or not session_id or len(session_id) > 256
+                   or not isinstance(receipt, dict)
+                   for session_id, receipt in receipts.items())):
+        return "item usage receipts are malformed"
+    for session_id, receipt in receipts.items():
+        if receipt.get("role") not in {"implementer", "reviewer", "legacy"}:
+            return f"item usage receipt {session_id} role is malformed"
+        for key in ("tokens", "cost"):
+            measured = receipt.get(key)
+            if measured is not None and not _valid_usage_value(key, measured):
+                return f"item usage receipt {session_id} {key} is malformed"
+            available = receipt.get(f"{key}_available")
+            if available is not None and not isinstance(available, bool):
+                return f"item usage receipt {session_id} {key} availability is malformed"
+            if available is True and measured is None:
+                return f"item usage receipt {session_id} {key} is missing"
+    if receipts:
+        implementers = [receipt for receipt in receipts.values() if receipt.get("role") == "implementer"]
+        reviewers = [receipt for receipt in receipts.values() if receipt.get("role") == "reviewer"]
+        legacy = [receipt for receipt in receipts.values() if receipt.get("role") == "legacy"]
+        derived = {
+            "implementer_tokens": sum(int(receipt.get("tokens") or 0) for receipt in implementers),
+            "implementer_cost": sum(float(receipt.get("cost") or 0.0) for receipt in implementers),
+            "reviewer_tokens": sum(int(receipt.get("tokens") or 0) for receipt in reviewers),
+            "reviewer_cost": sum(float(receipt.get("cost") or 0.0) for receipt in reviewers),
+        }
+        derived["tokens"] = (derived["implementer_tokens"] + derived["reviewer_tokens"]
+                             + sum(int(receipt.get("tokens") or 0) for receipt in legacy))
+        derived["cost"] = (derived["implementer_cost"] + derived["reviewer_cost"]
+                           + sum(float(receipt.get("cost") or 0.0) for receipt in legacy))
+        for key, expected in derived.items():
+            actual = raw_usage.get(key, 0)
+            agrees = (actual == expected if key.endswith("tokens")
+                      else math.isclose(float(actual), float(expected), rel_tol=1e-12, abs_tol=1e-12))
+            if not agrees:
+                return f"item usage receipt totals disagree on {key}"
+        for key in ("tokens", "cost"):
+            derived_complete = all(receipt.get(f"{key}_available") is True
+                                   for receipt in receipts.values())
+            if raw_usage.get(f"{key}_evidence_complete") is not derived_complete:
+                return f"item usage receipt evidence disagrees on {key}"
+
+    try:
+        node_budgets = validate_node_budgets(it.get("node_budgets"))
+    except HelmError as exc:
+        return f"item node budgets are malformed: {exc.msg}"
+    raw_node_usage = it.get("node_usage", {})
+    if raw_node_usage is None:
+        raw_node_usage = {}
+    if (not isinstance(raw_node_usage, dict) or len(raw_node_usage) > len(BUDGET_NODES)
+            or set(raw_node_usage) - set(BUDGET_NODES)):
+        return "item node usage contains an unknown or malformed runtime node"
+    for node, usage in raw_node_usage.items():
+        if not isinstance(usage, dict):
+            return f"item node usage {node} is malformed"
+        for key in ("tokens", "cost", "seconds"):
+            if key in usage and not _valid_usage_value(key, usage[key]):
+                return f"item node usage {node}.{key} is malformed"
+        node_receipts = usage.get("receipts", {})
+        if (not isinstance(node_receipts, dict) or len(node_receipts) > MAX_BUDGET_RECEIPTS
+                or any(not isinstance(session_id, str) or not session_id or len(session_id) > 256
+                       or not isinstance(receipt, dict)
+                       for session_id, receipt in node_receipts.items())):
+            return f"item node usage {node} receipts are malformed"
+        for session_id, receipt in node_receipts.items():
+            for key in ("tokens", "cost"):
+                measured = receipt.get(key)
+                if measured is not None and not _valid_usage_value(key, measured):
+                    return f"item node usage {node} receipt {key} is malformed"
+                available = receipt.get(f"{key}_available")
+                if available is not None and not isinstance(available, bool):
+                    return f"item node usage {node} receipt {key} availability is malformed"
+                if available is True and measured is None:
+                    return f"item node usage {node} receipt {key} is missing"
+        if node_receipts:
+            receipt_tokens = sum(int(receipt.get("tokens") or 0) for receipt in node_receipts.values())
+            receipt_cost = sum(float(receipt.get("cost") or 0.0) for receipt in node_receipts.values())
+            if (usage.get("tokens", 0) != receipt_tokens
+                    or not math.isclose(float(usage.get("cost", 0.0)), receipt_cost,
+                                        rel_tol=1e-12, abs_tol=1e-12)):
+                return f"item node usage {node} receipt totals disagree"
+        for key in ("tokens", "cost", "seconds"):
+            flag = f"{key}_evidence_complete"
+            complete = usage.get(flag)
+            if flag in usage and not isinstance(complete, bool):
+                return f"item node usage {node}.{key}_evidence_complete is malformed"
+        for key in ("tokens", "cost"):
+            if node_receipts and usage.get(f"{key}_evidence_complete") is True \
+                    and not all(receipt.get(f"{key}_available") is True
+                                for receipt in node_receipts.values()):
+                return f"item node usage {node} receipt evidence disagrees on {key}"
+    if historical:
+        for node, limits in node_budgets.items():
+            if node not in raw_node_usage and any(limit is not None for limit in limits.values()):
+                return f"item node usage {node} evidence is incomplete"
+    return None
+
+
+def validate_budget_state(it: object) -> None:
+    if error := budget_state_error(it):
+        raise HelmError(error)
 
 
 def _new_node_usage(*, complete: bool = True) -> dict:
@@ -219,10 +373,14 @@ def _hydrate(it: dict) -> dict:
         it.setdefault(key, default)
     it.setdefault("activity", {"last": it.get("updated"), "state": it.get("phase")})
     it.setdefault("budgets", {"tokens": None, "cost": None, "seconds": None})
+    if not isinstance(it.get("budgets"), dict):
+        raise HelmError("item budgets are malformed")
     it["node_budgets"] = validate_node_budgets(it.get("node_budgets"))
     it.setdefault("usage", {"tokens": 0, "cost": 0.0, "seconds": 0.0,
                             "implementer_tokens": 0, "implementer_cost": 0.0,
                             "reviewer_tokens": 0, "reviewer_cost": 0.0})
+    if not isinstance(it.get("usage"), dict):
+        raise HelmError("item usage is malformed")
     usage = it["usage"]
     historical_turn = bool(it.get("attempts") or it.get("runs") or it.get("session")
                            or it.get("agent_launches"))
@@ -230,12 +388,15 @@ def _hydrate(it: dict) -> dict:
     # is unknown, never a trustworthy zero. Brand-new items have proven zero use.
     usage.setdefault("tokens_evidence_complete", not historical_turn)
     usage.setdefault("cost_evidence_complete", not historical_turn)
+    if it.get("node_usage") is not None and not isinstance(it.get("node_usage"), dict):
+        raise HelmError("item node usage is malformed")
     it["node_usage"] = _node_usage_snapshot(it)
     if not it.get("model_decision") and it.get("dispatch"):
         it["model_decision"] = {"models": it["dispatch"].get("models", {}), "thinking": it["dispatch"].get("thinking", {}),
                                 "rationale": "migrated pinned dispatch", "resolved_at": it.get("created")}
     if it.get("dispatch"):
         it["dispatch"]["graph"] = modes.normalize(it["dispatch"].get("graph"))
+    validate_budget_state(it)
     return it
 
 
@@ -251,6 +412,7 @@ def load(work_id: str) -> dict:
 
 def save(it: dict) -> None:
     """CAS-save an item. Stale writers fail instead of erasing concurrent controls."""
+    validate_budget_state(it)
     expected = int(it.get("revision", 0))
     def replace(current):
         if int(current.get("revision", 0)) != expected:
@@ -397,17 +559,19 @@ def _pid_alive(pid) -> bool:
 
 def budget_blockers(it: dict) -> list[str]:
     """Return fail-closed cumulative budget blockers before any new model turn."""
+    if error := budget_state_error(it):
+        return [f"budget state is malformed: {error}"]
     usage, budgets = it.get("usage") or {}, it.get("budgets") or {}
     blockers = []
     for key in ("tokens", "cost", "seconds"):
         limit = budgets.get(key)
         if limit is None:
             continue
-        if key in ("tokens", "cost") and usage.get(f"{key}_evidence_complete") is False:
+        if key in ("tokens", "cost") and usage.get(f"{key}_evidence_complete") is not True:
             blockers.append(f"{key} usage evidence is incomplete")
             continue
         actual = usage.get(key)
-        if not isinstance(actual, (int, float)) or isinstance(actual, bool):
+        if not _valid_usage_value(key, actual):
             blockers.append(f"{key} usage evidence is unavailable")
         elif float(actual) >= float(limit):
             blockers.append(f"{key} budget exhausted ({actual:g}/{limit:g})")

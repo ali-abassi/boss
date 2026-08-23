@@ -54,7 +54,10 @@ def private_mkdir(path: Path) -> None:
 def write_json(path: Path, data: Any) -> None:
     """Durably replace one private JSON record without sharing a temp pathname."""
     private_mkdir(path.parent)
-    payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
+    # Python's encoder otherwise writes NaN/Infinity tokens even though they
+    # are not JSON.  Durable control state must never manufacture a value that
+    # makes numeric safety comparisons fail open.
+    payload = (json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
     fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     tmp = Path(raw_tmp)
     try:

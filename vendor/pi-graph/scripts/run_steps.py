@@ -1174,6 +1174,24 @@ def main() -> int:
     ).resolve()
     if not cwd.is_dir():
         raise SystemExit(f"workflow cwd not found: {cwd}")
+    incoming_input = None
+    if args.input is not None:
+        incoming_input = args.input.encode("utf-8")
+    elif args.input_file is not None:
+        source = args.input_file.expanduser().resolve()
+        if not source.is_file():
+            raise SystemExit(f"input file not found: {source}")
+        incoming_input = source.read_bytes()
+
+    input_contract = spec.get("input") if isinstance(spec.get("input"), dict) else {}
+    if (input_contract.get("required") and incoming_input is None
+            and not (args.resume or args.from_id or args.verify)
+            and not (args.run_dir
+                     and (args.run_dir.expanduser().resolve() / "input.txt").is_file())):
+        # Fail before any run directory exists: a fresh run that never had its
+        # required input must not leave a half-initialized bundle behind.
+        raise SystemExit("this workflow requires --input or --input-file")
+
     workflow = spec.get("workflow", args.steps_file.stem)
     run_dir = (args.run_dir or args.steps_file.parent / "runs" /
                f"{workflow}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}").resolve()
@@ -1196,15 +1214,6 @@ def main() -> int:
             except FileExistsError:
                 attempt += 1
                 run_dir = base.parent / f"{base.name}-{attempt}"
-
-    incoming_input = None
-    if args.input is not None:
-        incoming_input = args.input.encode("utf-8")
-    elif args.input_file is not None:
-        source = args.input_file.expanduser().resolve()
-        if not source.is_file():
-            raise SystemExit(f"input file not found: {source}")
-        incoming_input = source.read_bytes()
 
     workflow_dir = (args.workflow_dir.expanduser().resolve() if args.workflow_dir else cwd)
     input_path = run_dir / "input.txt"
@@ -1290,7 +1299,7 @@ def main() -> int:
                     output.flush()
                     os.fsync(output.fileno())
 
-    input_contract = spec.get("input") if isinstance(spec.get("input"), dict) else {}
+    # Backstop for --run-dir paths where the early guard could not decide.
     if input_contract.get("required") and not input_path.is_file():
         if bundle:
             bundle.close()
@@ -1441,9 +1450,15 @@ def main() -> int:
                           payload={"failed": sorted(failed), "skipped": sorted(skipped)})
             bundle.close()
             ACTIVE_BUNDLE = None
-        print(f"\nFAILED step(s) {sorted(failed)}. Fix and rerun with:\n"
-              f"  python3 {shlex.quote(sys.argv[0])} {shlex.quote(str(args.steps_file))} "
-              f"--from {sorted(failed)[0]} --run-dir {shlex.quote(str(run_dir))}", file=sys.stderr)
+        if bundle is not None:
+            # Durable runs resume through the documented public surface.
+            remedy = (f"  piw resume {shlex.quote(str(args.steps_file))} "
+                      f"{shlex.quote(str(run_dir))}")
+        else:
+            remedy = (f"  python3 {shlex.quote(sys.argv[0])} {shlex.quote(str(args.steps_file))} "
+                      f"--from {sorted(failed)[0]} --run-dir {shlex.quote(str(run_dir))}")
+        print(f"\nFAILED step(s) {sorted(failed)}. Fix the cause, then resume with:\n{remedy}",
+              file=sys.stderr)
         return 1
 
     # Report what actually ran: with `when:` guards, "all N passed" would be a lie

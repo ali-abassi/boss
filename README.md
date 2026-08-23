@@ -47,7 +47,9 @@ It keeps the operating contract of [firstmate](https://github.com/kunchenguid/fi
 ([fork](https://github.com/ali-abassi/firstmate)). Production work runs only in persistent
 Herdr Pi agents. The bundled [pi-graph](https://github.com/ali-abassi/pi-graph) runner orders
 the workflow; a checked-in inert runner is the deterministic test seam, never a production
-agent or substitute identity.
+agent or substitute identity. Pi Graph contains the portable
+[Agent Workflows](https://github.com/ali-abassi/agent-workflows) kernel; First Mate pins its
+v0.2.0 run-bundle compatibility fixes while retaining Pi Graph's fuller command surface.
 
 ## Proof
 

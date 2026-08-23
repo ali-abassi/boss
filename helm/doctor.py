@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlparse
-from . import control, dispatch, gates, modes, scope, processes, ids, registry, worktree
+from . import control, dispatch, gates, modes, scope, processes, ids, registry, worktree, work
 from .paths import (GRAPHS, dispatch_file, home, projects_file, supervisor_file,
                     wakes_file, work_root, worktree_root, supervisor_lock, authority_lock)
 from .util import HelmError, git_config, locked, now, read_json, sh, write_json
@@ -347,74 +347,8 @@ def _item_schema(value: object, directory_name: str) -> str | None:
                 "promotion", "pr_delivery", "external_gate", "cancellation"):
         if value.get(key) is not None and not isinstance(value.get(key), dict):
             return f"item {key} must be an object or null"
-    item_usage = value.get("usage") or {}
-    for key in ("tokens", "cost", "seconds"):
-        measured = item_usage.get(key, 0)
-        if (not isinstance(measured, (int, float)) or isinstance(measured, bool)
-                or not math.isfinite(float(measured)) or measured < 0
-                or key == "tokens" and not float(measured).is_integer()):
-            return f"item usage {key} is malformed"
-    seconds_receipts = item_usage.get("seconds_receipts", {})
-    if (not isinstance(seconds_receipts, dict) or len(seconds_receipts) > MAX_RECORDS
-            or any(not isinstance(key, str) or not key
-                   or not isinstance(measured, (int, float)) or isinstance(measured, bool)
-                   or not math.isfinite(float(measured)) or measured < 0
-                   for key, measured in seconds_receipts.items())):
-        return "item usage seconds receipts are malformed"
-    node_budgets = value.get("node_budgets") or {}
-    allowed_nodes = {"implement", "scout", "review_correctness", "review_adversarial", "verify"}
-    if len(node_budgets) > len(allowed_nodes) or set(node_budgets) - allowed_nodes:
-        return "item node budgets contain an unknown runtime node"
-    for node, limits in node_budgets.items():
-        if not isinstance(limits, dict) or set(limits) - {"tokens", "cost", "seconds"}:
-            return f"item node budget {node} is malformed"
-        for key, limit in limits.items():
-            if (limit is not None and (not isinstance(limit, (int, float)) or isinstance(limit, bool)
-                                       or not math.isfinite(float(limit)) or limit <= 0)):
-                return f"item node budget {node}.{key} is malformed"
-        if node == "verify" and any(limits.get(key) is not None for key in ("tokens", "cost")):
-            return "item verify node budget contains a model-only metric"
-    node_usage = value.get("node_usage") or {}
-    if len(node_usage) > len(allowed_nodes) or set(node_usage) - allowed_nodes:
-        return "item node usage contains an unknown runtime node"
-    for node, usage in node_usage.items():
-        if not isinstance(usage, dict) or not isinstance(usage.get("receipts", {}), dict):
-            return f"item node usage {node} is malformed"
-        for key in ("tokens", "cost", "seconds"):
-            actual = usage.get(key, 0)
-            if (not isinstance(actual, (int, float)) or isinstance(actual, bool)
-                    or not math.isfinite(float(actual)) or actual < 0):
-                return f"item node usage {node}.{key} is malformed"
-        for key in ("tokens_evidence_complete", "cost_evidence_complete", "seconds_evidence_complete"):
-            if usage.get(key) is not None and not isinstance(usage.get(key), bool):
-                return f"item node usage {node}.{key} is malformed"
-        receipts = usage.get("receipts", {})
-        if len(receipts) > MAX_RECORDS or any(not isinstance(key, str) or not isinstance(receipt, dict)
-                                              for key, receipt in receipts.items()):
-            return f"item node usage {node} receipts are malformed"
-        for session_id, receipt in receipts.items():
-            if not session_id or len(session_id) > 256:
-                return f"item node usage {node} receipt identity is malformed"
-            for key in ("tokens", "cost"):
-                measured = receipt.get(key)
-                if (measured is not None
-                        and (not isinstance(measured, (int, float)) or isinstance(measured, bool)
-                             or not math.isfinite(float(measured)) or measured < 0
-                             or key == "tokens" and not float(measured).is_integer())):
-                    return f"item node usage {node} receipt {key} is malformed"
-                available = receipt.get(f"{key}_available")
-                if available is not None and not isinstance(available, bool):
-                    return f"item node usage {node} receipt {key} availability is malformed"
-            if receipt.get("tokens_available") is True and receipt.get("tokens") is None:
-                return f"item node usage {node} receipt tokens are missing"
-            if receipt.get("cost_available") is True and receipt.get("cost") is None:
-                return f"item node usage {node} receipt cost is missing"
-        receipt_tokens = sum(int(receipt.get("tokens") or 0) for receipt in receipts.values())
-        receipt_cost = sum(float(receipt.get("cost") or 0.0) for receipt in receipts.values())
-        if receipts and (usage.get("tokens", 0) != receipt_tokens
-                         or not math.isclose(float(usage.get("cost", 0.0)), receipt_cost,
-                                             rel_tol=1e-12, abs_tol=1e-12)):
-            return f"item node usage {node} receipt totals disagree"
+    if error := work.budget_state_error(value):
+        return error
     lease = value.get("lease") or {}
     if lease and (not isinstance(lease.get("pid"), int) or isinstance(lease.get("pid"), bool)
                   or lease.get("process_identity") is not None and not isinstance(lease.get("process_identity"), dict)
@@ -426,7 +360,9 @@ def _item_schema(value: object, directory_name: str) -> str | None:
         launch_id = launch.get("launch_id")
         if (not isinstance(launch_id, str) or not isinstance(launch.get("state"), str)
                 or launch.get("role") not in {"implementer", "reviewer"}
-                or launch.get("agent_name") is not None and not isinstance(launch.get("agent_name"), str)):
+                or launch.get("agent_name") is not None and not isinstance(launch.get("agent_name"), str)
+                or launch.get("attested_process_identity") is not None
+                and not isinstance(launch.get("attested_process_identity"), dict)):
             return "item launch journal is malformed"
         launch_ids.append(launch_id)
     if len(launch_ids) != len(set(launch_ids)): return "item launch identities are duplicated"

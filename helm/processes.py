@@ -9,6 +9,8 @@ from typing import Any
 from .util import now
 
 VERSION = 1
+WORKER_KIND = "firstmate-worker"
+PI_AGENT_KIND = "firstmate-pi-agent"
 
 
 def _field(pid: int, name: str) -> str | None:
@@ -40,7 +42,7 @@ def exists(pid: Any) -> str:
         return "unknown"
 
 
-def capture(pid: int, owner: str) -> dict | None:
+def capture(pid: int, owner: str, *, kind: str = WORKER_KIND) -> dict | None:
     """Capture the already-exec'd daemon. Failure means it must not be registered."""
     start, command = _field(pid, "lstart"), _field(pid, "command")
     if not start or not command:
@@ -49,12 +51,12 @@ def capture(pid: int, owner: str) -> dict | None:
         pgid = os.getpgid(pid)
     except OSError:
         return None
-    return {"version": VERSION, "kind": "firstmate-worker", "pid": int(pid), "pgid": int(pgid),
+    return {"version": VERSION, "kind": kind, "pid": int(pid), "pgid": int(pgid),
             "owner": owner, "start_sha256": _digest(start), "command_sha256": _digest(command),
             "registered_at": now()}
 
 
-def probe(record: object) -> dict:
+def probe(record: object, *, expected_kind: str = WORKER_KIND) -> dict:
     """Return live only for an exact captured identity; legacy integers are untrusted."""
     if not isinstance(record, dict):
         state = exists(record)
@@ -66,9 +68,9 @@ def probe(record: object) -> dict:
         return {"state": "dead", "pid": pid, "reason": "captured PID is positively absent"}
     if presence != "present":
         return {"state": "unknown", "pid": pid, "reason": "process presence could not be proven"}
-    if (record.get("version") != VERSION or record.get("kind") != "firstmate-worker"
+    if (record.get("version") != VERSION or record.get("kind") != expected_kind
             or not record.get("start_sha256") or not record.get("command_sha256")):
-        return {"state": "untrusted", "pid": pid, "reason": "worker identity record is incomplete"}
+        return {"state": "untrusted", "pid": pid, "reason": "process identity record is incomplete"}
     start, command = _field(int(pid), "lstart"), _field(int(pid), "command")
     if not start or not command:
         return {"state": "unknown", "pid": pid, "reason": "live process metadata is unavailable"}

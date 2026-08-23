@@ -2,6 +2,7 @@
 // This does not create or imitate Pi's session JSONL. Pi writes that durable
 // record after its first assistant event; First Mate validates it separately.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign as cryptoSign, type KeyObject } from "node:crypto";
 import { appendFileSync, existsSync, linkSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -20,6 +21,40 @@ function canonical(path: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function processField(name: "lstart" | "command" | "pgid"): string {
+  let lastError: unknown;
+  for (const binary of ["/bin/ps", "/usr/bin/ps"]) {
+    try {
+      const value = execFileSync(binary, ["-p", String(process.pid), "-o", `${name}=`], {
+        encoding: "utf8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`cannot attest Pi process ${name}: ${String(lastError ?? "empty ps result")}`);
+}
+
+function processBirthIdentity(sessionId: string) {
+  const started = processField("lstart");
+  const command = processField("command");
+  const pgid = Number(processField("pgid"));
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) throw new Error("cannot attest Pi process group");
+  return {
+    version: 1,
+    kind: "firstmate-pi-agent",
+    pid: process.pid,
+    pgid,
+    owner: sessionId,
+    start_sha256: createHash("sha256").update(started, "utf8").digest("hex"),
+    command_sha256: createHash("sha256").update(command, "utf8").digest("hex"),
+    registered_at: new Date().toISOString(),
+  };
 }
 
 function mentionedAbsolutePaths(command: string): string[] {
@@ -137,12 +172,14 @@ export default function attest(pi: ExtensionAPI) {
     const keyPair = generateKeyPairSync("ed25519");
     eventPrivateKey = keyPair.privateKey;
     eventPublicKey = keyPair.publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const sessionId = ctx.sessionManager.getSessionId();
     const payload = {
       schema: 1,
       nonce,
       pid: process.pid,
+      process_identity: processBirthIdentity(sessionId),
       cwd: ctx.sessionManager.getCwd(),
-      session_id: ctx.sessionManager.getSessionId(),
+      session_id: sessionId,
       session_dir: ctx.sessionManager.getSessionDir(),
       session_file: ctx.sessionManager.getSessionFile(),
       events_file: eventsPath,

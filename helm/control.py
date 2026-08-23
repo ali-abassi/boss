@@ -47,6 +47,11 @@ def cas_update(work_id: str, mutate: Callable[[dict], None], expected_revision: 
             raise HelmError(f"unknown work item '{work_id}'")
         if item.get("id") != ids.work(work_id):
             raise HelmError("work item identity does not match its durable state directory")
+        # A successful CAS is also the compatibility migration boundary. This
+        # makes missing legacy evidence flags explicit before any mutation is
+        # allowed to persist the record again.
+        from . import work
+        item = work._hydrate(item)
         revision = int(item.get("revision", 0))
         if expected_revision is not None and revision != expected_revision:
             raise HelmError(f"stale work item revision {expected_revision}; current revision is {revision}")
@@ -54,6 +59,10 @@ def cas_update(work_id: str, mutate: Callable[[dict], None], expected_revision: 
         item["schema_version"] = SCHEMA_VERSION
         item["revision"] = revision + 1
         item["updated"] = now()
+        # Every mutation path shares the same fail-closed budget validator;
+        # callers cannot persist malformed limits, receipts, or evidence flags
+        # by bypassing work.save().  Import lazily to avoid a module cycle.
+        work.validate_budget_state(item)
         write_json(path, item)
         return item
 

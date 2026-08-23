@@ -182,15 +182,18 @@ class DoctorTests(unittest.TestCase):
     def test_corrupt_node_budget_state_is_reported_without_rewriting(self):
         directory = self.home / "work" / "p-node-corrupt"; directory.mkdir(parents=True)
         item_path = directory / "item.json"
-        write_json(item_path, {"id": "p-node-corrupt", "project": "p", "status": "paused", "revision": 0,
-                               "branch": "firstmate/p-node-corrupt",
-                               "worktree": str(self.home / "worktrees" / "p" / "p-node-corrupt"),
-                               "agent_launches": [], "controls": {"events": [], "pending": []},
-                               "node_budgets": {"implement": {"tokens": 10}},
-                               "node_usage": {"implement": {
-                                   "tokens": 0, "cost": 0.0, "seconds": 0.0,
-                                   "receipts": {"session": {"tokens": float("nan"),
-                                                               "tokens_available": True}}}}})
+        # Simulate externally corrupted/non-standard JSON. The controller's
+        # durable writer now refuses to manufacture NaN itself.
+        item_path.write_text(json.dumps({
+            "id": "p-node-corrupt", "project": "p", "status": "paused", "revision": 0,
+            "branch": "firstmate/p-node-corrupt",
+            "worktree": str(self.home / "worktrees" / "p" / "p-node-corrupt"),
+            "agent_launches": [], "controls": {"events": [], "pending": []},
+            "node_budgets": {"implement": {"tokens": 10}},
+            "node_usage": {"implement": {
+                "tokens": 0, "cost": 0.0, "seconds": 0.0,
+                "receipts": {"session": {"tokens": float("nan"),
+                                            "tokens_available": True}}}}}))
         before = item_path.read_bytes()
         report = doctor.audit(network=False)
         check = next(value for value in report["checks"] if value["id"] == "state:item:p-node-corrupt")

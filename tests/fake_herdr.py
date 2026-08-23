@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stand-in for the `herdr` CLI: records every call to $FAKE_HERDR_LOG and answers like herdr."""
-import hashlib, json, os, re, sys
+import hashlib, json, os, re, subprocess, sys
 from pathlib import Path
 try:
     from tests._event_signing import PUBLIC_KEY_B64, sign_chain
@@ -10,6 +10,15 @@ args = sys.argv[1:]
 with open(os.environ["FAKE_HERDR_LOG"], "a") as fh:
     fh.write(json.dumps(args) + "\n")
 n = sum(1 for _ in open(os.environ["FAKE_HERDR_LOG"]))
+def process_identity(pid, owner):
+    field = lambda name: subprocess.run(
+        ["ps", "-p", str(pid), "-o", f"{name}="], text=True, capture_output=True, check=True
+    ).stdout.strip()
+    return {"version": 1, "kind": "firstmate-pi-agent", "pid": pid,
+            "pgid": os.getpgid(pid), "owner": owner,
+            "start_sha256": hashlib.sha256(field("lstart").encode()).hexdigest(),
+            "command_sha256": hashlib.sha256(field("command").encode()).hexdigest(),
+            "registered_at": "2026-01-01T00:00:00Z"}
 def normalized(call):
     return call[2:] if call[:1] == ["--session"] else call
 if args[:1] == ["--session"]:
@@ -35,7 +44,9 @@ elif args[:2] == ["agent", "start"]:
     events_file = pane_env.get("HELM_AGENT_EVENTS")
     if attestation and session_id and session_dir and cwd:
         session_file = session_dir / f"2026-01-01T00-00-00-000Z_{session_id}.jsonl"
-        payload = {"schema": 1, "nonce": pane_env.get("HELM_AGENT_NONCE"), "pid": 44, "cwd": str(Path(cwd).resolve()),
+        agent_pid = os.getppid()
+        payload = {"schema": 1, "nonce": pane_env.get("HELM_AGENT_NONCE"), "pid": agent_pid,
+                   "process_identity": process_identity(agent_pid, session_id), "cwd": str(Path(cwd).resolve()),
                    "session_id": session_id, "session_dir": str(session_dir.resolve()),
                    "session_file": str(session_file.resolve()), "events_file": str(Path(events_file).resolve()),
                    "event_public_key": PUBLIC_KEY_B64,
@@ -181,7 +192,7 @@ elif args[:2] == ["pane", "process-info"]:
     pane = args[args.index("--pane") + 1]
     agent_started = any(call[:2] == ["agent", "start"] and "--pane" in call
                         and call[call.index("--pane") + 1] == pane for call in calls)
-    foreground = ([{"pid": 44, "name": "node"}] if agent_started else
+    foreground = ([{"pid": os.getppid(), "name": "node"}] if agent_started else
                   [{"pid": 43, "name": "sleep"}] if sleep_indexes and probes == 1 else
                   [{"pid": 42, "name": "zsh"}])
     print(json.dumps({"result": {"process_info": {"pane_id": args[args.index("--pane") + 1], "shell_pid": 42,

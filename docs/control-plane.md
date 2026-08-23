@@ -28,8 +28,8 @@ scoped to the worktree by the controller-owned extension. Pi's startup hook must
 that an out-of-capability write receives `EPERM`/`EACCES` before the controller accepts the
 session. Each launch creates an in-memory Ed25519 key and signs a monotonic hash chain of
 input/start/settled metadata; prompt text is never stored in that ledger. Controller validation
-pins the public key, file ownership, inode, link count, pane PID, model, thinking level, session
-UUID, worktree, and both profile digests. This is not a separate user account, and production
+pins the public key, file ownership, inode, link count, pane PID plus process-start/command/group
+fingerprints, model, thinking level, session UUID, worktree, and both profile digests. This is not a separate user account, and production
 Herdr work fails closed off macOS or without these prerequisites.
 
 ## Safety pipeline
@@ -86,7 +86,9 @@ turn, one already-running turn can cross a threshold. The controller then settle
 spending another checkpoint turn and refuses another turn until the captain explicitly raises
 the paused item's budget and resumes it. Missing or legacy-unattributable node evidence fails
 closed instead of being recorded as zero. Completed node receipts are durably checkpointed as
-the pipeline advances. Confirmed dead-process reconciliation harvests the open lease exactly once
+the pipeline advances. Every load and mutation validates finite limits, non-negative usage,
+boolean evidence flags, and receipt totals; non-standard NaN/Infinity JSON cannot be written.
+Confirmed dead-process reconciliation harvests the open lease exactly once
 through a receipt key and accounts its active node before recovery can create another session.
 
 ## Supervisor, recovery, and away mode
@@ -95,14 +97,14 @@ Item transitions feed private, fsynced atomic supervisor records and a durable w
 PIDs, clocks, Git/Herdr metadata, and network APIs—never a model—to classify each item as
 `healthy`, `waiting`, `needs-you`, `stale`, `wedged`, `dead`, or `unknown`. Unknown evidence is
 preserved as unknown. A live Herdr name/pane is healthy only when the durable Pi session UUID's
-signed runtime attestation names the PID currently running in that exact pane; reused display
-coordinates remain unknown. Durable wake keys deduplicate concurrent observers and survive daemon,
+signed runtime attestation names the exact process birth currently running in that pane; a reused
+numeric PID or display coordinate remains unknown. Durable wake keys deduplicate concurrent observers and survive daemon,
 Herdr, and Pi restarts; claims have leases so a UI crash cannot lose a wake. Declared waits
 resurface after their deadline. Repeated unchanged stale evidence escalates to a bounded wedge
 reminder. The supervisor cannot kill, launch, release, discard, promote, or merge.
 
 The same exact identity check gates prompt submission, steering, cooperative interrupt, and tab
-closure. If the name, pane, UUID, attested PID, or durable session evidence no longer agrees, the
+closure. If the name, pane, UUID, process-birth fingerprint, or durable session evidence no longer agrees, the
 operation fails as unknown and retains recovery custody rather than acting on a replacement tab.
 
 Doctor audits tools, worker PIDs, tabs, leases, claims, session identities, JSON state,

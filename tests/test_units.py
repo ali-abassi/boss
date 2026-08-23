@@ -264,6 +264,43 @@ class NodeBudgetTests(Isolated):
         self.assertFalse(state["tokens_evidence_complete"])
         self.assertFalse(state["cost_evidence_complete"])
 
+    def test_malformed_persisted_budget_state_blocks_before_runtime_and_cannot_be_written(self):
+        from unittest import mock
+        from helm import work
+        from helm.util import write_json
+        base = {"attempts": 1, "runs": [{"attempt": 1}], "session": None, "agent_launches": [],
+                "budgets": {"tokens": 100, "cost": None, "seconds": None},
+                "usage": {"tokens": 0, "cost": 0.0, "seconds": 0.0,
+                          "tokens_evidence_complete": True, "cost_evidence_complete": True},
+                "node_budgets": {}, "node_usage": {}}
+        cases = []
+        nan_limit = json.loads(json.dumps(base)); nan_limit["budgets"]["tokens"] = float("nan")
+        cases.append(nan_limit)
+        null_evidence = json.loads(json.dumps(base)); null_evidence["usage"]["tokens_evidence_complete"] = None
+        cases.append(null_evidence)
+        nan_node = json.loads(json.dumps(base)); nan_node["budgets"]["tokens"] = None
+        nan_node["node_budgets"] = {"implement": {"tokens": 100}}
+        nan_node["node_usage"] = {"implement": {**work._new_node_usage(), "tokens": float("nan")}}
+        cases.append(nan_node)
+        for corrupt in cases:
+            self.assertTrue(work.budget_blockers(corrupt), corrupt)
+
+        rejected = self.home / "nan.json"
+        with self.assertRaises(ValueError):
+            write_json(rejected, {"limit": float("nan")})
+        self.assertFalse(rejected.exists())
+
+        work_id = "malformed-budget"
+        item_path = self.home / "work" / work_id / "item.json"; item_path.parent.mkdir(parents=True)
+        persisted = {**null_evidence, "id": work_id, "project": "p", "status": "queued",
+                     "phase": "queued", "revision": 0, "created": "2026-01-01T00:00:00Z",
+                     "updated": "2026-01-01T00:00:00Z", "controls": {"paused": False}}
+        item_path.write_text(json.dumps(persisted))
+        with mock.patch("helm.work._execute") as execute:
+            with self.assertRaises(SystemExit):
+                work.execute(persisted)
+        execute.assert_not_called()
+
     def test_active_first_turn_waits_for_provider_receipt_but_settled_turn_fails_closed(self):
         from helm import work
         budgets = {"tokens": 100, "cost": 1.0}
@@ -326,6 +363,36 @@ class DispatchSetTests(Isolated):
 
 
 class RuntimePackagingTests(unittest.TestCase):
+    def test_full_runner_keeps_agent_workflows_input_and_public_resume_fixes(self):
+        runner = REPO / "vendor" / "pi-graph" / "scripts" / "run_steps.py"
+        runtime = REPO / ".venv" / "bin" / "python"
+        python = str(runtime if runtime.is_file() else Path(sys.executable))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); steps = root / "steps.yaml"
+            steps.write_text("""version: 1
+workflow: agent-workflows-compat
+input:
+  required: true
+  description: immutable test input
+steps:
+  - id: fail
+    cmd: printf 'candidate\\n'
+    gate: 'false'
+""")
+            missing = subprocess.run([python, str(runner), str(steps)],
+                                     cwd=root, text=True, capture_output=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("requires --input", missing.stderr)
+            self.assertFalse((root / "runs").exists(), "missing input must not create a run")
+            failed = subprocess.run([python, str(runner), str(steps), "--input", "x"],
+                                    cwd=root, text=True, capture_output=True)
+            self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+            self.assertIn("piw resume", failed.stderr)
+            self.assertNotIn("python3 " + str(runner), failed.stderr)
+        provenance = (REPO / "vendor" / "pi-graph" / "VENDOR.md").read_text()
+        self.assertIn("Agent Workflows v0.2.0", provenance)
+        self.assertIn("d2f84bb740d8e336a198145022a367acdf18824f", provenance)
+
     def test_direct_and_symlinked_launcher_use_a_receipt_capable_runtime(self):
         direct = subprocess.run([str(REPO / "bin" / "helm"), "--version"],
                                 text=True, capture_output=True)

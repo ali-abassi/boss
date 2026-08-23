@@ -555,7 +555,8 @@ class HerdrTests(unittest.TestCase):
         identity = {"agent_name": "impl", "agent_session_id": "durable-session",
                     "pane_id": "w1:p7", "workspace_id": "w1", "tab_id": "w1:t7",
                     "resolved_model": "openai-codex/gpt-5.6-sol", "resolved_thinking": "high",
-                    "agent_cwd": str(self.proj)}
+                    "agent_cwd": str(self.proj),
+                    "attested_process_identity": {"pid": 123, "start_sha256": "a" * 64}}
         different = {"state": "live", "agent": {"name": "impl", "pane_id": "w1:p7",
                      "workspace_id": "w1", "tab_id": "w1:t7", "agent_session_id": "replacement"}}
         self.assertEqual(herdr.exact_agent_liveness(identity, different)["state"], "unknown")
@@ -569,12 +570,40 @@ class HerdrTests(unittest.TestCase):
             result = herdr.exact_agent_liveness(identity, omitted, process_info={})
         self.assertEqual(result["state"], "unknown")
         self.assertIn("attested PID", result["reason"])
-        with mock.patch.object(herdr, "_verify_runtime_attestation", return_value={"pid": 123}), \
+        with mock.patch.object(herdr, "_verify_runtime_attestation",
+                               return_value={"pid": 123, "process_identity": identity["attested_process_identity"]}), \
              mock.patch.object(herdr, "session_evidence",
                                return_value={"agent_session_id": "durable-session"}):
             result = herdr.exact_agent_liveness(identity, omitted, process_info={})
         self.assertEqual(result["state"], "live")
         self.assertTrue(result["identity_verified"])
+
+    def test_same_pid_with_different_birth_identity_cannot_be_steered_interrupted_or_closed(self):
+        old = os.environ.copy(); os.environ.update(self.env)
+        try:
+            from helm import herdr, processes
+            session = herdr.ensure_agent({"id": "pid-reuse", "project": "p", "session": None},
+                                         self.proj, "openai-codex/gpt-5.6-sol", "high")
+            herdr.prompt_agent(session["agent_name"], "materialize durable identity", 30, session)
+            live = herdr.agent_liveness(session["agent_name"])
+            real_field = processes._field
+            def reused_field(pid, name):
+                return "Thu Jan  1 00:00:00 1970" if name == "lstart" else real_field(pid, name)
+            before = self.calls()
+            with mock.patch.object(processes, "_field", side_effect=reused_field):
+                exact = herdr.exact_agent_liveness(session, live)
+                self.assertEqual(exact["state"], "unknown")
+                self.assertIn("different process identity", exact["reason"])
+                with self.assertRaises(SystemExit):
+                    herdr.steer_agent(session["agent_name"], "do not deliver", identity=session)
+                with self.assertRaises(SystemExit):
+                    herdr.interrupt_agent(session["agent_name"], session)
+                self.assertFalse(herdr.close_agent_tab(session))
+            after = self.calls()[len(before):]
+            self.assertFalse(any(call[:2] in (["agent", "prompt"], ["agent", "send-keys"],
+                                              ["tab", "close"]) for call in after), after)
+        finally:
+            os.environ.clear(); os.environ.update(old)
 
     def test_manual_pause_settles_without_an_unbudgeted_checkpoint_turn(self):
         from helm import herdr
