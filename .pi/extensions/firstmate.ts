@@ -33,21 +33,39 @@ export function statusLine(s: Status | null): string {
   return parts.join(" · ");
 }
 
+function compactStatus(s: Status | null, narrow = false): string {
+  if (!s) return "crew tools unavailable";
+  const needs = (s.items["needs-you"] || 0) + (s.items["failed"] || 0) + (s.items["ready"] || 0) + (s.items["pr-open"] || 0);
+  const running = s.items["running"] || 0;
+  const parts = [`${s.projects} project${s.projects === 1 ? "" : "s"}`];
+  if (!narrow && running) parts.push(`${running} running`);
+  parts.push(needs ? `${needs} need you` : running ? `${running} running` : "inbox clear");
+  return parts.join(" · ");
+}
+
 export function renderBanner(theme: Theme, width: number, status: Status | null, noColor = false): string[] {
   const titlePlain = `${ANCHOR}  F I R S T   M A T E`;
   const title = noColor ? titlePlain
     : `${theme.fg("warning", ANCHOR)}  ${theme.bold?.("F I R S T   M A T E") ?? "F I R S T   M A T E"}`;
   const statePlain = statusLine(status);
   const state = noColor ? statePlain : theme.fg("muted", statePlain);
-  if (width < 52) return fit([title, state], width);
-
-  const ruleWidth = Math.max(3, inner(width) - visibleWidth(titlePlain) - 4);
-  const rule = noColor ? "─".repeat(ruleWidth) : theme.fg("borderMuted", "─".repeat(ruleWidth));
   const hintPlain = "/fleet  ·  /inbox  ·  /wake 20m";
-  const hint = noColor ? hintPlain : theme.fg("dim", hintPlain);
+  const hint = noColor ? hintPlain
+    : `${theme.fg("accent", "/fleet")}${theme.fg("dim", "  ·  ")}${theme.fg("accent", "/inbox")}${theme.fg("dim", "  ·  ")}${theme.fg("accent", "/wake 20m")}`;
+  if (width < 52) return fit([title, noColor ? compactStatus(status, true) : theme.fg("muted", compactStatus(status, true))], width);
+  if (width < 72) return fit([title, noColor ? compactStatus(status) : theme.fg("muted", compactStatus(status)), hint], width);
+
+  const compass = (text: string) => noColor ? text : theme.fg("accent", text);
+  const horizonWidth = Math.max(12, Math.min(88, inner(width) - 2));
+  const horizon = noColor ? "━".repeat(horizonWidth) : theme.fg("borderMuted", "━".repeat(horizonWidth));
+  const deck = noColor ? "C A P T A I N ' S   C O N T R O L   D E C K"
+    : theme.fg("dim", "C A P T A I N ' S   C O N T R O L   D E C K");
   return fit([
-    `${title}  ${rule}`,
-    `   ${state}`,
+    `       ${compass("N")}`,
+    `    ${compass("W  ✦  E")}       ${title}`,
+    `       ${compass("S")}          ${deck}`,
+    horizon,
+    `${compass("◇")}  ${state}`,
     `   ${hint}`,
   ], width);
 }
@@ -207,11 +225,12 @@ if (process.argv[1]?.endsWith("firstmate.ts")) {
   const ok = (v: boolean, label: string) => { if (!v) throw new Error(`FAIL: ${label}`); n++; };
   const theme: Theme = { fg: (_t, s) => s, bold: (s) => s };
   const st: Status = { projects: 2, workers: 123, items: { running: 1, "needs-you": 1 } };
-  for (const width of [120, 80, 60]) {
+  for (const width of [120, 80]) {
     const lines = renderBanner(theme, width, st, false);
-    ok(lines.length === 3 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
-    ok(lines[0].includes("F I R S T") && lines[1].includes("2 projects"), `identity + status at ${width}`);
+    ok(lines.length === 6 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
+    ok(lines[1].includes("F I R S T") && lines[4].includes("2 projects"), `identity + status at ${width}`);
   }
+  ok(renderBanner(theme, 60, st, false).length === 3 && renderBanner(theme, 60, st, false)[2].includes("/fleet"), "medium banner keeps actions");
   ok(renderBanner(theme, 50, st, false)[0].includes("F I R S T") && renderBanner(theme, 50, st, false).length === 2, "narrow banner keeps identity");
   ok(renderBanner(theme, 80, st, false).join("|") === renderBanner(theme, 80, st, false).join("|"), "render is stable");
   ok(statusLine({ projects: 1, workers: null, items: {} }) === "1 project · workers stopped · inbox clear", "status line when idle");
