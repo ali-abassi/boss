@@ -122,6 +122,14 @@ def budget_state_error(it: object) -> str | None:
                    or not _valid_usage_value("seconds", measured)
                    for receipt_id, measured in seconds_receipts.items())):
         return "item usage seconds receipts are malformed"
+    receipt_seconds_floor = sum(float(measured) for measured in seconds_receipts.values())
+    reported_seconds = float(raw_usage.get("seconds", 0.0))
+    # Each receipt is a cumulative maximum for one execution identity and the
+    # scalar advances by its positive delta. Legacy/success-path accounting may
+    # make the scalar larger, never smaller. Allow only floating summation noise.
+    tolerance = max(1e-9, abs(receipt_seconds_floor) * 1e-12)
+    if reported_seconds + tolerance < receipt_seconds_floor:
+        return "item usage seconds receipt totals exceed reported seconds"
 
     receipts = raw_usage.get("receipts", {})
     if (not isinstance(receipts, dict) or len(receipts) > MAX_BUDGET_RECEIPTS

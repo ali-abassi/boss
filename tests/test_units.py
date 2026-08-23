@@ -282,6 +282,10 @@ class NodeBudgetTests(Isolated):
         nan_node["node_budgets"] = {"implement": {"tokens": 100}}
         nan_node["node_usage"] = {"implement": {**work._new_node_usage(), "tokens": float("nan")}}
         cases.append(nan_node)
+        seconds_mismatch = json.loads(json.dumps(base))
+        seconds_mismatch["budgets"] = {"tokens": None, "cost": None, "seconds": 100}
+        seconds_mismatch["usage"].update(seconds=0.0, seconds_receipts={"captured-execution": 1000.0})
+        cases.append(seconds_mismatch)
         for corrupt in cases:
             self.assertTrue(work.budget_blockers(corrupt), corrupt)
 
@@ -292,7 +296,7 @@ class NodeBudgetTests(Isolated):
 
         work_id = "malformed-budget"
         item_path = self.home / "work" / work_id / "item.json"; item_path.parent.mkdir(parents=True)
-        persisted = {**null_evidence, "id": work_id, "project": "p", "status": "queued",
+        persisted = {**seconds_mismatch, "id": work_id, "project": "p", "status": "queued",
                      "phase": "queued", "revision": 0, "created": "2026-01-01T00:00:00Z",
                      "updated": "2026-01-01T00:00:00Z", "controls": {"paused": False}}
         item_path.write_text(json.dumps(persisted))
