@@ -122,7 +122,12 @@ def budget_state_error(it: object) -> str | None:
                    or not _valid_usage_value("seconds", measured)
                    for receipt_id, measured in seconds_receipts.items())):
         return "item usage seconds receipts are malformed"
-    receipt_seconds_floor = sum(float(measured) for measured in seconds_receipts.values())
+    try:
+        receipt_seconds_floor = math.fsum(float(measured) for measured in seconds_receipts.values())
+    except OverflowError:
+        return "item usage seconds receipt total is not finite"
+    if not math.isfinite(receipt_seconds_floor):
+        return "item usage seconds receipt total is not finite"
     reported_seconds = float(raw_usage.get("seconds", 0.0))
     # Each receipt is a cumulative maximum for one execution identity and the
     # scalar advances by its positive delta. Legacy/success-path accounting may

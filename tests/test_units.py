@@ -286,8 +286,15 @@ class NodeBudgetTests(Isolated):
         seconds_mismatch["budgets"] = {"tokens": None, "cost": None, "seconds": 100}
         seconds_mismatch["usage"].update(seconds=0.0, seconds_receipts={"captured-execution": 1000.0})
         cases.append(seconds_mismatch)
+        seconds_overflow = json.loads(json.dumps(base))
+        seconds_overflow["budgets"] = {"tokens": None, "cost": None, "seconds": 100}
+        seconds_overflow["usage"].update(seconds=0.0, seconds_receipts={"a": 1e308, "b": 1e308})
+        cases.append(seconds_overflow)
         for corrupt in cases:
+            self.assertIsNotNone(work.budget_state_error(corrupt), corrupt)
             self.assertTrue(work.budget_blockers(corrupt), corrupt)
+            with self.assertRaises(SystemExit):
+                work.validate_budget_state(corrupt)
 
         rejected = self.home / "nan.json"
         with self.assertRaises(ValueError):
@@ -296,10 +303,14 @@ class NodeBudgetTests(Isolated):
 
         work_id = "malformed-budget"
         item_path = self.home / "work" / work_id / "item.json"; item_path.parent.mkdir(parents=True)
-        persisted = {**seconds_mismatch, "id": work_id, "project": "p", "status": "queued",
+        persisted = {**seconds_overflow, "id": work_id, "project": "p", "status": "queued",
                      "phase": "queued", "revision": 0, "created": "2026-01-01T00:00:00Z",
                      "updated": "2026-01-01T00:00:00Z", "controls": {"paused": False}}
         item_path.write_text(json.dumps(persisted))
+        before = item_path.read_bytes()
+        with self.assertRaises(SystemExit):
+            work.control.cas_update(work_id, lambda item: item["controls"].update(paused=True))
+        self.assertEqual(item_path.read_bytes(), before)
         with mock.patch("helm.work._execute") as execute:
             with self.assertRaises(SystemExit):
                 work.execute(persisted)
