@@ -2,9 +2,11 @@
 
 Each work item has one durable JSON record, branch, worktree, scope claim, compact checkpoint,
 and Herdr implementer identity. Records are atomically replaced under per-item locks. An alive
-Herdr agent is reattached only after lifecycle, session, model, and thinking metadata validate;
-a dead agent starts a replacement from the saved checkpoint. Correctness and adversarial
-reviewers always use fresh identities.
+Herdr agent is reattached only after lifecycle and durable session identity validate. Model,
+thinking, token, and cost evidence is attested from the Pi session JSONL when Herdr's generic
+agent record does not carry it; missing or conflicting evidence fails closed. A dead agent
+starts a replacement from the saved checkpoint. Correctness and adversarial reviewers always
+use fresh identities.
 
 ## Safety pipeline
 
@@ -29,8 +31,11 @@ Dead-process claims are reclaimed. Scope escape interrupts execution and asks be
 Rigor starts as scout, quick, standard, or high-risk with a recorded rationale and escalates on
 sensitive paths, expanded scope, or failed verification.
 
-`steer`, `pause`, `resume`, `away`, `interrupt`, and `recover` are durable events. Pending events
-are consumed exactly once at an agent boundary. Inspection exposes phase/state, activity,
+`steer`, `pause`, `resume`, `away`, `interrupt`, and `recover` are durable events. Live steering
+is submitted without waiting on an unrelated active turn. Pause and interrupt stop the active
+turn, wait for settlement, ask the same agent to checkpoint, and then persist the paused state;
+the worktree remains the fallback checkpoint if the agent cannot respond. Pending events are
+consumed exactly once at an agent boundary. Inspection exposes phase/state, activity,
 branch/SHA, scopes, tests, reviews, blockers, frozen model/thinking rationale, usage evidence,
 controls, rigor, and recent output through recursive secret redaction. Away mode can reach
 merge-ready but cannot promote; promotion always requires explicit confirmation for that item.

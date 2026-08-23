@@ -239,13 +239,29 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
     pending = list((it.get("controls") or {}).get("pending", []))
     baseline_changed = set(worktree.changed_files(project, wt))
     monitor_started = time.monotonic(); last_heartbeat = [0.0]
+    reconnecting_active = session.get("reconnected") and (session.get("agent_status") or session.get("state")) == "working"
+    delivered_controls: set[str] = set() if reconnecting_active else {p["id"] for p in pending}
     def live_escape():
         live_item = load(it["id"])
         controls = live_item.get("controls") or {}
         elapsed = time.monotonic() - monitor_started
+        # Steering submitted while this turn is active reaches the durable agent
+        # immediately and is acknowledged exactly once only after Herdr accepts it.
+        for event in controls.get("pending", []):
+            event_id = event.get("id")
+            if event_id and event_id not in delivered_controls:
+                herdr.steer_agent(session["agent_name"], event["text"])
+                control.consume(it["id"], [event_id], "delivered")
+                delivered_controls.add(event_id)
         if elapsed - last_heartbeat[0] >= 5:
-            def beat(item): item["activity"] = {"last": now(), "state": "working", "elapsed_seconds": int(elapsed)}
+            live_agent = herdr.agent_get(session["agent_name"])
+            measured = herdr.usage(live_agent)
+            def beat(item): item["activity"] = {"last": now(), "state": "working", "elapsed_seconds": int(elapsed), **measured}
             control.cas_update(it["id"], beat); last_heartbeat[0] = elapsed
+            for key in ("tokens", "cost"):
+                limit, actual = (live_item.get("budgets") or {}).get(key), measured.get(key)
+                if limit is not None and actual is not None and actual >= limit:
+                    return {"control": "budget", "reason": f"{key} budget reached ({actual:g}/{limit:g})"}
         if (live_item.get("budgets") or {}).get("seconds") and elapsed >= live_item["budgets"]["seconds"]:
             return {"control": "budget", "reason": "time budget reached"}
         if controls.get("pause_requested") or controls.get("interrupt_requested"):
@@ -258,8 +274,8 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         changed = sorted(changed - baseline_changed)
         sensitive = [p for p in changed if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
         return sorted(set(sensitive + scope.escaped((it.get("scope") or {}).get("paths"), changed)))
-    if session.get("reconnected") and (session.get("agent_status") or session.get("state")) == "working":
-        agent, escaped_live = herdr.wait_agent(session["agent_name"], timeout), None
+    if reconnecting_active:
+        agent, escaped_live = herdr.wait_agent_monitored(session["agent_name"], timeout, live_escape)
     else:
         agent, escaped_live = herdr.prompt_agent_monitored(session["agent_name"], prompt, timeout, live_escape)
         if pending:
@@ -270,7 +286,8 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": escaped_live["control"],
-                "budget_exceeded": escaped_live.get("reason"), "error": "cooperative control checkpoint"}
+                "budget_exceeded": escaped_live.get("reason"), "agent_checkpoint": escaped_live.get("agent_checkpoint"),
+                "error": "cooperative control checkpoint"}
     if escaped_live:
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -286,9 +303,11 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
     (run_dir / "implementer.md").write_text(output)
     if it["kind"] == "scout":
         (item_dir(it["id"]) / "report.md").write_text(output)
-        return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], "tokens": agent.get("tokens"), "cost": agent.get("cost"), "reviews": []}
+        measured = herdr.usage(agent)
+        return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], **measured, "reviews": []}
     if (wt / ".helm-ask.json").exists():
-        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["question"], "tokens": agent.get("tokens"), "cost": agent.get("cost")}
+        measured = herdr.usage(agent)
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["question"], **measured}
     if not worktree.has_commits(project, wt):
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["implement"], "error": "implementer produced no commit"}
     changed = worktree.changed_files(project, wt)
@@ -325,7 +344,7 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                 verdict_file = run_dir / f"review_{role}.pending.json"
                 herdr.prompt_agent(reviewer["agent_name"],
                     f"You are an independent {role} reviewer. Review commit {sha}. Do not modify the repository. "
-                    "Write genuine JSON {\"verdict\":\"accept\" or \"reject\",\"notes\":\"...\"} to "
+                    f"Write genuine JSON {{\"verdict\":\"accept\" or \"reject\",\"notes\":\"...\",\"sha\":\"{sha}\"}} to "
                     f"{verdict_file}, then reply with that path.\n\n" + brief.read_text() + "\n\nDIFF:\n" + diff, timeout)
                 live_reviewer = herdr.agent_get(reviewer["agent_name"])
                 if not live_reviewer:
@@ -336,8 +355,8 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                     verdict = json.loads(verdict_file.read_text())
                 except (OSError, json.JSONDecodeError):
                     verdict = _json_verdict(evidence)
-                if verdict.get("verdict") not in ("accept", "reject"):
-                    raise HelmError("reviewer evidence has no valid verdict")
+                if verdict.get("verdict") not in ("accept", "reject") or verdict.get("sha") != sha:
+                    raise HelmError("reviewer evidence has no valid verdict bound to the requested SHA")
                 rec = {**verdict, "sha": sha, "role": role, "reviewer": reviewer, "fresh": True,
                        "valid": True, "evidence": evidence[-12000:], "at": now()}
                 reviews.append(rec); (run_dir / f"review_{role}.json").write_text(json.dumps(rec, indent=2))
@@ -345,7 +364,8 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                     return {"ok": False, "run_dir": str(run_dir), "failed_ids": [phase], "reviews": reviews}
             finally:
                 herdr.close_agent_tab(reviewer)
-    return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], "tokens": agent.get("tokens"), "cost": agent.get("cost"),
+    measured = herdr.usage(agent)
+    return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], **measured,
             "reviews": reviews, "sha": sha, "base_sha": base_sha, "changed": changed}
 
 
@@ -364,6 +384,8 @@ def _headless_reviews(it: dict, summary: dict, sha: str) -> list[dict]:
         if not evidence:
             return []
         verdict = _json_verdict(evidence)
+        if verdict.get("sha") != sha:
+            return []
         reviews.append({**verdict, "sha": sha, "role": phase.removeprefix("review_"),
                         "reviewer": {"kind": "pi-graph", "identity": f"{run_dir}:{phase}"},
                         "fresh": True, "valid": True, "at": now(), "evidence": evidence[-12000:]})
@@ -457,9 +479,20 @@ def _execute(it: dict, timeout: int) -> dict:
                                  f"{shlex.quote(str(Path(__file__).resolve().parents[1] / 'bin' / 'helm'))} tail {it['id']}")
             if tab: herdr.remember("task", {**tab, "item": it["id"]})
         try:
-            summary = graphs.run(steps, brief, timeout + 60, env=env)
+            monitor_started = time.monotonic()
+            def headless_monitor():
+                live = load(it["id"]); controls = live.get("controls") or {}
+                elapsed = time.monotonic() - monitor_started
+                if controls.get("pause_requested") or controls.get("interrupt_requested"):
+                    return {"control": "interrupt" if controls.get("interrupt_requested") else "pause"}
+                if (live.get("budgets") or {}).get("seconds") and elapsed >= live["budgets"]["seconds"]:
+                    return {"control": "budget", "budget_exceeded": "time budget reached"}
+                changed_now = worktree.status_paths(wt, allow_ask=True)
+                escaped_now = scope.escaped((live.get("scope") or {}).get("paths"), changed_now)
+                return {"scope_escape": escaped_now} if escaped_now else None
+            summary = graphs.run(steps, brief, timeout + 60, env=env, monitor=headless_monitor)
             pending_ids = [event["id"] for event in (it.get("controls") or {}).get("pending", [])]
-            if pending_ids:
+            if pending_ids and summary.get("ok"):
                 control.consume(it["id"], pending_ids, "delivered")
         finally:
             if tab:
@@ -485,8 +518,14 @@ def _execute(it: dict, timeout: int) -> dict:
     it["reviews"] = summary.get("reviews") or it.get("reviews", [])
     it["head_sha"] = summary.get("sha") or (git(wt, "rev-parse", "HEAD") if wt.exists() else None)
     it["changed_scope"] = summary.get("changed") or (worktree.changed_files(project, wt) if wt.exists() else [])
+    prior_checkpoint = it.get("checkpoint") or {}
     it["checkpoint"] = {"sha": it["head_sha"], "at": now(), "phase": "verified" if summary.get("ok") else "checkpoint",
-                        "changed_scope": it["changed_scope"], "worktree": worktree.signature(wt) if wt.exists() else None}
+                        "changed_scope": it["changed_scope"], "worktree": worktree.signature(wt) if wt.exists() else None,
+                        "attempt": it["attempts"], "run_dir": summary.get("run_dir"),
+                        "failed_ids": summary.get("failed_ids") or [], "agent_checkpoint": summary.get("agent_checkpoint"),
+                        "usage": {"tokens": summary.get("tokens"), "cost": summary.get("cost")},
+                        "remaining_guidance": list((it.get("controls") or {}).get("pending", [])),
+                        "previous_sha": prior_checkpoint.get("sha")}
     it["activity"] = {"last": now(), "state": "verified" if summary.get("ok") else "attention"}
     failed_ids = set(summary.get("failed_ids") or [])
     it["rigor"] = rigor.escalate(it.get("rigor") or {}, changed=it["changed_scope"],

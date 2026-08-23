@@ -5,6 +5,8 @@ import os
 import shlex
 import signal
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from string import Template
 
@@ -54,23 +56,34 @@ def validate(steps: Path) -> None:
         raise HelmError(f"piw validate failed:\n{r.stdout}{r.stderr}")
 
 
-def run(steps: Path, brief: Path, timeout: int, env: dict | None = None) -> dict:
+def run(steps: Path, brief: Path, timeout: int, env: dict | None = None, monitor=None) -> dict:
     cmd = [piw_bin(), "run", str(steps), "--input-file", str(brief), "--json",
            "--no-cache", "--timeout", str(timeout)]
     log(f"exec {' '.join(shlex.quote(c) for c in cmd)}")
     # stdin MUST be closed: `pi -p` blocks forever on an open inherited pipe (fine in a
     # terminal, fatal under a daemon). Own process group so a timeout kills pi too.
-    proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, cwd=str(steps.parent), start_new_session=True, env=env)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout + 120)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            stdout, stderr = proc.communicate(timeout=15)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            stdout, stderr = proc.communicate()
+    finding = None
+    # Files avoid pipe back-pressure while the supervisor polls controls and scope.
+    with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(mode="w+") as stderr_file:
+        proc = subprocess.Popen(cmd, text=True, stdout=stdout_file, stderr=stderr_file,
+                                stdin=subprocess.DEVNULL, cwd=str(steps.parent), start_new_session=True, env=env)
+        deadline = time.monotonic() + timeout + 120
+        while proc.poll() is None:
+            finding = monitor() if monitor else None
+            if finding or time.monotonic() >= deadline:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try: proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL); proc.wait()
+                break
+            time.sleep(0.2)
+        stdout_file.seek(0); stderr_file.seek(0)
+        stdout, stderr = stdout_file.read(), stderr_file.read()
+    if finding:
+        return {"ok": False, "failed_ids": ([] if isinstance(finding, dict) and finding.get("control") else ["scope-escape"]),
+                "run_dir": "", "exit_code": proc.returncode, **(finding if isinstance(finding, dict) else {"scope_escape": finding}),
+                "error": "headless runner stopped at a safe supervisor boundary; worktree preserved"}
+    if time.monotonic() >= deadline and proc.returncode:
         stderr = (stderr or "") + f"\nhelm: killed piw after {timeout + 120}s"
     r = subprocess.CompletedProcess(cmd, proc.returncode, stdout or "", stderr or "")
     summary = None

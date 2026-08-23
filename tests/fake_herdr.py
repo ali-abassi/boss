@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stand-in for the `herdr` CLI: records every call to $FAKE_HERDR_LOG and answers like herdr."""
-import json, os, sys
+import json, os, re, subprocess, sys
+from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ["FAKE_HERDR_LOG"], "a") as fh:
     fh.write(json.dumps(args) + "\n")
@@ -38,9 +39,28 @@ elif args[:2] in (["agent", "prompt"], ["agent", "wait"]):
     call = starts[-1] if starts else []
     model = call[call.index("--model") + 1] if "--model" in call else None
     thinking = call[call.index("--thinking") + 1] if "--thinking" in call else None
+    if args[:2] == ["agent", "prompt"] and os.environ.get("FAKE_HERDR_EXECUTE") == "1":
+        prompt = args[3]
+        pane = call[call.index("--pane") + 1] if call else ""
+        cwd = None
+        for index, line in enumerate(open(os.environ["FAKE_HERDR_LOG"]), 1):
+            prior = json.loads(line)
+            if prior[:2] == ["tab", "create"] and f"w1:p{index}" == pane and "--cwd" in prior:
+                cwd = Path(prior[prior.index("--cwd") + 1])
+        if prompt.startswith("Continue work on the persistent branch") and cwd:
+            (cwd / "herdr-change.txt").write_text("real persistent agent change\n")
+            subprocess.run(["git", "-C", str(cwd), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(cwd), "-c", "user.email=t@t", "-c", "user.name=t",
+                            "commit", "-qm", "herdr: persistent change"], check=True)
+        if "independent" in prompt and "reviewer" in prompt:
+            sha = re.search(r"Review commit ([0-9a-f]{40})", prompt).group(1)
+            output = re.search(r"to (/.+?\.pending\.json)", prompt).group(1)
+            Path(output).write_text(json.dumps({"verdict": "accept", "notes": "fake independent review", "sha": sha}))
     print(json.dumps({"result": {"agent": {"name": args[2], "pane_id": "w1:p-agent", "workspace_id": "w1",
                                                 "agent_status": "idle", "agent_session_id": f"real-{args[2]}-w1:p-agent",
                                                 "model": model, "thinking": thinking}}}))
+elif args[:2] == ["agent", "read"]:
+    print("fake durable agent output")
 elif args[:2] == ["workspace", "list"]:
     print(json.dumps({"result": {"workspaces": [{"workspace_id": "w1", "label": "First Mate"}]}}))
 elif args[:2] == ["tab", "list"]:

@@ -88,6 +88,22 @@ class ControlPlaneTests(unittest.TestCase):
             if old is None: os.environ.pop("HELM_AVAILABLE_MODELS", None)
             else: os.environ["HELM_AVAILABLE_MODELS"] = old
 
+    def test_pi_session_record_attests_model_thinking_identity_and_usage(self):
+        from helm import herdr
+        session = self.root / "session.jsonl"
+        session.write_text("\n".join(json.dumps(event) for event in [
+            {"type": "session", "id": "real-session"},
+            {"type": "model_change", "provider": "openai-codex", "modelId": "gpt-5.6-sol"},
+            {"type": "thinking_level_change", "thinkingLevel": "high"},
+            {"type": "message", "message": {"role": "assistant", "usage": {
+                "totalTokens": 120, "cost": {"total": 0.25}}}},
+        ]) + "\n")
+        agent = {"pane_id": "p1", "agent_status": "idle", "agent_session_path": str(session)}
+        herdr.validate_agent(agent, "openai-codex/gpt-5.6-sol", "high")
+        self.assertEqual(herdr.usage(agent), {"tokens": 120, "cost": 0.25})
+        with self.assertRaises(SystemExit):
+            herdr.validate_agent({**agent, "agent_session_id": "lie"}, "openai-codex/gpt-5.6-sol", "high")
+
     def test_latest_base_integration_and_exact_worktree_signature(self):
         from helm import worktree
         repo = self.root / "repo"; repo.mkdir()
@@ -116,10 +132,17 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(escalated["level"], "high-risk"); self.assertIn("verification", escalated["rationale"])
 
     def test_review_parser_requires_real_evidence(self):
-        from helm.work import _json_verdict
+        from helm.work import _json_verdict, _headless_reviews
         self.assertEqual(_json_verdict('noise {"verdict":"accept","notes":"ok"}')["verdict"], "accept")
         with self.assertRaises(SystemExit):
             _json_verdict("looks good")
+        run = self.root / "run"; run.mkdir()
+        (run / "review_correctness.json").write_text(json.dumps({"verdict": "accept", "notes": "ok"}))
+        item = {"dispatch": {"graph": "direct-pr"}}
+        self.assertEqual(_headless_reviews(item, {"run_dir": str(run)}, "a" * 40), [])
+        (run / "review_correctness.json").write_text(json.dumps(
+            {"verdict": "accept", "notes": "ok", "sha": "a" * 40}))
+        self.assertEqual(_headless_reviews(item, {"run_dir": str(run)}, "a" * 40)[0]["sha"], "a" * 40)
 
 
 if __name__ == "__main__":

@@ -111,6 +111,38 @@ class HerdrTests(unittest.TestCase):
         finally:
             os.environ.clear(); os.environ.update(old)
 
+    def test_live_steering_is_submitted_without_waiting_on_active_turn(self):
+        old = os.environ.copy(); os.environ.update(self.env)
+        try:
+            from helm import herdr
+            herdr.steer_agent("impl-x", "narrow the parser")
+            prompt = [c for c in self.calls() if c[:2] == ["agent", "prompt"]][-1]
+            self.assertNotIn("--wait", prompt)
+            self.assertIn("narrow the parser", prompt[3])
+        finally:
+            os.environ.clear(); os.environ.update(old)
+
+    def test_ship_runs_in_real_persistent_agent_and_reviews_bind_exact_sha(self):
+        env = {**self.env, "FAKE_HERDR_EXECUTE": "1",
+               "HELM_AVAILABLE_MODELS": "openai-codex/gpt-5.6-sol"}
+        env.pop("HELM_PIW", None)
+        r = subprocess.run(HELM + ["add", str(self.proj), "--id", "persistent", "--test", "true",
+                                  "--mode", "no-mistakes"], env=env, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = subprocess.run(HELM + ["task", "persistent", "change it", "--json"], env=env,
+                              text=True, capture_output=True)
+        self.assertEqual(task.returncode, 0, task.stderr); item = json.loads(task.stdout)
+        run = subprocess.run(HELM + ["run-once"], env=env, text=True, capture_output=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        shown = json.loads(subprocess.run(HELM + ["show", item["id"], "--json"], env=env,
+                                          text=True, capture_output=True, check=True).stdout)
+        self.assertEqual(shown["status"], "ready", shown)
+        self.assertTrue(shown["session"]["agent_session_id"].startswith("real-impl-"))
+        self.assertEqual(len(shown["reviews"]), 2)
+        self.assertTrue(all(review["sha"] == shown["head_sha"] for review in shown["reviews"]))
+        starts = [call for call in self.calls() if call[:2] == ["agent", "start"]]
+        self.assertEqual(len(starts), 3, "one persistent implementer plus two fresh reviewers")
+
     def test_ask_notifies_captain(self):
         self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
         self.helm("task", "p", "thing [fake:ask]")

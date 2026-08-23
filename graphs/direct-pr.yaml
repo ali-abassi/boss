@@ -36,7 +36,7 @@ steps:
     timeout: @{TIMEOUT}
   - id: diff
     needs: [verify]
-    cmd: git -C "@{CWD}" log --format='%h %s' @{BASE}..HEAD; echo; git -C "@{CWD}" diff @{BASE}...HEAD | head -c 200000
+    cmd: echo REVIEW_SHA=$(git -C "@{CWD}" rev-parse HEAD); git -C "@{CWD}" log --format='%h %s' @{BASE}..HEAD; echo; git -C "@{CWD}" diff @{BASE}...HEAD | head -c 200000
   - id: review_correctness
     needs: [diff]
     model: @{MODEL_REVIEW_CORRECTNESS}
@@ -44,7 +44,8 @@ steps:
     prompt: |
       You are a strict code reviewer. The task brief and the resulting diff are
       below. Decide whether the diff correctly and completely implements the
-      brief without regressions. Reply with JSON only, exactly: {"verdict": "accept" or "reject", "notes": "why"}.
+      brief without regressions. Copy the full REVIEW_SHA from the evidence into
+      your response. Reply with JSON only, exactly: {"verdict": "accept" or "reject", "notes": "why", "sha": "full REVIEW_SHA"}.
 
       BRIEF:
       {input}
@@ -54,5 +55,6 @@ steps:
     schema:
       verdict: {type: string, enum: [accept, reject]}
       notes: string
+      sha: string
     gate: python3 -c 'import json,sys; v=str(json.load(open(sys.argv[1])).get("verdict","")).lower(); sys.exit(0 if v in ("accept","pass") else 1)' "$OUT"
     retries: 0

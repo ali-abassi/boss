@@ -55,7 +55,10 @@ GIT_OPTS = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]
 
 
 def git(repo: Path | str, *args: str, check: bool = True) -> str:
-    return sh(["git", *GIT_OPTS, "-C", str(repo), *args], check=check).stdout.strip()
+    # Supervisor reads (especially live scope polling) must never contend with an
+    # implementer's commit by taking Git's optional index refresh lock.
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    return sh(["git", *GIT_OPTS, "-C", str(repo), *args], check=check, env=env).stdout.strip()
 
 
 def log(msg: str) -> None:

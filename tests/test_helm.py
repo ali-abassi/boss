@@ -122,6 +122,34 @@ class HelmTests(unittest.TestCase):
         self.assertEqual(item["status"], "paused"); self.assertIn("budget", item["ask"]["question"].lower())
         self.assertTrue((self.home / "worktrees" / "p" / item["id"]).exists())
 
+    def test_active_headless_pause_stops_runner_and_preserves_recoverable_worktree(self):
+        self.add(mode="local-only")
+        item = self.task("slow bounded work")
+        env = {**self.env, "FAKE_PIW_MODE": "ok", "FAKE_PIW_SECONDS": "5"}
+        proc = subprocess.Popen(HELM + ["run-once"], env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.time() + 10
+        while time.time() < deadline and self.show(item["id"])["status"] != "running":
+            time.sleep(0.05)
+        self.helm("pause", item["id"])
+        stdout, stderr = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 0, stdout + stderr)
+        paused = self.show(item["id"])
+        self.assertEqual(paused["status"], "paused")
+        self.assertIsNotNone(paused["checkpoint"])
+        self.assertTrue((self.home / "worktrees" / "p" / item["id"]).exists())
+        self.helm("resume", item["id"]); self.helm("run-once")
+        self.assertEqual(self.show(item["id"])["status"], "ready")
+
+    def test_headless_review_evidence_must_name_the_exact_sha(self):
+        self.add(mode="direct-pr", authority=1)
+        for value in ("omit", "wrong"):
+            item = self.task(f"review evidence {value}", **{"max-attempts": 1})
+            r = subprocess.run(HELM + ["run-once"], env={**self.env, "FAKE_PIW_REVIEW_SHA": value},
+                               text=True, capture_output=True)
+            self.assertNotEqual(self.show(item["id"])["status"], "ready", r.stdout + r.stderr)
+            self.assertIn("exact-sha-review", self.show(item["id"])["failure_notes"][-1]["notes"])
+
     def test_uncommitted_mutation_invalidates_ready_promotion(self):
         self.add(mode="local-only", authority=3)
         item = self.task(); self.helm("run-once")

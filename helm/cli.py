@@ -339,20 +339,21 @@ def cmd_control(a):
     it = control.request(a.id, a.action, value if a.action == "steer" else (value.lower() in ("on", "true", "1") if a.action == "away" else None))
     event_id = (it.get("controls", {}).get("events") or [{}])[-1].get("id")
     delivered = a.action not in ("steer", "pause", "interrupt")
-    if a.action in ("steer", "pause", "interrupt") and target and herdr.inside():
-        if a.action == "interrupt":
-            herdr.interrupt_agent(target)
-            herdr.steer_agent(target, "Checkpoint current work, do not discard it, then wait for resume.")
-        elif a.action == "pause":
-            herdr.steer_agent(target, "Cooperatively checkpoint current work, commit safe progress if appropriate, then pause for resume.")
-        else:
-            herdr.steer_agent(target, value)
+    if a.action == "steer" and target and herdr.inside():
+        # Non-blocking submission: never mistake the completion of an already
+        # active turn for acknowledgement of this steering message.
+        herdr.steer_agent(target, value)
         delivered = True
+    # Running pause/interrupt is consumed by the runner monitor, which performs
+    # interrupt -> settle -> checkpoint. Marking it paused here would race that
+    # sequence and could release the item before its checkpoint exists.
     if a.action in ("pause", "interrupt"):
+        was_queued = it["status"] == "queued"
         def paused(x):
-            x["controls"]["paused"] = True; x["phase"] = "paused"
-            if x["status"] == "queued": x["status"] = "paused"
+            if x["status"] == "queued":
+                x["controls"]["paused"] = True; x["phase"] = "paused"; x["status"] = "paused"
         it = control.cas_update(a.id, paused)
+        delivered = was_queued
     elif a.action in ("resume", "recover") and it["status"] in ("paused", "failed"):
         def resumed(x):
             x.update(status="queued", phase="queued")

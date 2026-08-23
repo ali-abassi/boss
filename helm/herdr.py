@@ -64,6 +64,40 @@ def _result(out: dict, key: str) -> dict:
 LIVE_STATES = {"idle", "done", "working", "blocked"}
 
 
+def session_evidence(agent: dict) -> dict:
+    """Read authoritative model, thinking and usage from the durable Pi JSONL."""
+    raw = agent.get("agent_session_path")
+    if not raw:
+        return {}
+    path = Path(str(raw))
+    if not path.is_absolute() or not path.is_file():
+        return {}
+    evidence = {"agent_session_path": str(path)}
+    total_tokens, total_cost = 0, 0.0
+    try:
+        with path.open() as handle:
+            for line in handle:
+                try: event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeError): continue
+                if event.get("type") == "session" and event.get("id"):
+                    evidence["agent_session_id"] = event["id"]
+                elif event.get("type") == "model_change":
+                    provider, model = event.get("provider"), event.get("modelId")
+                    if provider and model: evidence["model"] = f"{provider}/{model}"
+                elif event.get("type") == "thinking_level_change" and event.get("thinkingLevel"):
+                    evidence["thinking"] = event["thinkingLevel"]
+                message = event.get("message") or {}
+                usage = message.get("usage") or {}
+                if message.get("role") == "assistant" and isinstance(usage.get("totalTokens"), (int, float)):
+                    total_tokens += usage["totalTokens"]
+                    cost = usage.get("cost") or {}
+                    if isinstance(cost.get("total"), (int, float)): total_cost += cost["total"]
+    except OSError:
+        return {}
+    evidence["tokens"] = total_tokens; evidence["cost"] = total_cost
+    return evidence
+
+
 def agent_get(target: str) -> dict | None:
     """Return only a positively live agent; a stale/dead/unknown record is not reconnectable."""
     out = _cli("agent", "get", target)
@@ -73,7 +107,7 @@ def agent_get(target: str) -> dict | None:
     state = agent.get("agent_status") or agent.get("status") or agent.get("state")
     if state not in LIVE_STATES or not agent.get("pane_id"):
         return None
-    return agent
+    return {**agent, **session_evidence(agent)}
 
 
 def _reported_model(agent: dict) -> str | None:
@@ -87,14 +121,29 @@ def _reported_model(agent: dict) -> str | None:
 def validate_agent(agent: dict, model: str, thinking: str) -> None:
     """Fail closed when Herdr cannot attest the frozen model and thinking level."""
     from .util import HelmError
-    actual_model = _reported_model(agent)
-    actual_thinking = agent.get("thinking") or agent.get("thinking_level") or (agent.get("metadata") or {}).get("thinking")
+    evidence = session_evidence(agent)
+    actual_model = _reported_model({**agent, **evidence})
+    actual_thinking = evidence.get("thinking") or agent.get("thinking") or agent.get("thinking_level") or (agent.get("metadata") or {}).get("thinking")
     if actual_model is None or actual_thinking is None:
         raise HelmError("Herdr agent omitted model/thinking metadata; refusing an unverifiable session")
     if actual_model != model or str(actual_thinking) != thinking:
         raise HelmError(f"agent drift: resolved {model} thinking={thinking}, got {actual_model} thinking={actual_thinking}")
-    if not agent.get("agent_session_id"):
+    if not (agent.get("agent_session_id") or evidence.get("agent_session_id")):
         raise HelmError("Herdr agent omitted its durable session identity")
+    if agent.get("agent_session_id") and evidence.get("agent_session_id") and agent["agent_session_id"] != evidence["agent_session_id"]:
+        raise HelmError("Herdr session identity disagrees with the durable Pi session record")
+
+
+def usage(agent: dict | None) -> dict:
+    """Return only trustworthy numeric usage; never expose Herdr display dictionaries."""
+    if not agent:
+        return {}
+    evidence = session_evidence(agent)
+    out = {}
+    for key in ("tokens", "cost"):
+        value = evidence.get(key, agent.get(key))
+        if isinstance(value, (int, float)) and not isinstance(value, bool): out[key] = value
+    return out
 
 
 def agent_read(target: str, lines: int = 120) -> str:
@@ -136,6 +185,19 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
     args = ["agent", "start", name, "--kind", "pi", "--pane", tab["pane_id"], "--timeout", "60000",
             "--", "--model", model, "--thinking", thinking]
     agent = _result(cli_required(*args), "agent")
+    # Pi reports its durable session path shortly after interactive readiness.
+    # Wait for that authoritative attestation instead of trusting launch args.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        enriched = agent_get(agent.get("name") or name)
+        if enriched:
+            agent = {**agent, **enriched}
+        evidence = session_evidence(agent)
+        if (_reported_model({**agent, **evidence}) and
+                (evidence.get("thinking") or agent.get("thinking") or agent.get("thinking_level"))):
+            break
+        time.sleep(0.1)
+    agent = {**agent, **session_evidence(agent)}
     try:
         validate_agent(agent, model, thinking)
     except BaseException:
@@ -151,8 +213,47 @@ def prompt_agent(target: str, text: str, timeout: int) -> dict:
     return _result(cli_required("agent", "prompt", target, text, "--wait", "--timeout", str(timeout * 1000)), "agent")
 
 
+def prompt_agent_async(target: str, text: str) -> dict:
+    """Submit steering without waiting on whichever turn was already active."""
+    return _result(cli_required("agent", "prompt", target, text), "agent")
+
+
 def wait_agent(target: str, timeout: int) -> dict:
     return _result(cli_required("agent", "wait", target, "--timeout", str(timeout * 1000)), "agent")
+
+
+def wait_agent_monitored(target: str, timeout: int, monitor) -> tuple[dict, object | None]:
+    """Reconnect to an already-working turn without giving up live controls."""
+    cmd = ["herdr", "agent", "wait", target, "--timeout", str(timeout * 1000)]
+    if os.environ.get("HERDR_SESSION"):
+        cmd += ["--session", os.environ["HERDR_SESSION"]]
+    proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    finding = None
+    deadline = time.monotonic() + timeout + 10
+    while proc.poll() is None:
+        finding = monitor()
+        if finding or time.monotonic() >= deadline:
+            interrupt_agent(target); break
+        time.sleep(0.2)
+    try: stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.terminate(); stdout, stderr = proc.communicate(timeout=5)
+    if finding:
+        try:
+            wait_agent(target, 30)
+            prompt_agent(target,
+                "Checkpoint the current work now. Preserve every useful change, commit safe progress when possible, "
+                "summarize remaining work and blockers, then stop and wait for resume.", 120)
+        except BaseException: finding["agent_checkpoint"] = "unavailable"
+        else: finding["agent_checkpoint"] = "complete"
+        return agent_get(target) or {}, finding
+    if proc.returncode != 0:
+        from .util import HelmError
+        raise HelmError(f"Herdr agent wait failed: {(stderr or stdout).strip()[-500:]}")
+    try: return _result(json.loads(stdout), "agent"), None
+    except (json.JSONDecodeError, TypeError):
+        from .util import HelmError
+        raise HelmError("Herdr agent wait returned no real agent identity")
 
 
 def prompt_agent_monitored(target: str, text: str, timeout: int, monitor) -> tuple[dict, object | None]:
@@ -181,6 +282,22 @@ def prompt_agent_monitored(target: str, text: str, timeout: int, monitor) -> tup
         from .util import HelmError
         raise HelmError(f"Herdr agent prompt failed: {(stderr or stdout).strip()[-500:]}")
     if finding:
+        # Escape stops the active turn. Pause/interrupt additionally ask the same
+        # durable agent to leave a compact, committed checkpoint before we persist
+        # the paused state. This is deliberately after the active --wait exits: a
+        # second waiting prompt could otherwise match the first turn's completion.
+        if isinstance(finding, dict) and finding.get("control") in ("pause", "interrupt", "budget"):
+            try:
+                wait_agent(target, 30)
+                prompt_agent(target,
+                    "Checkpoint the current work now. Preserve every useful change, commit safe progress when possible, "
+                    "summarize remaining work and blockers, then stop and wait for resume.", 120)
+            except BaseException:
+                # The filesystem/worktree checkpoint is still retained. The caller
+                # records that the cooperative agent checkpoint was unavailable.
+                finding["agent_checkpoint"] = "unavailable"
+            else:
+                finding["agent_checkpoint"] = "complete"
         return agent_get(target) or {}, finding
     try:
         return _result(json.loads(stdout), "agent"), None
@@ -190,7 +307,7 @@ def prompt_agent_monitored(target: str, text: str, timeout: int, monitor) -> tup
 
 
 def steer_agent(target: str, text: str, timeout: int = 300) -> dict:
-    return prompt_agent(target, "STEERING FROM THE CAPTAIN:\n" + text, timeout)
+    return prompt_agent_async(target, "STEERING FROM THE CAPTAIN:\n" + text)
 
 
 def interrupt_agent(target: str) -> None:

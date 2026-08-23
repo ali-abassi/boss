@@ -53,15 +53,21 @@ if mode in ("scout", "scout-write"):
     (run_dir / "report.md").write_text("# Report\n\nfindings…\n")
     if mode == "scout-write": Path(cwd, "scout-wrote.txt").write_text("forbidden\n")
     done(True, [])
-# The stand-in emits actual reviewer-node evidence; the control plane never invents verdicts.
-if "review_correctness" in text:
-    (run_dir / "review_correctness.json").write_text(json.dumps({"verdict": "accept", "notes": "fake reviewer evidence"}))
-if "review_adversarial" in text:
-    (run_dir / "review_adversarial.json").write_text(json.dumps({"verdict": "accept", "notes": "fake reviewer evidence"}))
 # ok: make a commit in the worktree, honouring guidance if present
 Path(cwd, "helm-change.txt").write_text("changed\n" + ("guided\n" if "Captain guidance" in brief else ""))
 if mode == "sensitive": Path(cwd, "package-lock.json").write_text(json.dumps({"generated": time.time()}))
 subprocess.run(["git", "-C", cwd, "add", "-A"], check=True)
 subprocess.run(["git", "-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "helm: fake change"], check=True)
+sha = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+review_sha = {"omit": None, "wrong": "0" * 40}.get(os.environ.get("FAKE_PIW_REVIEW_SHA"), sha)
+# The stand-in emits actual exact-SHA reviewer-node evidence; the control plane never invents verdicts.
+if "review_correctness" in text:
+    evidence = {"verdict": "accept", "notes": "fake reviewer evidence"}
+    if review_sha is not None: evidence["sha"] = review_sha
+    (run_dir / "review_correctness.json").write_text(json.dumps(evidence))
+if "review_adversarial" in text:
+    evidence = {"verdict": "accept", "notes": "fake reviewer evidence"}
+    if review_sha is not None: evidence["sha"] = review_sha
+    (run_dir / "review_adversarial.json").write_text(json.dumps(evidence))
 if mode == "dirty": Path(cwd, "unreviewed.txt").write_text("must not deliver\n")
 done(True, [])
