@@ -3,12 +3,13 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, subprocess, tempfile, unittest, uuid
+import json, os, subprocess, sys, tempfile, unittest, uuid
 from pathlib import Path
 from unittest import mock
+from tests.fake_helm import fake_sandbox_status
 
 REPO = Path(__file__).resolve().parents[1]
-HELM = [str(REPO / "bin" / "helm")]
+HELM = [sys.executable, str(REPO / "tests" / "fake_helm.py")]
 
 
 class HerdrTests(unittest.TestCase):
@@ -26,6 +27,8 @@ class HerdrTests(unittest.TestCase):
                     "PI_CODING_AGENT_DIR": str(self.pi_home),
                     "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_HERDR_LOG": str(self.log),
                     "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1", "HERDR_SESSION": "pi-x", "HERDR_PANE_ID": "w1:p1"}
+        sandbox_patch = mock.patch("helm.sandbox.available", side_effect=fake_sandbox_status)
+        sandbox_patch.start(); self.addCleanup(sandbox_patch.stop)
 
     def helm(self, *args, check=True):
         r = subprocess.run(HELM + list(args), env=self.env, text=True, capture_output=True)
