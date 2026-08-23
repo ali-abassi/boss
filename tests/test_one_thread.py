@@ -11,11 +11,11 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, shutil, subprocess, tempfile, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-HELM = [sys.executable, str(REPO / "bin" / "helm")]
+HELM = [str(REPO / "bin" / "helm")]
 
 
 def git(repo, *args):
@@ -25,6 +25,7 @@ def git(repo, *args):
 class OneThreadTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.procs = []
         self.home = self.tmp / "home"
         self.env = {**os.environ, "HELM_HOME": str(self.home),
                     "HELM_PIW": str(REPO / "tests" / "fake_piw.py"), "FAKE_PIW_SECONDS": "0.6"}
@@ -36,6 +37,15 @@ class OneThreadTest(unittest.TestCase):
             (repo / "README.md").write_text(f"# {name}\n"); git(repo, "add", "-A"); git(repo, "commit", "-qm", "init")
             self.projects[name] = repo
             self.helm("add", str(repo), "--id", name, "--test", "true", "--mode", "local-only", "--authority", "3")
+
+    def tearDown(self):
+        for process in reversed(self.procs):
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait(timeout=5)
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def helm(self, *args, check=True):
         r = subprocess.run(HELM + list(args), env=self.env, text=True, capture_output=True)
@@ -49,6 +59,7 @@ class OneThreadTest(unittest.TestCase):
     def run_two_daemons_until_drained(self):
         procs = [subprocess.Popen(HELM + ["daemon", "--owner", f"worker-{i}", "--interval", "0", "--once-idle", "3"],
                                   env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in (1, 2)]
+        self.procs.extend(procs)
         for p in procs:
             out, err = p.communicate(timeout=120)
             self.assertEqual(p.returncode, 0, err)
@@ -127,7 +138,7 @@ class OneThreadTest(unittest.TestCase):
         # 8. Every delegation is auditable: who ran it, which graph, which model, what it cost.
         for i in ids:
             it = by_id[i]
-            self.assertIn(it["dispatch"]["graph"], ("local-only", "no-mistakes", "scout"))
+            self.assertIn(it["dispatch"]["graph"], ("local-only", "high-assurance", "scout"))
             self.assertTrue(it["dispatch"]["models"]["implement"])
             self.assertTrue((self.home / "work" / i / "steps.yaml").is_file())
             self.assertTrue(all(r["run_dir"] and Path(r["run_dir"]).is_dir() for r in it["runs"]))

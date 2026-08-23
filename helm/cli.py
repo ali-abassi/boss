@@ -7,11 +7,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from . import registry, dispatch, work, deliver, worktree, herdr, board, control, scope, __version__
-from .paths import home, projects_file, dispatch_file, GRAPHS
-from .util import HelmError, log, now
+from . import registry, dispatch, work, deliver, worktree, herdr, board, control, scope, gates, supervisor, processes, __version__
+from .paths import home, dispatch_file, authority_lock
+from .util import HelmError, locked, log, now, private_mkdir, write_json
 
 
 def out(obj, as_json: bool, text: str | None = None):
@@ -22,7 +23,7 @@ def out(obj, as_json: bool, text: str | None = None):
 
 
 def cmd_add(a):
-    p = registry.add(a.path, a.id, a.mode, a.authority, a.test, a.protected.split(",") if a.protected else [], a.base)
+    p = registry.add(a.path, a.id, a.mode, a.authority, a.test, a.protected.split(",") if a.protected else [], a.base, a.gate)
     out(p, a.json, f"registered {p['id']}  mode {p['mode']} · authority {p['authority']} · base {p['base']}\n"
                    f"  test: {p['test_cmd'] or '(none found)'}")
     if not p["test_cmd"]:
@@ -34,78 +35,119 @@ def cmd_add(a):
 # ---------------------------------------------------------------- daemon lifecycle
 
 def _pid_file(): return home() / "daemon.pid"
+def _pid_lock(): return home() / "daemon.lock"
 
-def daemon_pids() -> list[int]:
+def _daemon_records_unlocked() -> list[object]:
     try:
         raw = _pid_file().read_text().strip()
         value = json.loads(raw)
-        candidates = value if isinstance(value, list) else [int(value)]
+        return value if isinstance(value, list) else [value]
     except (OSError, ValueError, json.JSONDecodeError):
         return []
-    alive = []
-    for value in candidates:
-        try:
-            pid = int(value); os.kill(pid, 0); alive.append(pid)
-        except (OSError, TypeError, ValueError):
-            pass
-    if alive != candidates:
-        if alive: _pid_file().write_text(json.dumps(alive))
-        else: _pid_file().unlink(missing_ok=True)
-    return alive
+
+
+def _daemon_pids_unlocked() -> list[int]:
+    return [probe["pid"] for record in _daemon_records_unlocked()
+            if (probe := processes.probe(record)).get("state") == "live"]
+
+
+def daemon_pids() -> list[int]:
+    with locked(_pid_lock()):
+        return _daemon_pids_unlocked()
 
 def daemon_pid():
     pids = daemon_pids()
     return pids[0] if pids else None
 
 
-HELM_BIN = str(Path(__file__).resolve().parents[1] / "bin" / "helm")
-
-
 def cmd_up(a):
-    home().mkdir(parents=True, exist_ok=True)
+    home().mkdir(parents=True, exist_ok=True, mode=0o700)
     if herdr.inside():
         return _up_herdr(a)
     return _up_background(a)
 
 
 def _up_background(a, *, quiet: bool = False):
-    existing = daemon_pids()
-    desired = max(1, a.workers)
-    if len(existing) >= desired:
-        if a.json: out({"pids": existing}, True)
-        elif not quiet: print(f"{len(existing)} worker{'s' if len(existing) != 1 else ''} already running")
-        return
-    logf = open(home() / "daemon.log", "ab")
-    pids = list(existing)
-    for n in range(len(existing) + 1, desired + 1):
-        p = subprocess.Popen([sys.executable, HELM_BIN, "daemon", "--owner", f"worker-{n}", "--interval", str(a.interval)],
-                             stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True, env=os.environ)
-        pids.append(p.pid)
-    _pid_file().write_text(json.dumps(pids))
+    with locked(_pid_lock()):
+        records = _daemon_records_unlocked()
+        existing = [probe["pid"] for record in records
+                    if (probe := processes.probe(record)).get("state") == "live"]
+        desired = max(1, a.workers)
+        if len(existing) >= desired:
+            if a.json: out({"pids": existing}, True)
+            elif not quiet: print(f"{len(existing)} worker{'s' if len(existing) != 1 else ''} already running")
+            return
+        pids = list(existing)
+        with open(home() / "daemon.log", "ab") as logf:
+            for n in range(len(existing) + 1, desired + 1):
+                owner = f"worker-{n}"
+                # This process is already running under bin/helm's verified
+                # runtime. Reuse that exact interpreter and module entry point
+                # so the PID's command is stable before identity capture.
+                p = subprocess.Popen([sys.executable, "-m", "helm", "daemon", "--owner", owner,
+                                      "--interval", str(a.interval)],
+                                     stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                                     start_new_session=True, env=os.environ)
+                identity = None
+                for _ in range(20):
+                    identity = processes.capture(p.pid, owner)
+                    if identity and p.poll() is None:
+                        break
+                    time.sleep(0.025)
+                if not identity or p.poll() is not None:
+                    if p.poll() is None:
+                        p.terminate()
+                        try: p.wait(timeout=5)
+                        except subprocess.TimeoutExpired: p.kill(); p.wait()
+                    raise HelmError("worker started without a provable process identity; it was stopped")
+                records.append(identity); pids.append(p.pid)
+                write_json(_pid_file(), records)
     if a.json: out({"pids": pids}, True)
     elif not quiet: print(f"{len(pids)} worker{'s' if len(pids) != 1 else ''} running")
 
 
 def _up_herdr(a):
     """Herdr shows real task agents; schedulers stay invisible in the background."""
-    from .util import read_json
-    existing = read_json(home() / "herdr.json", {"tabs": []})["tabs"]
-    for tab in [t for t in existing if t.get("kind") in ("board", "worker")]:
-        herdr.close_tab(tab["tab_id"]); herdr.forget(tab["tab_id"])
+    # Legacy fleet/worker tabs are closed only when session/workspace/label
+    # still prove exact ownership. A reused ID is preserved for doctor rather
+    # than closing somebody else's live tab.
+    herdr.close_all("board")
+    herdr.close_all("worker")
     return _up_background(a, quiet=True)
 
 
 def cmd_down(a):
     closed = herdr.close_all() if (home() / "herdr.json").exists() else 0
-    pids = daemon_pids()
-    if not pids:
-        out({"stopped": False, "tabs_closed": closed}, a.json, f"closed {closed} herdr tabs" if closed else "workers not running")
-        return
-    for pid in pids:
-        try: os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (OSError, ProcessLookupError): pass
-    _pid_file().unlink(missing_ok=True)
-    out({"stopped": True, "pids": pids}, a.json, f"stopped {len(pids)} workers; a running attempt will be reclaimed next start")
+    with locked(_pid_lock()):
+        records = _daemon_records_unlocked()
+        signalled, remaining = [], []
+        for record in records:
+            evidence = processes.probe(record)
+            if evidence.get("state") == "live":
+                try:
+                    os.killpg(evidence["pgid"], signal.SIGTERM); signalled.append(record)
+                except (OSError, ProcessLookupError):
+                    remaining.append(record)
+            elif evidence.get("state") == "dead":
+                continue
+            else:
+                remaining.append(record)
+        deadline = time.monotonic() + 10
+        pending = list(signalled)
+        while pending and time.monotonic() < deadline:
+            pending = [record for record in pending if processes.probe(record).get("state") != "dead"]
+            if pending: time.sleep(0.05)
+        stopped = [int(record.get("pid")) for record in signalled if record not in pending]
+        remaining.extend(pending)
+        if remaining: write_json(_pid_file(), remaining)
+        else: _pid_file().unlink(missing_ok=True)
+        if remaining:
+            raise HelmError(f"shutdown could not prove {len(remaining)} worker identity/identities stopped; state was retained for doctor")
+        if not stopped:
+            out({"stopped": False, "tabs_closed": closed}, a.json, f"closed {closed} herdr tabs" if closed else "workers not running")
+            return
+    out({"stopped": True, "pids": stopped, "untrusted_records": 0}, a.json,
+        f"stopped {len(stopped)} workers; interrupted work remains preserved for doctor/recover")
 
 
 def cmd_status(a):
@@ -116,7 +158,8 @@ def cmd_status(a):
     pid = daemon_pid()
     from .util import read_json
     tabs = read_json(home() / "herdr.json", {"tabs": []})["tabs"]
-    data = {"workers": pid, "herdr_tabs": tabs, "projects": len(registry.load()["projects"]), "items": counts}
+    data = {"workers": pid, "herdr_tabs": tabs, "projects": len(registry.load()["projects"]), "items": counts,
+            "supervisor": supervisor.summary()}
     if a.json:
         return out(data, True)
     print(board.render(pid))
@@ -142,13 +185,17 @@ def pi_home() -> Path:
 
 def _isolated_pi_home() -> Path:
     dst = pi_home()
-    dst.mkdir(parents=True, exist_ok=True)
+    private_mkdir(dst)
     settings = dst / "settings.json"
     current = json.loads(settings.read_text()) if settings.exists() else {}
     if "defaultModel" not in current:                      # seed once; the captain's later choices stick
         current.update(PI_HOME_SETTINGS)
-        settings.write_text(json.dumps(current, indent=2) + "\n")
-    (dst / "README").write_text("first mate's private Pi home — managed by helm. Log in here with `helm setup`.\n")
+        write_json(settings, current)
+    readme = dst / "README"
+    if not readme.exists():
+        descriptor = os.open(readme, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write("first mate's private Pi home — managed by helm. Log in here with `helm setup`.\n")
     return dst
 
 
@@ -199,15 +246,13 @@ def cmd_launch(a):
         return cmd_captain(argparse.Namespace(harness=a.harness, workers=a.workers))
     binary = shutil.which("herdr")
     if not binary:
-        if os.environ.get("PI_FIRSTMATE_HEADLESS") == "1":
-            return cmd_captain(argparse.Namespace(harness=a.harness, workers=a.workers))
-        raise HelmError("Herdr is required for persistent First Mate sessions. Install Herdr, or set PI_FIRSTMATE_HEADLESS=1 for the documented non-persistent fallback.")
+        raise HelmError("Herdr is required for persistent First Mate sessions; no non-persistent worker fallback is fabricated")
     session = a.session
     def call(*args):
         return subprocess.run([binary, "--session", session, *args], text=True, capture_output=True, stdin=subprocess.DEVNULL)
     probe = call("workspace", "list")
     if probe.returncode and "server_not_running" in (probe.stderr or probe.stdout):
-        home().mkdir(parents=True, exist_ok=True)
+        home().mkdir(parents=True, exist_ok=True, mode=0o700)
         logf = open(home() / "herdr-server.log", "ab")
         subprocess.Popen([binary, "--session", session, "server"], stdin=subprocess.DEVNULL,
                          stdout=logf, stderr=logf, start_new_session=True)
@@ -236,11 +281,13 @@ def cmd_launch(a):
     mate_tab = next((t for t in tabs if t.get("label") == "⚓ First Mate"), None)
     pane = None
     if mate_tab:
+        created_mate = False
         panes = (hc("pane", "list").get("result") or {}).get("panes") or []
         pane_info = next((p for p in panes if p.get("tab_id") == mate_tab.get("tab_id")), None)
         pane = (pane_info or {}).get("pane_id")
         running = (pane_info or {}).get("agent") == "pi" or (pane_info or {}).get("agent_status") in ("idle", "working")
     else:
+        created_mate = True
         running = False
         made = hc("tab", "create", "--workspace", workspace_id, "--cwd", str(Path(__file__).resolve().parents[1]),
                   "--label", "⚓ First Mate", "--no-focus", "--env", f"HELM_HOME={home()}",
@@ -258,8 +305,16 @@ def cmd_launch(a):
     if not pane:
         raise HelmError("The First Mate tab has no pane; close it and run pi-firstmate again")
     if not running:
+        if not herdr.wait_shell(pane, session=session, binary=binary):
+            if created_mate and mate_tab.get("tab_id"):
+                hc("tab", "close", mate_tab["tab_id"])
+            raise HelmError("The First Mate shell did not become ready; no command was sent")
         command = shlex.quote(str(Path(__file__).resolve().parents[1] / "bin" / "pi-firstmate"))
         if a.harness != "pi": command += " " + shlex.quote(a.harness)
+        # Herdr 0.8 queues input for --no-focus tabs. Focusing before pane run
+        # is required command delivery; attaching later is not soon enough.
+        if mate_tab.get("tab_id"):
+            hc("tab", "focus", mate_tab["tab_id"])
         hc("pane", "run", pane, command)
         deadline = time.time() + 8
         while time.time() < deadline:
@@ -320,7 +375,7 @@ def cmd_tail(a):
 
 
 def cmd_set(a):
-    p = registry.set_fields(a.id, mode=a.mode, authority=a.authority, test_cmd=a.test, base=a.base,
+    p = registry.set_fields(a.id, mode=a.mode, authority=a.authority, test_cmd=a.test, base=a.base, gate=a.gate,
                             protected_paths=a.protected.split(",") if a.protected else None)
     out(p, a.json, f"{p['id']}: {p['mode']} authority {p['authority']} base {p['base']}")
 
@@ -378,19 +433,29 @@ def cmd_inspect(a):
 
 def cmd_control(a):
     it = work.load(a.id)
+    if a.action in ("resume", "recover"):
+        if exhausted := work.budget_blockers(it):
+            raise HelmError(f"{a.action} refused with exhausted budget or unproven usage (" + ", ".join(exhausted) +
+                            "); raise it explicitly with `helm budget` first")
+    if (a.action == "resume" and
+            (it.get("phase") == "recovery-required" or it.get("recovery_claim_token"))):
+        raise HelmError("resume refused: unknown agent settlement retains a recovery claim; inspect it and use explicit `helm recover`")
     session = it.get("session") or {}
     target = session.get("agent_name")
     value = " ".join(getattr(a, "value", []) or [])
     if a.action == "away" and value.lower() not in ("on", "off", "true", "false", "1", "0"):
         raise HelmError("away requires on or off")
-    it = control.request(a.id, a.action, value if a.action == "steer" else (value.lower() in ("on", "true", "1") if a.action == "away" else None))
-    event_id = (it.get("controls", {}).get("events") or [{}])[-1].get("id")
+    it = control.request(a.id, a.action, value if a.action == "steer" else (value.lower() in ("on", "true", "1") if a.action == "away" else None),
+                         request_id=getattr(a, "request_id", None))
+    deduplicated = it.pop("_control_deduplicated", False)
+    events = it.get("controls", {}).get("events") or []
+    event_id = (next((event.get("id") for event in events if event.get("id") == getattr(a, "request_id", None)), None)
+                if getattr(a, "request_id", None) else (events[-1].get("id") if events else None))
     delivered = a.action not in ("steer", "pause", "interrupt")
-    if a.action == "steer" and target and herdr.inside():
+    if a.action == "steer" and target and it["status"] == "running" and herdr.inside() and not deduplicated:
         # Non-blocking submission: never mistake the completion of an already
         # active turn for acknowledgement of this steering message.
-        herdr.steer_agent(target, value)
-        delivered = True
+        delivered = work.deliver_steering(a.id, event_id, value, session, f"cli:{os.getpid()}")
     # Running pause/interrupt is consumed by the runner monitor, which performs
     # interrupt -> settle -> checkpoint. Marking it paused here would race that
     # sequence and could release the item before its checkpoint exists.
@@ -405,16 +470,47 @@ def cmd_control(a):
         def resumed(x):
             x.update(status="queued", phase="queued")
             x["controls"]["paused"] = False; x["controls"]["recovery_requested"] = False
-            if a.action == "recover": x["attempts"] = 0
+            if a.action == "recover":
+                x["attempts"] = 0; x["ask"] = None
+                unresolved_launch = next((launch for launch in reversed(x.get("agent_launches") or [])
+                                          if launch.get("role") == "implementer" and launch.get("state") in
+                                          {"reserved", "tab-created", "attested"}), {})
+                x["recovery_authorized"] = {"at": now(), "request_id": event_id,
+                                            # The newest unresolved launch edge is the thing
+                                            # being superseded.  Falling back to the finalized
+                                            # session is correct only when no open edge exists.
+                                            "session_id": (unresolved_launch.get("agent_session_id")
+                                                           or (x.get("session") or {}).get("agent_session_id"))}
         it = control.cas_update(a.id, resumed)
-    if delivered and event_id:
+    if delivered and event_id and a.action != "steer":
         it = control.consume(a.id, [event_id])
     out(control.redact(it), a.json, f"{a.id}: {a.action} recorded")
+
+
+def cmd_budget(a):
+    updates = {"tokens": a.tokens, "cost": a.cost, "seconds": a.seconds}
+    if all(value is None for value in updates.values()):
+        raise HelmError("budget requires at least one of --tokens, --cost, or --seconds")
+    if any(value is not None and value <= 0 for value in updates.values()):
+        raise HelmError("budget limits must be positive")
+    def mutate(item):
+        if item.get("status") not in ("paused", "needs-you", "failed"):
+            raise HelmError("budget changes require a paused/needs-you/failed item")
+        before = dict(item.get("budgets") or {})
+        item.setdefault("budgets", {}).update({key: value for key, value in updates.items() if value is not None})
+        item.setdefault("history", []).append({"at": now(), "from": item.get("status"), "to": item.get("status"),
+                                               "note": f"captain updated budget from {before} to {item['budgets']}"})
+    item = control.cas_update(a.id, mutate)
+    out(control.redact(item), a.json, f"{a.id}: budget updated; use `helm resume {a.id}` when ready")
 
 
 def cmd_scope(a):
     paths = scope.normalize(a.paths.split(","))
     def mutate(it):
+        if (it.get("promotion") or {}).get("state") in {"armed", "external-requested", "merge-observed", "cleanup-pending"}:
+            raise HelmError("scope change refused while exact-SHA promotion requires reconciliation")
+        if (it.get("pr_delivery") or {}).get("state") in {"armed", "push-requested", "push-confirmed", "pr-create-requested"}:
+            raise HelmError("scope change refused while exact-SHA PR delivery requires reconciliation")
         if it["status"] == "running": raise HelmError("cannot replace scope while running; pause first")
         project = registry.get(it["project"])
         global_claim = scope.is_global(paths) or any(scope.overlap(paths, [p]) for p in project.get("protected_paths", []))
@@ -480,24 +576,24 @@ def cmd_retry(a):
 
 
 def cmd_cancel(a):
-    it = work.load(a.id)
-    if a.discard:
-        registry_p = registry.get(it["project"])
-        worktree.remove(registry_p, it["id"], delete_branch=True)
-    it = work.cancel(a.id)
-    out(it, a.json, f"{it['id']} cancelled")
+    it = work.cancel(a.id, discard=a.discard)
+    receipt = ((it.get("cancellation") or {}).get("quarantine_result") or {}).get("path")
+    note = f"{it['id']} cancelled" + (f"; work preserved at {receipt}" if receipt else "; no worktree existed")
+    out(it, a.json, note)
 
 
 def cmd_promote(a):
     it = work.load(a.id)
     p = registry.get(it["project"])
-    ref = deliver.promote(it, p, a.confirm)
-    out(work.load(a.id), a.json, f"{it['id']} merged: {ref}")
+    result = deliver.promote(it, p, a.confirm)
+    verb = "merged" if result["state"] == "merged" else "merge requested; awaiting exact GitHub evidence"
+    out(work.load(a.id), a.json, f"{it['id']} {verb}: {result['ref']}")
 
 
 def cmd_run_once(a):
     it = work.claim_next(a.owner)
     if not it:
+        supervisor.scan()
         out({"claimed": None}, a.json, "nothing queued")
         return
     it = work.execute(it, timeout=a.timeout)
@@ -506,23 +602,126 @@ def cmd_run_once(a):
 
 def cmd_daemon(a):
     log(f"daemon start interval={a.interval}s")
-    idle = 0
-    while True:
-        it = work.claim_next(a.owner)
-        if it:
-            idle = 0
+    stopped = threading.Event()
+    def supervise_forever():
+        while not stopped.is_set():
             try:
-                work.execute(it, timeout=a.timeout)
-            except KeyboardInterrupt:
-                raise
-            except BaseException as e:  # execute() already marked the item failed; keep the loop alive
-                log(f"{it['id']}: executor error {e!r}")
-            continue
-        idle += 1
-        if a.once_idle and idle >= a.once_idle:
-            log("daemon: queue drained, exiting")
-            return
-        time.sleep(a.interval)
+                supervisor.scan()
+            except BaseException as exc:
+                log(f"supervisor scan unavailable: {getattr(exc, 'msg', None) or exc!r}")
+            try:
+                from . import forge
+                forge.monitor_all()
+            except BaseException as exc:
+                log(f"GitHub monitor unavailable: {getattr(exc, 'msg', None) or exc!r}")
+            stopped.wait(max(1, a.interval))
+    watcher = threading.Thread(target=supervise_forever,
+                               name=f"firstmate-supervisor:{a.owner}", daemon=True)
+    watcher.start()
+    idle = 0
+    try:
+        while True:
+            it = work.claim_next(a.owner)
+            if it:
+                idle = 0
+                try:
+                    work.execute(it, timeout=a.timeout)
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as e:  # execution state is already preserved; keep the loop alive
+                    log(f"{it['id']}: executor error {e!r}")
+                continue
+            idle += 1
+            if a.once_idle and idle >= a.once_idle:
+                log("daemon: queue drained, exiting")
+                return
+            time.sleep(a.interval)
+    finally:
+        stopped.set(); watcher.join(timeout=max(2, a.interval + 1))
+
+
+def cmd_supervise(a):
+    observations = supervisor.scan(probe_agents=not a.no_herdr)
+    out(observations, a.json, "\n".join(f"{o['item_id']}: {o['classification']} — {o['reason']}" for o in observations) or "no work items")
+
+
+def cmd_wakes(a):
+    if a.ack:
+        count = supervisor.acknowledge(a.ack.split(","), a.consumer)
+        return out({"acknowledged": count}, a.json, f"acknowledged {count} wake(s)")
+    if a.release:
+        count = supervisor.release(a.release.split(","), a.consumer)
+        return out({"released": count}, a.json, f"released {count} wake claim(s)")
+    if a.sending:
+        count = supervisor.mark_sending(a.sending.split(","), a.consumer)
+        return out({"sending": count}, a.json, f"marked {count} wake send(s) in progress")
+    if a.sent:
+        count = supervisor.mark_sent(a.sent.split(","), a.consumer)
+        return out({"sent": count}, a.json, f"marked {count} wake send(s) durable")
+    if a.renew:
+        count = supervisor.renew(a.renew.split(","), a.consumer)
+        return out({"renewed": count}, a.json, f"renewed {count} wake receipt(s)")
+    events = supervisor.claim(a.consumer, limit=a.limit) if a.claim else supervisor.pending()
+    out(events, a.json, "\n".join(f"[{e['classification']}] {e['item_id']} — {e['reason']}" for e in events) or "no pending wakes")
+
+
+def cmd_wait(a):
+    item = supervisor.declare_wait(a.id, a.duration, " ".join(a.reason))
+    wait = item.get("declared_wait")
+    out(item, a.json, f"{a.id}: " + (f"waiting until {wait['until']}" if wait else "declared wait cleared"))
+
+
+def cmd_forge(a):
+    from . import forge
+    observations = forge.monitor_all() if a.all else [{"item_id": a.id, **forge.monitor_item(a.id, force=True)}]
+    out(observations, a.json, "\n".join(f"{o['item_id']}: {o['classification']} — {o['reason']}" for o in observations) or "no open GitHub PRs")
+
+
+def cmd_gate_status(a):
+    item = work.load(a.id); project = registry.get(item["project"])
+    result = gates.inspect_item(item, project)
+    out(result, a.json, f"{a.id}: {result.get('classification')} — {result.get('reason')}")
+    return 0 if result.get("classification") in {"checks-passed", "needs-you", "running"} else 1
+
+
+def cmd_gate_reconcile(a):
+    with locked(authority_lock()):
+        result = gates.reconcile(a.id)
+    observation = (result.get("external_gate") or {}).get("last_observation") or {}
+    out(control.redact(result), a.json,
+        f"{a.id}: {observation.get('classification')} — {observation.get('reason')}")
+
+
+def cmd_gate_respond(a):
+    findings = [value.strip() for value in (a.findings or "").split(",") if value.strip()]
+    with locked(authority_lock()):
+        result = gates.respond(a.id, a.action, findings, a.instructions)
+    observation = (result.get("external_gate") or {}).get("last_observation") or {}
+    out(control.redact(result), a.json,
+        f"{a.id}: {observation.get('classification')} — {observation.get('reason')}")
+
+
+def cmd_memory(a):
+    from . import memory
+    args = a.args
+    if a.scope == "operational":
+        if a.action == "list": result = memory.list_operational()
+        elif a.action == "get" and len(args) == 1: result = memory.get_operational(args[0])
+        elif a.action == "set" and len(args) >= 2: result = memory.set_operational(args[0], " ".join(args[1:]))
+        elif a.action == "remove" and len(args) == 1: result = memory.remove_operational(args[0], confirm=a.confirm)
+        else: raise HelmError("usage: helm memory operational list|get KEY|set KEY VALUE|remove KEY --confirm")
+    else:
+        if a.action == "list" and len(args) == 1: result = memory.project_requests(args[0])
+        elif a.action == "set" and len(args) >= 3: result = memory.request_project(args[0], "set", args[1], " ".join(args[2:]))
+        elif a.action == "remove" and len(args) == 2: result = memory.request_project(args[0], "remove", args[1], confirm=a.confirm)
+        else: raise HelmError("usage: helm memory project list PROJECT|set PROJECT KEY VALUE|remove PROJECT KEY --confirm")
+    out(result, a.json, json.dumps(control.redact(result), indent=2))
+
+
+def cmd_away_mode(a):
+    result = supervisor.away_status() if a.state == "status" else supervisor.set_away(a.state == "on")
+    out(result, a.json, ("away mode on" if result.get("enabled") else "away mode off") +
+        f" · {result.get('pending_wakes', 0)} durable wake(s) preserved")
 
 
 def cmd_dispatch(a):
@@ -546,43 +745,18 @@ def cmd_dispatch(a):
 
 
 def cmd_doctor(a):
-    ok = True
-    def chk(name, good, detail=""):
-        nonlocal ok
-        ok &= bool(good)
-        print(f"{'ok  ' if good else 'FAIL'} {name} {detail}")
-    for b in ("git", "pi", "gh"):
-        chk(b, shutil.which(b), shutil.which(b) or "not on PATH")
-    from . import graphs as _gr
-    r = subprocess.run([_gr.piw_bin(), "schema", "--json"], capture_output=True, text=True)
-    chk("bundled runner", r.returncode == 0, _gr.piw_bin() if r.returncode == 0 else (r.stderr.strip()[-200:] or "run install.sh"))
-    chk("HELM_HOME", True, str(home()))
-    chk("codex login", codex_ready(), str(pi_home()) if codex_ready() else "run `helm setup`")
-    n = len(registry.load()["projects"])
-    chk("projects", True, f"{n} registered" if n else 'none yet — tell the first mate "add ~/code/my-repo"')
-    cfg = dispatch.load()
-    wanted = set(cfg["models"].values()) | {m for r in cfg["rules"] for m in r.get("models", {}).values()}
-    have = set()
-    if shutil.which("pi"):
-        r = subprocess.run(["pi", "--list-models"], text=True, capture_output=True)
-        for line in r.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                have.add(f"{parts[0]}/{parts[1]}")
-    from . import graphs as _g
-    for m in sorted(wanted):
-        listed = m in have
-        if listed and a.probe:
-            good, detail = _g.probe_model(m)
-            chk(f"model {m}", good, detail)
-        else:
-            chk(f"model {m}", listed, "(listed; add --probe for a live call)" if listed else "not in `pi --list-models` — fix dispatch.json or /login")
-    for g in ("no-mistakes", "direct-pr", "local-only", "scout"):
-        chk(f"graph {g}", (GRAPHS / f"{g}.yaml").exists())
-    sys.exit(0 if ok else 1)
+    from . import doctor
+    if a.repair:
+        result = doctor.repair(confirm=a.confirm, network=not a.offline,
+                               auth_source=a.auth_source, auth_provider=a.auth_provider,
+                               model_specs=a.model, test_specs=a.test, fetch_projects=a.fetch)
+        return out(result, a.json, f"doctor repair: {len(result['applied'])} applied · {len(result['skipped'])} skipped\n" + doctor.render(result["post_audit"]))
+    report = doctor.audit(network=not a.offline, probe_models=a.probe)
+    out(report, a.json, doctor.render(report))
+    return 0 if report["healthy"] else 1
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(prog="helm", description="one neck to choke for many repos")
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -590,10 +764,13 @@ def main(argv=None):
         p = sub.add_parser(name, help=help_); p.set_defaults(fn=fn); p.add_argument("--json", action="store_true"); return p
 
     p = S("add", cmd_add, "register a repo"); p.add_argument("path"); p.add_argument("--id")
-    p.add_argument("--mode", default="local-only", choices=registry.MODES); p.add_argument("--authority", type=int, default=1)
+    p.add_argument("--mode", default="local-only", choices=registry.ACCEPTED_MODES); p.add_argument("--authority", type=int, default=1)
+    p.add_argument("--gate", default="native", choices=gates.PROVIDERS,
+                   help="native or the externally installed, pinned macOS no-mistakes adapter")
     p.add_argument("--test", help="test command (the verify gate); auto-detected when omitted")
     p.add_argument("--protected", help="comma-separated globs the agent may not change"); p.add_argument("--base")
-    p = S("set", cmd_set, "change a project's posture"); p.add_argument("id"); p.add_argument("--mode", choices=registry.MODES)
+    p = S("set", cmd_set, "change a project's posture"); p.add_argument("id"); p.add_argument("--mode", choices=registry.ACCEPTED_MODES)
+    p.add_argument("--gate", choices=gates.PROVIDERS)
     p.add_argument("--authority", type=int); p.add_argument("--test"); p.add_argument("--protected"); p.add_argument("--base")
     S("projects", cmd_projects, "list projects")
     p = S("task", cmd_task, "queue a ship or scout task"); p.add_argument("project"); p.add_argument("text", nargs="*")
@@ -607,6 +784,9 @@ def main(argv=None):
     p = S("inspect", cmd_inspect, "secret-safe live item inspection"); p.add_argument("id"); p.add_argument("--lines", type=int, default=120)
     for action in ("steer", "pause", "resume", "away", "interrupt", "recover"):
         p = S(action, cmd_control, f"{action} a persistent item"); p.set_defaults(action=action); p.add_argument("id"); p.add_argument("value", nargs="*")
+        p.add_argument("--request-id", help="idempotency key for retried/racing control delivery")
+    p = S("budget", cmd_budget, "explicitly update a paused item's cumulative limits")
+    p.add_argument("id"); p.add_argument("--tokens", type=int); p.add_argument("--cost", type=float); p.add_argument("--seconds", type=int)
     p = S("scope", cmd_scope, "replace a paused item's declared scope"); p.add_argument("id"); p.add_argument("paths")
     p = S("inbox", cmd_inbox, "what needs the captain"); p.add_argument("--hints", action="store_true", help="show the helm commands (for the first mate)")
     p = S("respond", cmd_respond, "answer a question / give guidance, requeue"); p.add_argument("id"); p.add_argument("guidance", nargs="+")
@@ -616,6 +796,30 @@ def main(argv=None):
     p = S("run-once", cmd_run_once, "claim and execute one queued item"); p.add_argument("--owner", default="cli"); p.add_argument("--timeout", type=int, default=3600)
     p = S("daemon", cmd_daemon, "execute forever"); p.add_argument("--owner", default="daemon"); p.add_argument("--interval", type=int, default=20)
     p.add_argument("--timeout", type=int, default=3600); p.add_argument("--once-idle", type=int, default=0, help="exit after N idle polls (tests)")
+    p = S("supervise", cmd_supervise, "run one zero-token supervisor scan"); p.add_argument("--no-herdr", action="store_true", help="do not probe live Herdr identities")
+    p = S("wakes", cmd_wakes, "inspect or claim durable supervisor wakes")
+    p.add_argument("--claim", action="store_true"); p.add_argument("--consumer", default="cli"); p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--ack", help="comma-separated claimed wake ids"); p.add_argument("--release", help="comma-separated claimed wake ids")
+    p.add_argument("--sending", help="durably mark IDs before Pi send begins")
+    p.add_argument("--sent", help="durably mark IDs after Pi accepted the message")
+    p.add_argument("--renew", help="renew IDs while their queued Pi turn is pending")
+    p = S("wait", cmd_wait, "declare when an unchanged item should resurface")
+    p.add_argument("id"); p.add_argument("duration", help="30s, 20m, 1h30m, or clear"); p.add_argument("reason", nargs="*")
+    p = S("forge", cmd_forge, "observe GitHub PR lifecycle at the exact reviewed SHA")
+    group = p.add_mutually_exclusive_group(required=True); group.add_argument("--all", action="store_true"); group.add_argument("id", nargs="?")
+    p = S("gate-status", cmd_gate_status, "inspect one journaled no-mistakes transaction read-only")
+    p.add_argument("id")
+    p = S("gate-reconcile", cmd_gate_reconcile, "record authoritative no-mistakes SQLite evidence without replay")
+    p.add_argument("id")
+    p = S("gate-respond", cmd_gate_respond, "answer one exact observed no-mistakes gate")
+    p.add_argument("id"); p.add_argument("--action", required=True, choices=("approve", "fix", "skip"))
+    p.add_argument("--findings", help="comma-separated exact finding IDs; required for fix")
+    p.add_argument("--instructions", help="captain guidance passed only with action=fix")
+    p = S("memory", cmd_memory, "explicit operational memory or reviewed project knowledge")
+    p.add_argument("scope", choices=("operational", "project")); p.add_argument("action", choices=("list", "get", "set", "remove"))
+    p.add_argument("args", nargs="*"); p.add_argument("--confirm", action="store_true")
+    p = S("away-mode", cmd_away_mode, "gated unattended supervision without merge authority")
+    p.add_argument("state", choices=("on", "off", "status"), default="status", nargs="?")
     p = S("dispatch", cmd_dispatch, "show dispatch table"); p.add_argument("--set", action="append", metavar="PHASE=provider/model", help="change a step's default model")
     p = S("setup", cmd_setup, "connect the first mate to the Codex subscription (own config, own login)")
     p.add_argument("--import-login", action="store_true", help="(default behaviour) reuse the Codex login from your Pi")
@@ -632,7 +836,19 @@ def main(argv=None):
     p = S("launch", cmd_launch, "create/attach the persistent Herdr First Mate session")
     p.add_argument("--session", default="firstmate"); p.add_argument("--workers", type=int, default=2)
     p.add_argument("--harness", default="pi")
-    p = S("doctor", cmd_doctor, "check tools, models, graphs"); p.add_argument("--probe", action="store_true", help="live 1-word call per model (costs a few tokens)")
+    p = S("doctor", cmd_doctor, "read-only control-plane audit and confirmed safe reconciliation")
+    p.add_argument("--probe", action="store_true", help="live 1-word call per model (explicitly spends a few tokens)")
+    p.add_argument("--offline", action="store_true", help="skip read-only network freshness/auth probes")
+    p.add_argument("--repair", action="store_true", help="apply the freshly audited non-destructive repair plan")
+    p.add_argument("--confirm", action="store_true", help="explicitly authorize --repair mutations")
+    p.add_argument("--auth-source", help="explicit auth.json or Pi config directory to copy one provider from")
+    p.add_argument("--auth-provider", default="openai-codex", help="provider key used with --auth-source")
+    p.add_argument("--model", action="append", metavar="PHASE=PROVIDER/MODEL",
+                   help="explicitly reconcile one dispatch model against the offline inventory")
+    p.add_argument("--test", action="append", metavar="PROJECT=COMMAND",
+                   help="explicitly replace one project test command after syntax validation")
+    p.add_argument("--fetch", action="append", metavar="PROJECT",
+                   help="fetch only the exact configured origin/base ref; never merge or update the checkout")
     a = ap.parse_args(argv)
     os.environ["PI_CODING_AGENT_DIR"] = str(pi_home())
     try:
@@ -642,3 +858,12 @@ def main(argv=None):
     except subprocess.CalledProcessError as e:
         print(f"helm: command failed: {' '.join(e.cmd)}\n{e.stderr}", file=sys.stderr)
         return 1
+
+
+def main(argv=None):
+    """Run one CLI command with private creation defaults and restore the caller."""
+    previous_umask = os.umask(0o077)
+    try:
+        return _main(argv)
+    finally:
+        os.umask(previous_umask)

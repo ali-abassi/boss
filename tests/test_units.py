@@ -25,7 +25,7 @@ class DispatchTests(Isolated):
         proj = {"id": "api", "mode": "no-mistakes"}
         d = dispatch.resolve({"kind": "ship", "labels": ["cheap"]}, proj)
         self.assertEqual(d["rule"], "cheap")
-        self.assertEqual(d["graph"], "no-mistakes")                       # graph falls back to project mode
+        self.assertEqual(d["graph"], "high-assurance")                    # legacy state reads canonically
         self.assertEqual(d["models"]["implement"], "openai-codex/gpt-5.4-mini")
         self.assertEqual(d["models"]["review_correctness"], "openai-codex/gpt-5.6-sol")  # default kept
 
@@ -51,7 +51,7 @@ class RenderTests(Isolated):
         from helm import graphs, dispatch
         cfg = dispatch.load()
         proj = {"id": "p", "path": "/tmp/p", "base": "main", "test_cmd": "npm test", "protected_paths": [".github/*", "a b.txt"]}
-        for g in ("local-only", "direct-pr", "no-mistakes", "scout"):
+        for g in ("local-only", "direct-pr", "high-assurance", "scout"):
             steps = graphs.render(g, self.home / g, cwd=Path("/tmp/wt"), branch="helm/x", project=proj,
                                   models=cfg["models"], thinking=cfg["thinking"], timeout=42)
             text = steps.read_text()
@@ -59,7 +59,7 @@ class RenderTests(Isolated):
             self.assertIn("cwd: /tmp/wt", text)
             if g != "scout":
                 self.assertIn("$(git", text)                                     # shell survives rendering
-            if g in ("direct-pr", "no-mistakes"):
+            if g in ("direct-pr", "high-assurance"):
                 self.assertIn("$OUT", text)
                 self.assertIn("'a b.txt'", text)                                 # protected globs are shell-quoted
                 self.assertIn("npm test", text)
@@ -71,11 +71,42 @@ class RenderTests(Isolated):
         repo = self.home / "repo"; repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         proj = {"id": "p", "path": str(repo), "base": "main", "test_cmd": "true", "protected_paths": []}
-        for g in ("local-only", "direct-pr", "no-mistakes", "scout"):
+        for g in ("local-only", "direct-pr", "high-assurance", "scout"):
             steps = graphs.render(g, self.home / g, cwd=repo, branch="helm/x", project=proj,
                                   models=cfg["models"], thinking=cfg["thinking"], timeout=42)
             r = subprocess.run([graphs.piw_bin(), "validate", str(steps)], text=True, capture_output=True)
             self.assertEqual(r.returncode, 0, f"{g}: {r.stdout}{r.stderr}")
+
+    def test_legacy_graph_name_renders_the_canonical_template(self):
+        from helm import graphs, dispatch
+        cfg = dispatch.load()
+        proj = {"id": "p", "path": "/tmp/p", "base": "main", "test_cmd": "true", "protected_paths": []}
+        steps = graphs.render("no-mistakes", self.home / "legacy", cwd=Path("/tmp/wt"), branch="helm/x",
+                              project=proj, models=cfg["models"], thinking=cfg["thinking"], timeout=42)
+        self.assertIn("workflow: helm-high-assurance", steps.read_text())
+
+
+class GateBoundaryTests(Isolated):
+    def test_absent_external_gate_fails_closed_without_installing_or_faking_evidence(self):
+        from unittest import mock
+        from helm import gates
+        with mock.patch("helm.no_mistakes.shutil.which", return_value=None):
+            evidence = gates.no_mistakes_status(self.home)
+        self.assertFalse(evidence["ready"])
+        self.assertFalse(evidence["installed"])
+        self.assertFalse(evidence["adapter_verified"])
+        self.assertEqual(evidence["required_tag_sha"], gates.NO_MISTAKES_TAG_SHA)
+
+    def test_unattested_executable_is_not_mistaken_for_the_pinned_product(self):
+        from unittest import mock
+        from helm import gates
+        binary = self.home / "no-mistakes"; binary.write_text("not the release\n"); binary.chmod(0o755)
+        with mock.patch("helm.no_mistakes.shutil.which", return_value=str(binary)):
+            evidence = gates.no_mistakes_status(self.home)
+        self.assertTrue(evidence["installed"])
+        self.assertFalse(evidence["binary_provenance_verified"])
+        self.assertFalse(evidence["adapter_verified"])
+        self.assertFalse(evidence["ready"])
 
 
 class ProtectedPathTests(unittest.TestCase):
@@ -89,8 +120,70 @@ class ProtectedPathTests(unittest.TestCase):
         self.assertEqual(self.check([], [".github/*"]), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class WorktreeStatusTests(Isolated):
+    def test_unstaged_first_porcelain_record_keeps_its_complete_path(self):
+        from helm import worktree
+        repo = self.home / "repo"; repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+        (repo / "task.py").write_text("before\n")
+        subprocess.run(["git", "-C", str(repo), "add", "task.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+        (repo / "task.py").write_text("after\n")
+        self.assertEqual(worktree.status_paths(repo), ["task.py"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX Git path identity test")
+    def test_scope_preserves_a_literal_backslash_filename(self):
+        from helm import scope
+        literal = r"src\literal.py"
+        self.assertEqual(scope.normalize([literal]), [literal])
+        self.assertEqual(scope.escaped([literal], [literal]), [])
+        self.assertEqual(scope.escaped([literal], ["src/literal.py"]), ["src/literal.py"])
+
+    def test_checkpoint_excludes_managed_dependency_links_without_ambient_git_config(self):
+        from helm import worktree
+        from helm.util import sh
+        repo = self.home / "checkpoint"; repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+        (repo / ".gitignore").write_text("node_modules/\n")
+        (repo / "task.py").write_text("before\n")
+        subprocess.run(["git", "-C", str(repo), "add", ".gitignore", "task.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+        dependency = self.home / "shared-node-modules"; dependency.mkdir()
+        (dependency / "dep.js").write_text("module.exports = 1\n")
+        (repo / "node_modules").symlink_to(dependency, target_is_directory=True)
+        (repo / ".helm-ask.json").write_text('{"question":"keep me unstaged"}\n')
+        (repo / "task.py").write_text("after\n")
+        result = sh(["git", "-C", str(repo), "add", "-A", "--",
+                     *worktree.checkpoint_pathspecs(repo)], check=False,
+                    env={**os.environ, "GIT_CONFIG_COUNT": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        staged = subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+                                text=True, capture_output=True, check=True).stdout.splitlines()
+        self.assertEqual(staged, ["task.py"])
+        raw_status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1"],
+                                    text=True, capture_output=True, check=True).stdout
+        self.assertIn("node_modules", raw_status)
+        self.assertIn(".helm-ask.json", raw_status)
+
+    def test_creating_a_sibling_never_prunes_a_retained_item_worktree(self):
+        from helm import worktree
+        repo = self.home / "multi"; repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+        project = {"id": "p", "path": str(repo), "base": "main"}
+        first = worktree.create(project, "p-first")
+        second = worktree.create(project, "p-second")
+        self.assertTrue(first.is_dir() and second.is_dir())
+        self.assertEqual(worktree.branch_worktrees(project, "firstmate/p-first"), [first.resolve()])
+        self.assertEqual(worktree.branch_worktrees(project, "firstmate/p-second"), [second.resolve()])
 
 
 class DetectTests(unittest.TestCase):
@@ -147,7 +240,7 @@ class OwnPiHomeTests(Isolated):
         _isolated_pi_home()                                   # second run keeps the captain's choice
         self.assertEqual(json.loads((dst / "settings.json").read_text())["defaultModel"], "mine")
         # --import-login copies only the Codex credential
-        r = subprocess.run([sys.executable, str(REPO / "bin" / "helm"), "setup", "--import-login", "--json"],
+        r = subprocess.run([str(REPO / "bin" / "helm"), "setup", "--import-login", "--json"],
                            env={**os.environ}, text=True, capture_output=True)
         auth = json.loads((dst / "auth.json").read_text())
         self.assertEqual(list(auth), ["openai-codex"])
@@ -162,11 +255,49 @@ class OwnPiHomeTests(Isolated):
 
 class DispatchSetTests(Isolated):
     def test_captain_can_change_a_steps_model(self):
-        r = subprocess.run([sys.executable, str(REPO / "bin" / "helm"), "dispatch", "--set", "implement=openai-codex/gpt-5.6-luna"],
+        r = subprocess.run([str(REPO / "bin" / "helm"), "dispatch", "--set", "implement=openai-codex/gpt-5.6-luna"],
                            env={**os.environ, "HELM_HOME": str(self.home)}, text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("implement=openai-codex/gpt-5.6-luna", r.stdout)
         from helm import dispatch
         self.assertEqual(dispatch.load()["models"]["implement"], "openai-codex/gpt-5.6-luna")
-        r = subprocess.run([sys.executable, str(REPO / "bin" / "helm"), "dispatch", "--set", "bogus=x"],
+        r = subprocess.run([str(REPO / "bin" / "helm"), "dispatch", "--set", "bogus=x"],
                            env={**os.environ, "HELM_HOME": str(self.home)}, text=True, capture_output=True)
         self.assertEqual(r.returncode, 1)
+
+
+class RuntimePackagingTests(unittest.TestCase):
+    def test_direct_and_symlinked_launcher_use_a_receipt_capable_runtime(self):
+        direct = subprocess.run([str(REPO / "bin" / "helm"), "--version"],
+                                text=True, capture_output=True)
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        with tempfile.TemporaryDirectory() as raw:
+            link = Path(raw) / "helm"; link.symlink_to(REPO / "bin" / "helm")
+            linked = subprocess.run([str(link), "--version"], text=True, capture_output=True)
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+            self.assertEqual(linked.stdout, direct.stdout)
+
+    def test_launcher_prefers_the_installer_private_runtime(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); (root / "bin").mkdir(); (root / ".venv" / "bin").mkdir(parents=True)
+            shutil.copy2(REPO / "bin" / "helm", root / "bin" / "helm")
+            fake = root / ".venv" / "bin" / "python"
+            fake.write_text("#!/bin/sh\n[ \"$1\" = -c ] && exit 0\nprintf 'private-runtime\\n'\n")
+            fake.chmod(0o755)
+            result = subprocess.run([str(root / "bin" / "helm"), "--version"],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "private-runtime\n")
+
+    def test_cryptographic_runtime_dependency_is_installed_in_ci_and_locally(self):
+        requirements = (REPO / "vendor" / "pi-graph" / "requirements.txt").read_text()
+        self.assertIn("cryptography>=42,<51", requirements)
+        self.assertIn("vendor/pi-graph/requirements.txt", (REPO / "install.sh").read_text())
+        self.assertIn("vendor/pi-graph/requirements.txt",
+                      (REPO / ".github" / "workflows" / "tests.yml").read_text())
+        syntax = subprocess.run(["sh", "-n", str(REPO / "bin" / "helm")],
+                                text=True, capture_output=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

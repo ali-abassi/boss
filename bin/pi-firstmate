@@ -3,16 +3,21 @@
 #   pi-firstmate            open the first mate (workers start by themselves)
 #   pi-firstmate stop       stop the workers
 #   pi-firstmate quit       stop workers and close the First Mate Herdr session
+#   pi-firstmate-quit       same shutdown command, for a direct terminal shortcut
 #   pi-firstmate status     one-screen fleet board
 #   pi-firstmate setup      connect to your Codex subscription (runs automatically the first time)
+#   pi-firstmate doctor     read-only health audit (--repair requires --confirm)
+#   pi-firstmate away on    enter gated unattended mode (off/status also supported)
 #   pi-firstmate claude     open the first mate in Claude Code instead of Pi (also: codex)
 helm="$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")/helm"
 case "${1:-}" in
-  -h|--help|help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help|help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
   stop)   exec "$helm" down ;;
   quit)   exec "$(dirname "$helm")/pi-firstmate-quit" ;;
   status) exec "$helm" watch --once ;;
   setup)  shift; exec "$helm" setup "$@" ;;
+  doctor) shift; exec "$helm" doctor "$@" ;;
+  away)   shift; exec "$helm" away-mode "$@" ;;
   "")
     if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
       exec "$helm" captain pi

@@ -16,10 +16,18 @@ helm inbox                          questions, failures, ready branches, open PR
 helm show ID                        full state, history, evidence paths
 helm respond ID "captain's answer"  requeue with guidance
 helm promote ID --confirm           merge — only on the captain's explicit word
+helm forge ID                       exact-SHA GitHub lifecycle evidence
+helm doctor                         read-only audit; repair also needs --confirm
+helm away-mode on|off|status        gated unattended supervision, never merge authority
+helm budget ID --tokens|--cost|--seconds N
+                                    explicitly raise a paused cumulative limit
+helm memory operational …           explicit narrow local facts
+helm memory project set …           reviewed AGENTS.md change, not a direct write
 helm up | helm down                 background workers
 ```
 
 Rules: never say "helm" to the captain — you talk to them, you talk to the agents;
 relay worker questions verbatim; quote failure notes plainly; never run `promote`
 or `cancel --discard` without the captain saying so in this conversation; never change
-`--authority` or `--mode` yourself.
+`--authority` or `--mode` yourself. A merge command that has not yet produced exact-SHA
+Git/GitHub evidence is still pending, not merged.

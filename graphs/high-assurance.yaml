@@ -1,5 +1,5 @@
 version: 1
-workflow: helm-no-mistakes
+workflow: helm-high-assurance
 cwd: @{CWD}
 workers: 2
 input:
@@ -43,14 +43,14 @@ steps:
     timeout: @{TIMEOUT}
   - id: protected
     needs: [implement]
-    cmd: test -f "@{CWD}/.helm-ask.json" && { echo ASKED; exit 1; }; git -C "@{CWD}" diff --name-only @{BASE}...HEAD | python3 "@{HELM_REPO}/helm/check_protected.py" @{PROTECTED_ARGS}
+    cmd: test -f "@{CWD}/.helm-ask.json" && { echo ASKED; exit 1; }; git -C "@{CWD}" diff --no-ext-diff --no-textconv --no-renames --name-only -z @{BASE}...HEAD | python3 "@{HELM_REPO}/helm/check_protected.py" --nul @{PROTECTED_ARGS}
   - id: verify
     needs: [protected]
     cmd: cd "@{CWD}" && @{TEST_CMD}
     timeout: @{TIMEOUT}
   - id: diff
     needs: [verify]
-    cmd: echo REVIEW_SHA=$(git -C "@{CWD}" rev-parse HEAD); git -C "@{CWD}" log --format='%h %s' @{BASE}..HEAD; echo; git -C "@{CWD}" diff @{BASE}...HEAD | head -c 200000
+    cmd: bytes=$(git -C "@{CWD}" diff @{BASE}...HEAD | wc -c | tr -d ' '); test "$bytes" -le 200000 || { echo "complete review diff is $bytes bytes; refusing truncated review" >&2; exit 1; }; echo REVIEW_BASE_SHA=$(git -C "@{CWD}" rev-parse @{BASE}); echo REVIEW_SHA=$(git -C "@{CWD}" rev-parse HEAD); git -C "@{CWD}" log --format='%h %s' @{BASE}..HEAD; echo; git -C "@{CWD}" diff @{BASE}...HEAD
   - id: review_correctness
     needs: [diff]
     model: @{MODEL_REVIEW_CORRECTNESS}
@@ -58,8 +58,9 @@ steps:
     prompt: |
       You are a strict code reviewer. The task brief and the resulting diff are
       below. Decide whether the diff correctly and completely implements the
-      brief without regressions. Copy the full REVIEW_SHA from the evidence into
-      your response. Reply with JSON only, exactly: {"verdict": "accept" or "reject", "notes": "why", "sha": "full REVIEW_SHA"}.
+      brief without regressions. Copy the full REVIEW_BASE_SHA and REVIEW_SHA
+      from the complete evidence into your response. Reply with JSON only,
+      exactly: {"verdict": "accept" or "reject", "notes": "why", "base_sha": "full REVIEW_BASE_SHA", "sha": "full REVIEW_SHA"}.
 
       BRIEF:
       {input}
@@ -69,6 +70,7 @@ steps:
     schema:
       verdict: {type: string, enum: [accept, reject]}
       notes: string
+      base_sha: string
       sha: string
     gate: python3 -c 'import json,sys; v=str(json.load(open(sys.argv[1])).get("verdict","")).lower(); sys.exit(0 if v in ("accept","pass") else 1)' "$OUT"
     retries: 0
@@ -80,8 +82,9 @@ steps:
       You are an adversarial reviewer. Try hard to break this change: security
       holes, data loss, silent behaviour changes, untested paths, gate or CI
       tampering, scope creep beyond the brief. Reject if you find a real
-      problem; accept only if you could not. Copy the full REVIEW_SHA from the
-      evidence into your response. Reply with JSON only, exactly: {"verdict": "accept" or "reject", "notes": "why", "sha": "full REVIEW_SHA"}.
+      problem; accept only if you could not. Copy the full REVIEW_BASE_SHA and
+      REVIEW_SHA from the complete evidence into your response. Reply with JSON
+      only, exactly: {"verdict": "accept" or "reject", "notes": "why", "base_sha": "full REVIEW_BASE_SHA", "sha": "full REVIEW_SHA"}.
 
       BRIEF:
       {input}
@@ -91,6 +94,7 @@ steps:
     schema:
       verdict: {type: string, enum: [accept, reject]}
       notes: string
+      base_sha: string
       sha: string
     gate: python3 -c 'import json,sys; v=str(json.load(open(sys.argv[1])).get("verdict","")).lower(); sys.exit(0 if v in ("accept","pass") else 1)' "$OUT"
     retries: 0

@@ -59,14 +59,17 @@ if mode == "sensitive": Path(cwd, "package-lock.json").write_text(json.dumps({"g
 subprocess.run(["git", "-C", cwd, "add", "-A"], check=True)
 subprocess.run(["git", "-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "helm: fake change"], check=True)
 sha = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+base_ref = re.search(r"\(base: ([^)]+)\)", text).group(1)
+base_sha = subprocess.run(["git", "-C", cwd, "rev-parse", base_ref], check=True,
+                          capture_output=True, text=True).stdout.strip()
 review_sha = {"omit": None, "wrong": "0" * 40}.get(os.environ.get("FAKE_PIW_REVIEW_SHA"), sha)
 # The stand-in emits actual exact-SHA reviewer-node evidence; the control plane never invents verdicts.
 if "review_correctness" in text:
-    evidence = {"verdict": "accept", "notes": "fake reviewer evidence"}
+    evidence = {"verdict": "accept", "notes": "fake reviewer evidence", "base_sha": base_sha}
     if review_sha is not None: evidence["sha"] = review_sha
     (run_dir / "review_correctness.json").write_text(json.dumps(evidence))
 if "review_adversarial" in text:
-    evidence = {"verdict": "accept", "notes": "fake reviewer evidence"}
+    evidence = {"verdict": "accept", "notes": "fake reviewer evidence", "base_sha": base_sha}
     if review_sha is not None: evidence["sha"] = review_sha
     (run_dir / "review_adversarial.json").write_text(json.dumps(evidence))
 if mode == "dirty": Path(cwd, "unreviewed.txt").write_text("must not deliver\n")

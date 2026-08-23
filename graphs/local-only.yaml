@@ -29,7 +29,7 @@ steps:
     timeout: @{TIMEOUT}
   - id: protected
     needs: [implement]
-    cmd: test -f "@{CWD}/.helm-ask.json" && { echo ASKED; exit 1; }; git -C "@{CWD}" diff --name-only @{BASE}...HEAD | python3 "@{HELM_REPO}/helm/check_protected.py" @{PROTECTED_ARGS}
+    cmd: test -f "@{CWD}/.helm-ask.json" && { echo ASKED; exit 1; }; git -C "@{CWD}" diff --no-ext-diff --no-textconv --no-renames --name-only -z @{BASE}...HEAD | python3 "@{HELM_REPO}/helm/check_protected.py" --nul @{PROTECTED_ARGS}
   - id: verify
     needs: [protected]
     cmd: cd "@{CWD}" && @{TEST_CMD}

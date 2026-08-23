@@ -16,18 +16,34 @@ class _T(Template):
 
 from .paths import GRAPHS, REPO
 from .util import HelmError, log
+from . import modes
 
 
 VENDORED_PIW = REPO / "vendor" / "pi-graph" / "bin" / "piw"
+TEST_PIW = REPO / "tests" / "fake_piw.py"
+
+
+def deterministic_test_mode() -> bool:
+    """Recognize only the checked-in inert fixture; arbitrary harness injection is forbidden."""
+    raw = os.environ.get("HELM_PIW")
+    if not raw:
+        return False
+    try:
+        return Path(raw).expanduser().resolve() == TEST_PIW.resolve()
+    except OSError:
+        return False
 
 
 def piw_bin() -> str:
-    """The bundled pi-graph runner, unless HELM_PIW points elsewhere (tests use a stand-in)."""
-    return os.environ.get("HELM_PIW") or str(VENDORED_PIW)
+    """Return the runner; only the repository's inert fixture may override it."""
+    if os.environ.get("HELM_PIW") and not deterministic_test_mode():
+        raise HelmError("HELM_PIW may select only First Mate's checked-in deterministic test fixture")
+    return str(TEST_PIW if deterministic_test_mode() else VENDORED_PIW)
 
 
 def render(graph: str, dest_dir: Path, *, cwd: Path, branch: str, project: dict,
            models: dict, thinking: dict, timeout: int) -> Path:
+    graph = modes.normalize(graph)
     src = GRAPHS / f"{graph}.yaml"
     if not src.exists():
         raise HelmError(f"graph template not found: {src}")
@@ -123,13 +139,14 @@ def failure_notes(summary: dict, limit: int = 3000) -> str:
     return "\n\n".join(parts)
 
 
-def probe_model(model: str, timeout: int = 60) -> tuple[bool, str]:
+def probe_model(model: str, timeout: int = 60, env: dict | None = None) -> tuple[bool, str]:
     """One-word live call through pi with piw's exact flags. Proves auth + model id."""
     cmd = ["pi", "-p", "--mode", "json", "--no-session", "--no-approve", "--offline",
            "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-tools",
            "--model", model, "reply with the single word pong"]
     try:
-        r = subprocess.run(cmd, text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
+        r = subprocess.run(cmd, text=True, capture_output=True, stdin=subprocess.DEVNULL,
+                           timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return False, f"no answer in {timeout}s"
     except FileNotFoundError:

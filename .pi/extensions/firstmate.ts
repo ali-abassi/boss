@@ -7,7 +7,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 type Theme = { fg(token: string, text: string): string; bold?(text: string): string };
-type Status = { projects: number; workers: number | null; herdr_tabs?: { kind: string }[]; items: Record<string, number> };
+type Wake = { id: string; item_id: string; project?: string; classification: string; reason: string };
+type Status = {
+  projects: number; workers: number | null; herdr_tabs?: { kind: string }[]; items: Record<string, number>;
+  supervisor?: { pending_wakes: number | null; away: boolean | null; healthy: boolean };
+};
 
 // ------------------------------------------------------------------ rendering
 
@@ -27,6 +31,7 @@ export function statusLine(s: Status | null): string {
   const needs = (s.items["needs-you"] || 0) + (s.items["failed"] || 0) + (s.items["ready"] || 0) + (s.items["pr-open"] || 0);
   const running = s.items["running"] || 0, queued = s.items["queued"] || 0;
   const parts = [`${s.projects} project${s.projects === 1 ? "" : "s"}`, workers];
+  if (s.supervisor?.away) parts.push("away");
   if (running) parts.push(`${running} running`);
   if (queued) parts.push(`${queued} queued`);
   parts.push(needs ? `${needs} need you` : "inbox clear");
@@ -100,8 +105,9 @@ export default function firstmate(pi: ExtensionAPI) {
   let ui: any;
   let poll: ReturnType<typeof setInterval> | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
-  let lastNeeds = -1;
-  let lastSignature = "";
+  let deliveringWake = false;
+  let pendingWakeIds: string[] = [];
+  const wakeConsumer = `pi:${process.env.HERDR_SESSION || "local"}:${process.env.HERDR_PANE_ID || process.pid}`;
   const wakeTimers = new Map<number, { at: number; note: string; t: ReturnType<typeof setTimeout> }>();
   let wakeSeq = 0;
 
@@ -119,17 +125,53 @@ export default function firstmate(pi: ExtensionAPI) {
     const needs = (s.items["needs-you"] || 0) + (s.items["failed"] || 0) + (s.items["ready"] || 0) + (s.items["pr-open"] || 0);
     const running = s.items["running"] || 0;
     try {
-      ui.setStatus("firstmate", `${ANCHOR} ${running ? `${running} under way` : "crew idle"}${needs ? ` · ${needs} need you` : ""}`);
-      // Wake the first mate when the inbox changes shape: it reports, the captain never polls.
-      const signature = ["needs-you", "failed", "ready", "pr-open", "done", "merged"].map((k) => `${k}:${s.items[k] || 0}`).join(",");
-      if (notifyNew && lastSignature && signature !== lastSignature && needs > lastNeeds) {
-        const r = await helm("inbox", "--hints");
-        if (r.code === 0) pi.sendMessage({ customType: "firstmate-wake", content: wakeText("inbox", r.stdout.trim()), display: false },
-                                         { deliverAs: "followUp", triggerTurn: true });
-      }
-      lastSignature = signature;
+      const away = s.supervisor?.away ? "away" : running ? `${running} under way` : "crew idle";
+      const queuedDecisions = s.supervisor?.pending_wakes || 0;
+      ui.setStatus("firstmate", `${ANCHOR} ${away}${needs ? ` · ${needs} need you` : ""}${queuedDecisions ? ` · ${queuedDecisions} wake${queuedDecisions === 1 ? "" : "s"}` : ""}`);
+      // Only durable supervisor events may trigger a model turn. Count changes
+      // update this strip but are never treated as evidence by themselves.
+      if (notifyNew) await deliverWakes();
     } catch {}
-    lastNeeds = needs;
+  }
+
+  async function deliverWakes() {
+    if (deliveringWake) return;
+    if (pendingWakeIds.length) {
+      // A follow-up already exists in Pi. Renew its durable receipt instead of
+      // claiming/sending it again while an earlier model turn is long-running.
+      try { await helm("wakes", "--consumer", wakeConsumer, "--renew", pendingWakeIds.join(","), "--json"); } catch {}
+      return;
+    }
+    deliveringWake = true;
+    let events: Wake[] = [];
+    let sendingRecorded = false;
+    try {
+      const claimed = await helm("wakes", "--claim", "--consumer", wakeConsumer, "--limit", "20", "--json");
+      if (claimed.code !== 0) return;
+      events = JSON.parse(claimed.stdout) as Wake[];
+      if (!events.length) return;
+      const inbox = await helm("inbox", "--hints");
+      if (inbox.code !== 0) throw new Error(inbox.stderr || "inbox unavailable");
+      const evidence = events.map((e) => `[${e.classification}] ${e.item_id}: ${e.reason}`).join("\n");
+      pendingWakeIds = events.map((e) => e.id);
+      const sending = await helm("wakes", "--consumer", wakeConsumer, "--sending", pendingWakeIds.join(","), "--json");
+      if (sending.code !== 0 || Number(JSON.parse(sending.stdout)?.sending) !== pendingWakeIds.length) {
+        throw new Error("durable wake sending receipt was not acquired");
+      }
+      sendingRecorded = true;
+      pi.sendMessage({ customType: "firstmate-wake", content: wakeText("inbox", `${evidence}\n\n${inbox.stdout.trim()}`), display: false },
+                     { deliverAs: "followUp", triggerTurn: true });
+      // If this acknowledgement is lost, the durable `sending` state remains
+      // uncertain and is never automatically replayed as a duplicate turn.
+      await helm("wakes", "--consumer", wakeConsumer, "--sent", pendingWakeIds.join(","), "--json");
+    } catch {
+      if (events.length && !sendingRecorded) {
+        try { await helm("wakes", "--consumer", wakeConsumer, "--release", events.map((e) => e.id).join(","), "--json"); } catch {}
+        pendingWakeIds = [];
+      }
+    } finally {
+      deliveringWake = false;
+    }
   }
 
   // Put a fresh banner at the bottom of the transcript on every launch. Historical
@@ -157,6 +199,18 @@ export default function firstmate(pi: ExtensionAPI) {
   });
 
   pi.on("turn_start", async (_e: unknown, ctx: any) => {
+    // A queued wake is acknowledged only once Pi proves that its model turn
+    // began. If sending may have started but this hook never runs, the durable
+    // uncertain receipt stays visible for explicit reconciliation and is not
+    // replayed into a duplicate model turn.
+    if (pendingWakeIds.length) {
+      const ids = pendingWakeIds;
+      try {
+        const result = await helm("wakes", "--consumer", wakeConsumer, "--ack", ids.join(","), "--json");
+        const receipt = result.code === 0 ? JSON.parse(result.stdout) : null;
+        if (Number(receipt?.acknowledged) === ids.length) pendingWakeIds = [];
+      } catch {}
+    }
     if (!ctx.hasUI) return;
     try {
       const nc = noColor();
@@ -210,10 +264,27 @@ export default function firstmate(pi: ExtensionAPI) {
       else ctx.ui.notify(`helm inbox failed: ${r.stderr}`, "warning");
     },
   });
+  pi.registerCommand("away", {
+    description: "Gated unattended mode: /away on · /away off · /away status",
+    handler: async (args: string, ctx: any) => {
+      const state = args.trim() || "status";
+      if (!["on", "off", "status"].includes(state)) { ctx.ui.notify("Usage: /away on|off|status", "warning"); return; }
+      const r = await helm("away-mode", state, "--json");
+      if (r.code !== 0) { ctx.ui.notify(r.stderr.trim() || "Away preflight failed.", "warning"); return; }
+      const result = JSON.parse(r.stdout);
+      ctx.ui.notify(result.enabled ? "⚓ Away mode is on. Decisions stay queued; merges still need you." :
+                    `⚓ Away mode is off. ${result.pending_wakes || 0} preserved wake(s) ready.`, "info");
+      await refreshStrip(true);
+    },
+  });
 
   pi.on("session_shutdown", async () => {
     if (poll) clearInterval(poll); if (ticker) clearInterval(ticker);
     for (const w of wakeTimers.values()) clearTimeout(w.t); wakeTimers.clear();
+    if (pendingWakeIds.length) {
+      try { await helm("wakes", "--consumer", wakeConsumer, "--release", pendingWakeIds.join(","), "--json"); } catch {}
+      pendingWakeIds = [];
+    }
     try { ui?.setStatus?.("firstmate", undefined); ui?.setWorkingMessage?.(); ui?.setWorkingIndicator?.(); } catch {}
     ui = undefined;
   });

@@ -8,19 +8,34 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import secrets
 import shutil
 import time
 from pathlib import Path
-from . import dispatch, graphs, registry, worktree, deliver, herdr, scope, rigor, control
-from .paths import work_root, home
+from . import dispatch, graphs, registry, worktree, deliver, herdr, scope, rigor, control, modes, gates, ids, processes, sandbox
+from .paths import work_root, home, authority_lock
 from .util import read_json, write_json, locked, now, log, HelmError, git, sh
 
 ACTIVE = ("running",)
 OPEN = ("queued", "running", "paused", "needs-you", "ready", "pr-open")
+MAX_REVIEW_DIFF_BYTES = 200_000
 
 
-def item_dir(work_id: str) -> Path: return work_root() / work_id
+def _remaining_timeout(deadline: float | None, cap: int) -> int:
+    if deadline is None:
+        return max(1, int(cap))
+    remaining = deadline - time.monotonic()
+    return 0 if remaining < 1.0 else max(1, min(int(cap), int(remaining)))
+
+
+def _policy_snapshot(project: dict) -> dict:
+    return {key: project.get(key) for key in (
+        "id", "path", "mode", "authority", "base", "test_cmd", "protected_paths", "gate"
+    )}
+
+
+def item_dir(work_id: str) -> Path: return work_root() / ids.work(work_id)
 def item_path(work_id: str) -> Path: return item_dir(work_id) / "item.json"
 
 
@@ -29,20 +44,36 @@ def _hydrate(it: dict) -> dict:
     it.setdefault("schema_version", control.SCHEMA_VERSION); it.setdefault("revision", 0)
     it.setdefault("phase", it.get("status", "queued")); it.setdefault("scope", {"paths": ["unknown"], "claim": "global"})
     it.setdefault("controls", {"paused": False, "away": False, "pending": []})
-    for key, default in (("session", None), ("checkpoint", None), ("reviews", []), ("verification", []), ("changed_scope", [])):
+    for key, default in (("session", None), ("checkpoint", None), ("reviews", []), ("verification", []),
+                         ("changed_scope", []), ("agent_launches", [])):
         it.setdefault(key, default)
     it.setdefault("activity", {"last": it.get("updated"), "state": it.get("phase")})
     it.setdefault("budgets", {"tokens": None, "cost": None, "seconds": None})
+    it.setdefault("usage", {"tokens": 0, "cost": 0.0, "seconds": 0.0,
+                            "implementer_tokens": 0, "implementer_cost": 0.0,
+                            "reviewer_tokens": 0, "reviewer_cost": 0.0})
+    usage = it["usage"]
+    historical_turn = bool(it.get("attempts") or it.get("runs") or it.get("session")
+                           or it.get("agent_launches"))
+    # A migrated record with model-turn history and no explicit metering receipt
+    # is unknown, never a trustworthy zero. Brand-new items have proven zero use.
+    usage.setdefault("tokens_evidence_complete", not historical_turn)
+    usage.setdefault("cost_evidence_complete", not historical_turn)
     if not it.get("model_decision") and it.get("dispatch"):
         it["model_decision"] = {"models": it["dispatch"].get("models", {}), "thinking": it["dispatch"].get("thinking", {}),
                                 "rationale": "migrated pinned dispatch", "resolved_at": it.get("created")}
+    if it.get("dispatch"):
+        it["dispatch"]["graph"] = modes.normalize(it["dispatch"].get("graph"))
     return it
 
 
 def load(work_id: str) -> dict:
+    work_id = ids.work(work_id)
     it = read_json(item_path(work_id))
     if not it:
         raise HelmError(f"unknown work item '{work_id}'")
+    if it.get("id") != work_id:
+        raise HelmError("work item identity does not match its durable state directory")
     return _hydrate(it)
 
 
@@ -60,8 +91,21 @@ def save(it: dict) -> None:
 def transition(it: dict, status: str, note: str = "") -> None:
     it.setdefault("history", []).append({"at": now(), "from": it["status"], "to": status, "note": note})
     it["status"] = status
+    canonical_phase = {"running": "implementing", "ready": "merge-ready", "pr-open": "pr-open",
+                       "failed": "failed", "done": "done", "merged": "merged",
+                       "cancelled": "cancelled"}.get(status)
+    if canonical_phase:
+        it["phase"] = canonical_phase
+    it["activity"] = {"last": now(), "state": it.get("phase") or status}
     save(it)
     log(f"{it['id']}: {status}" + (f" — {note}" if note else ""))
+    try:
+        from . import supervisor
+        supervisor.observe(it)
+    except (Exception, HelmError) as exc:
+        # Item state is already durable. Never roll it back or fake a wake; the
+        # read-only doctor will expose a damaged supervisor ledger.
+        log(f"{it['id']}: supervisor observation unavailable: {getattr(exc, 'msg', None) or exc!r}")
 
 
 def all_items() -> list[dict]:
@@ -70,6 +114,8 @@ def all_items() -> list[dict]:
         for d in sorted(work_root().iterdir()):
             it = read_json(d / "item.json")
             if it:
+                if not ids.WORK_PATTERN.fullmatch(d.name) or d.name != it.get("id"):
+                    continue
                 out.append(_hydrate(it))
     return sorted(out, key=lambda i: i["created"])
 
@@ -77,14 +123,21 @@ def all_items() -> list[dict]:
 def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | None = None,
            max_attempts: int = 3, declared_scope: list[str] | None = None,
            model: str | None = None, thinking: str | None = None,
-           max_tokens: int | None = None, max_cost: float | None = None, max_seconds: int | None = None) -> dict:
+           max_tokens: int | None = None, max_cost: float | None = None, max_seconds: int | None = None,
+           memory_request: dict | None = None) -> dict:
     project = registry.get(project_id)
+    gates.require_execution(project.get("gate", "native"), project["path"])
     if kind not in ("ship", "scout"):
         raise HelmError("kind must be ship or scout")
     if model and "/" not in model:
         raise HelmError("model override must be provider/model")
     if any(v is not None and v <= 0 for v in (max_tokens, max_cost, max_seconds)):
         raise HelmError("budgets must be positive")
+    if project.get("gate") == "no-mistakes" and kind == "ship":
+        if project.get("authority", 0) < 2 or project.get("mode") == modes.LOCAL_ONLY:
+            raise HelmError("no-mistakes can push/open a PR and requires non-local mode with authority >= 2")
+        if any(value is not None for value in (max_tokens, max_cost, max_seconds)):
+            raise HelmError("no-mistakes cannot prove First Mate token/cost/time caps; configured budgets fail closed")
     available = {m.strip() for m in os.environ.get("HELM_AVAILABLE_MODELS", "").split(",") if m.strip()}
     if model and available and model not in available:
         raise HelmError(f"resolved model {model} is unavailable; refusing silent substitution")
@@ -92,7 +145,13 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
         raise HelmError(f"project '{project_id}' has authority 0 (observe): only scout tasks allowed")
     wid = f"{project_id}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
     declared = scope.normalize(declared_scope)
-    global_claim = scope.is_global(declared) or any(scope.overlap(declared, [p]) for p in project.get("protected_paths", []))
+    # `scope.overlap` treats either sensitive operand as globally serializing,
+    # which is correct for two durable claims but wrong for this policy test:
+    # the mere existence of a protected pattern would make every disjoint file
+    # look protected. Here we need the underlying conservative glob intersection.
+    protected_overlap = any(scope.patterns_overlap(path, protected)
+                            for path in declared for protected in project.get("protected_paths", []))
+    global_claim = scope.is_global(declared) or protected_overlap
     it = {
         "id": wid, "project": project_id, "kind": kind, "text": text.strip(),
         "labels": sorted(set(labels or [])), "status": "queued", "attempts": 0,
@@ -102,12 +161,17 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
         "branch": worktree.branch_name(wid), "worktree": str(worktree.worktree_root() / project_id / wid),
         "pr_url": None, "ask": None, "dispatch": None, "phase": "queued",
         "scope": {"paths": declared, "claim": "global" if global_claim else "paths"},
-        "controls": {"paused": False, "away": False, "pending": []}, "session": None,
+        "controls": {"paused": False, "away": False, "pending": []}, "session": None, "agent_launches": [],
         "checkpoint": None, "reviews": [], "verification": [], "changed_scope": [],
         "activity": {"last": now(), "state": "queued"},
         "budgets": {"tokens": max_tokens, "cost": max_cost, "seconds": max_seconds},
+        "usage": {"tokens": 0, "cost": 0.0, "seconds": 0.0,
+                  "implementer_tokens": 0, "implementer_cost": 0.0,
+                  "reviewer_tokens": 0, "reviewer_cost": 0.0,
+                  "tokens_evidence_complete": True, "cost_evidence_complete": True},
         "model_overrides": ({("scout" if kind == "scout" else "implement"): model} if model else {}),
         "thinking_overrides": ({("scout" if kind == "scout" else "implement"): thinking} if thinking else {}),
+        "memory_request": memory_request,
     }
     it["rigor"] = rigor.route(it)
     if global_claim and declared != ["unknown"] and it["rigor"]["level"] != "high-risk":
@@ -117,6 +181,11 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
     it["model_decision"] = {"models": it["dispatch"]["models"], "thinking": it["dispatch"]["thinking"],
                             "rationale": it["dispatch"]["rationale"], "resolved_at": now()}
     write_json(item_path(wid), it)
+    try:
+        from . import supervisor
+        supervisor.observe(it)
+    except (Exception, HelmError) as exc:
+        log(f"{wid}: supervisor observation unavailable: {getattr(exc, 'msg', None) or exc!r}")
     log(f"{wid}: queued ({kind}, rule={it['dispatch']['rule']}, graph={it['dispatch']['graph']})")
     return it
 
@@ -150,47 +219,253 @@ def _pid_alive(pid) -> bool:
         return False
 
 
+def budget_blockers(it: dict) -> list[str]:
+    """Return fail-closed cumulative budget blockers before any new model turn."""
+    usage, budgets = it.get("usage") or {}, it.get("budgets") or {}
+    blockers = []
+    for key in ("tokens", "cost", "seconds"):
+        limit = budgets.get(key)
+        if limit is None:
+            continue
+        if key in ("tokens", "cost") and usage.get(f"{key}_evidence_complete") is False:
+            blockers.append(f"{key} usage evidence is incomplete")
+            continue
+        actual = usage.get(key)
+        if not isinstance(actual, (int, float)) or isinstance(actual, bool):
+            blockers.append(f"{key} usage evidence is unavailable")
+        elif float(actual) >= float(limit):
+            blockers.append(f"{key} budget exhausted ({actual:g}/{limit:g})")
+        elif key == "seconds" and float(limit) - float(actual) < 1.0:
+            blockers.append(f"seconds budget has less than one bounded second remaining ({actual:g}/{limit:g})")
+    return blockers
+
+
+def _harvest_usage(work_id: str, elapsed: float = 0.0) -> dict:
+    """Persist monotonic per-session receipts on every exceptional exit."""
+    current = load(work_id)
+    identities = []
+    if isinstance(current.get("session"), dict):
+        identities.append(("implementer", current["session"]))
+    for historical in current.get("session_history") or []:
+        if isinstance(historical, dict):
+            identities.append(("implementer", historical))
+    for launch in current.get("agent_launches") or []:
+        # Closed reviewers are still billable model sessions. In particular,
+        # an invalid verdict/model-drift error may close a settled reviewer
+        # before the outer exception path harvests its receipt.
+        if (launch.get("role") in {"implementer", "reviewer"}
+                and launch.get("agent_session_id") and launch.get("agent_session_path")):
+            identities.append((launch["role"], launch))
+
+    def mutate(item):
+        usage = item.setdefault("usage", {})
+        receipts = usage.setdefault("receipts", {})
+        prior_implementer_tokens = int(usage.get("implementer_tokens") or 0)
+        prior_implementer_cost = float(usage.get("implementer_cost") or 0.0)
+        prior_reviewer_tokens = int(usage.get("reviewer_tokens") or 0)
+        prior_reviewer_cost = float(usage.get("reviewer_cost") or 0.0)
+        prior_session = usage.get("implementer_session_id")
+        if prior_session and str(prior_session) not in receipts and (prior_implementer_tokens or prior_implementer_cost):
+            receipts[str(prior_session)] = {
+                "role": "implementer", "tokens": prior_implementer_tokens,
+                "cost": prior_implementer_cost,
+                "tokens_available": True, "cost_available": True,
+            }
+        seen = set()
+        for role, identity in identities:
+            session_id = str(identity.get("agent_session_id") or "")
+            if not session_id or session_id in seen:
+                continue
+            seen.add(session_id)
+            evidence = herdr.usage(identity)
+            try:
+                started = int(herdr.runtime_activity(identity).get("runtime_input_sequence") or 0) > 0
+            except BaseException:
+                started = True
+            receipt = receipts.setdefault(session_id, {"role": role})
+            receipt["role"] = role
+            for key in ("tokens", "cost"):
+                value = evidence.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    receipt[key] = max(float(receipt.get(key) or 0), float(value))
+                    if key == "tokens": receipt[key] = int(receipt[key])
+                    receipt[f"{key}_available"] = True
+                elif started and key not in receipt:
+                    receipt[f"{key}_available"] = False
+            receipt["harvested_at"] = now()
+        measured_implementer_tokens = sum(int(r.get("tokens") or 0) for key, r in receipts.items()
+                                          if r.get("role") == "implementer" and key != "legacy-implementer")
+        measured_implementer_cost = sum(float(r.get("cost") or 0.0) for key, r in receipts.items()
+                                        if r.get("role") == "implementer" and key != "legacy-implementer")
+        measured_reviewer_tokens = sum(int(r.get("tokens") or 0) for key, r in receipts.items()
+                                       if r.get("role") == "reviewer" and key != "legacy-reviewers")
+        measured_reviewer_cost = sum(float(r.get("cost") or 0.0) for key, r in receipts.items()
+                                     if r.get("role") == "reviewer" and key != "legacy-reviewers")
+        # Older scalar-only records cannot identify which reviewer sessions
+        # they covered. Preserve their lower bound without claiming complete
+        # evidence; a configured budget will therefore fail closed.
+        residual_tokens = max(0, prior_reviewer_tokens - measured_reviewer_tokens)
+        residual_cost = max(0.0, prior_reviewer_cost - measured_reviewer_cost)
+        if residual_tokens or residual_cost:
+            receipts["legacy-reviewers"] = {
+                "role": "reviewer", "tokens": residual_tokens, "cost": residual_cost,
+                "tokens_available": False, "cost_available": False,
+                "harvested_at": now(), "unattributed_legacy": True,
+            }
+        elif receipts.get("legacy-reviewers", {}).get("unattributed_legacy"):
+            receipts.pop("legacy-reviewers", None)
+        residual_implementer_tokens = max(0, prior_implementer_tokens - measured_implementer_tokens)
+        residual_implementer_cost = max(0.0, prior_implementer_cost - measured_implementer_cost)
+        if residual_implementer_tokens or residual_implementer_cost:
+            receipts["legacy-implementer"] = {
+                "role": "implementer", "tokens": residual_implementer_tokens,
+                "cost": residual_implementer_cost, "tokens_available": False,
+                "cost_available": False, "harvested_at": now(), "unattributed_legacy": True,
+            }
+        elif receipts.get("legacy-implementer", {}).get("unattributed_legacy"):
+            receipts.pop("legacy-implementer", None)
+        token_receipts = [r for r in receipts.values() if r.get("role") != "legacy"]
+        legacy_receipts = [r for r in receipts.values() if r.get("role") == "legacy"]
+        implementer = [r for r in token_receipts if r.get("role") == "implementer"]
+        reviewers = [r for r in token_receipts if r.get("role") == "reviewer"]
+        usage["implementer_tokens"] = sum(int(r.get("tokens") or 0) for r in implementer)
+        usage["implementer_cost"] = sum(float(r.get("cost") or 0.0) for r in implementer)
+        usage["reviewer_tokens"] = sum(int(r.get("tokens") or 0) for r in reviewers)
+        usage["reviewer_cost"] = sum(float(r.get("cost") or 0.0) for r in reviewers)
+        usage["tokens"] = (sum(int(r.get("tokens") or 0) for r in legacy_receipts) + usage["implementer_tokens"]
+                           + usage["reviewer_tokens"])
+        usage["cost"] = (sum(float(r.get("cost") or 0.0) for r in legacy_receipts) + usage["implementer_cost"]
+                         + usage["reviewer_cost"])
+        active = list(receipts.values())
+        usage["tokens_evidence_complete"] = all(r.get("tokens_available") is True for r in active)
+        usage["cost_evidence_complete"] = all(r.get("cost_available") is True for r in active)
+        usage["seconds"] = float(usage.get("seconds") or 0.0) + max(0.0, elapsed)
+    return control.cas_update(work_id, mutate)
+
+
 def claim_next(owner: str) -> dict | None:
     """Claim the oldest queued item whose durable scope is mechanically disjoint."""
     with locked(home() / "claim.lock"):
         items = all_items()
-        for it in items:                      # a dead owner's lease is not a running item
-            if it["status"] == "running" and not _pid_alive((it.get("lease") or {}).get("pid")):
-                it.pop("lease", None)
-                transition(it, "queued", "stale lease (owner died); requeued without burning an attempt")
         for it in items:
             if it["status"] == "queued" and not (it.get("controls") or {}).get("paused"):
                 declared = (it.get("scope") or {}).get("paths") or ["unknown"]
                 paths = ["global"] if (it.get("scope") or {}).get("claim") == "global" else declared
-                if not scope.claim(it["project"], it["id"], paths, owner, os.getpid()):
+                identity = processes.capture(os.getpid(), owner)
+                if not identity:
+                    raise HelmError("worker cannot capture its exact process identity; refusing a lease")
+                recovery_token = it.get("recovery_claim_token")
+                claim_token = scope.claim(it["project"], it["id"], paths, owner, os.getpid(), identity,
+                                          replace_token=recovery_token)
+                if not claim_token:
                     continue
-                it["lease"] = {"owner": owner, "started": now(), "pid": os.getpid(), "scope": paths}
+                it.pop("recovery_claim_token", None)
+                it["lease"] = {"owner": owner, "started": now(), "pid": os.getpid(), "scope": paths,
+                               "process_identity": identity, "claim_token": claim_token,
+                               "recovery_attempt": bool(recovery_token),
+                               "replaced_recovery_claim_token": recovery_token}
                 it["phase"] = "implementing"
                 try:
                     transition(it, "running", f"leased by {owner}")
                 except BaseException:
-                    scope.release(it["id"])
+                    if recovery_token:
+                        # The hold was exchanged before the item CAS. Never
+                        # delete collision protection merely because that CAS
+                        # or the runner died in this narrow window. Pin the new
+                        # token back onto the item when possible; otherwise the
+                        # still-held claim remains visible to doctor.
+                        scope.hold(it["id"], claim_token,
+                                   "recovery lease transition did not durably complete")
+                        try:
+                            def preserve(current):
+                                if current.get("recovery_claim_token") != recovery_token:
+                                    raise HelmError("recovery ownership changed during failed lease transition")
+                                current["recovery_claim_token"] = claim_token
+                                current.pop("lease", None); current["status"] = "paused"
+                                current["phase"] = "recovery-required"
+                                current.setdefault("controls", {})["paused"] = True
+                            control.cas_update(it["id"], preserve)
+                        except BaseException:
+                            pass
+                    else:
+                        scope.release(it["id"], claim_token)
                     raise
                 return it
     return None
 
 
 def execute(it: dict, timeout: int = 3600) -> dict:
-    """Run one attempt. Claims are always released and crashes retain branch/checkpoint."""
+    """Run one attempt; retain the claim only while an unsettled agent may still mutate."""
+    hold_claim = False
+    claim_token = (it.get("lease") or {}).get("claim_token")
+    recovery_attempt = bool((it.get("lease") or {}).get("recovery_attempt"))
+    started = time.monotonic()
+    def retain_recovery(reason: str, question: str) -> dict:
+        nonlocal hold_claim
+        hold_claim = True
+        current = load(it["id"])
+        current["recovery_claim_token"] = claim_token
+        current.pop("lease", None); current["phase"] = "recovery-required"
+        current.setdefault("controls", {})["paused"] = True
+        current["ask"] = {"question": question, "context": reason}
+        transition(current, "paused", "recovery attempt stopped; exact scope retained")
+        if not scope.hold(current["id"], claim_token, reason):
+            raise HelmError("recovery stopped and exact scope ownership could not be retained")
+        return current
     try:
+        current = load(it["id"])
+        if gates.has_open_transaction(current):
+            project = registry.get(current["project"])
+            tx = current.get("external_gate") or {}
+            wt = Path(str(tx.get("worktree_path") or current.get("worktree") or ""))
+            return gates.start_or_reconcile(current, project, wt)
+        if deliver.has_resumable_pr_delivery(current):
+            project = registry.get(current["project"])
+            return deliver.resume_pr_delivery(current, project)
+        blockers = budget_blockers(current)
+        if blockers:
+            if recovery_attempt:
+                return retain_recovery("; ".join(blockers),
+                                       "Recovery cannot start another model turn until its budget is raised or reconciled.")
+            current = load(it["id"])
+            current.pop("lease", None); current["phase"] = "paused"
+            current.setdefault("controls", {})["paused"] = True
+            current["ask"] = {"question": "The item cannot start another model turn until its budget is raised or reconciled.",
+                              "context": "; ".join(blockers)}
+            transition(current, "paused", "budget gate stopped execution before agent creation")
+            return current
         return _execute(it, timeout)
+    except herdr.UnsettledAgentError as e:
+        try: _harvest_usage(it["id"], time.monotonic() - started)
+        except BaseException: pass
+        retain_recovery(str(e), "The agent did not prove it stopped. Inspect the live Herdr tab before recovery.")
+        raise
     except BaseException as e:          # includes HelmError (a SystemExit) and KeyboardInterrupt
+        try: _harvest_usage(it["id"], time.monotonic() - started)
+        except BaseException: pass
+        if recovery_attempt:
+            retain_recovery(str(getattr(e, "msg", None) or e),
+                            "Recovery did not complete. Inspect the preserved agent/worktree evidence before trying again.")
+            raise
         it = load(it["id"])
         if it["status"] == "running":
             it.pop("lease", None); it["phase"] = "failed"
             transition(it, "failed", f"attempt crashed: {getattr(e, 'msg', None) or e!r}")
         raise
     finally:
-        scope.release(it["id"])
+        if not hold_claim:
+            scope.release(it["id"], claim_token)
 
 
-def _model_drift(expected: str, thinking: str, agent: dict) -> None:
-    herdr.validate_agent(agent, expected, thinking)
+def _model_drift(expected: str, thinking: str, agent: dict, *, require_durable: bool = True) -> None:
+    herdr.validate_agent(agent, expected, thinking, require_durable=require_durable)
+
+
+def _mark_activity(work_id: str, phase: str) -> dict:
+    def mark(item):
+        item["phase"] = phase
+        item["activity"] = {"last": now(), "state": phase}
+    return control.cas_update(work_id, mark)
 
 
 def _json_verdict(text: str) -> dict:
@@ -209,37 +484,148 @@ def _json_verdict(text: str) -> dict:
     return found[-1]
 
 
-def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout: int) -> dict:
+def _failure_signature(summary: dict, notes: str) -> str:
+    """Deduplicate failure meaning without volatile run/session/reviewer evidence."""
+    import hashlib
+    text = str(summary.get("error") or notes)
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    text = re.sub(r"\b\d{4}-\d\d-\d\d[T ][0-9:.+-]+Z?\b", "<time>", text)
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b", "<uuid>", text, flags=re.I)
+    text = re.sub(r"\b[0-9a-f]{40,64}\b", "<sha>", text, flags=re.I)
+    text = re.sub(r"(?:^|\s)/(?:[^\s:]+/)*(?:runs|agent-sessions|agent-attestations)/[^\s:]+", " <run>", text)
+    text = re.sub(r"\b(?:pid|process|review-[a-z0-9_-]+)\s*[=: ]\s*\d{3,}\b", "<volatile-id>", text, flags=re.I)
+    text = " ".join(text.split())[:4000]
+    stable = {"failed_ids": sorted(set(summary.get("failed_ids") or [])),
+              "scope_escape": sorted(set(summary.get("scope_escape") or [])), "meaning": text}
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def deliver_steering(work_id: str, event_id: str, text: str, session: dict, owner: str) -> bool:
+    """Deliver one steering event with a CAS lease and Pi-ledger crash reconciliation."""
+    baseline = int(herdr.runtime_activity(session).get("runtime_input_sequence", 0))
+    reserved = control.begin_delivery(work_id, event_id, owner, baseline)
+    if not reserved.pop("_delivery_acquired", False):
+        return False
+    event = next(value for value in reserved.get("controls", {}).get("events", []) if value.get("id") == event_id)
+    baseline = int(event.get("delivery_baseline_sequence", baseline))
+    accepted = herdr.accepted_input(session, "STEERING FROM THE CAPTAIN:\n" + text, baseline)
+    if not accepted:
+        try:
+            submitted = herdr.steer_agent(session["agent_name"], text, identity=session)
+        except BaseException:
+            # Herdr may fail after Pi accepted input. Leave the bounded lease in
+            # place; the next owner checks the hash-only ledger before retrying.
+            raise
+        sequence = submitted.get("_runtime_input_sequence")
+        accepted = ({"input_sequence": sequence} if sequence else
+                    herdr.accepted_input(session, "STEERING FROM THE CAPTAIN:\n" + text, baseline))
+    if not accepted or not accepted.get("input_sequence"):
+        raise HelmError("Pi accepted no durable steering input; delivery remains reserved for reconciliation")
+    herdr.record_runtime_anchor(session)
+    control.complete_delivery(work_id, event_id, owner, int(accepted["input_sequence"]))
+    return True
+
+
+def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout: int,
+                        agent_env: dict[str, str], *, attempt_started: float,
+                        deadline: float | None) -> dict:
     """Use one real reconnectable Herdr implementer and fresh independent reviewers."""
     decision = it["model_decision"]
     model = decision["models"]["scout" if it["kind"] == "scout" else "implement"]
     thinking = decision["thinking"]["scout" if it["kind"] == "scout" else "implement"]
     dispatch.assert_available(it["dispatch"])
-    session = herdr.ensure_agent(it, wt, model, thinking)
-    _model_drift(model, thinking, session)
+    session = herdr.ensure_agent(it, wt, model, thinking, agent_env=agent_env)
+    _model_drift(model, thinking, session, require_durable=False)
     current = load(it["id"])
     previous = current.get("session")
     recovered_checkpoint = current.get("checkpoint") or {}
-    if previous and not session.get("reconnected"):
+    same_session = bool(previous and previous.get("agent_session_id") == session.get("agent_session_id"))
+    if previous and not same_session and not session.get("reconnected"):
         current.setdefault("session_history", []).append({**previous, "lost_at": now(), "recovered_from_checkpoint": True})
+        authorization = current.get("recovery_authorized") or {}
+        if authorization.get("session_id") == previous.get("agent_session_id") and not authorization.get("consumed_at"):
+            authorization.update(consumed_at=now(), replacement_session_id=session.get("agent_session_id"))
+            current["recovery_authorized"] = authorization
+    elif not same_session:
+        authorization = current.get("recovery_authorized") or {}
+        if authorization and not authorization.get("consumed_at"):
+            authorization.update(consumed_at=now(), outcome="live-reconnect" if session.get("reconnected") else "initial-session")
+            current["recovery_authorized"] = authorization
     current["session"] = session; current["phase"] = "investigating" if it["kind"] == "scout" else "implementing"
+    current["activity"] = {"last": now(), "heartbeat": now(), "state": current["phase"],
+                           "progress_marker": herdr.progress_marker(session)}
     current["checkpoint"] = {"sha": git(wt, "rev-parse", "HEAD"), "at": now(),
                              "phase": current["phase"], "prior": recovered_checkpoint,
                              "scope": current.get("changed_scope", []),
                              "recovery": "live-reconnect" if session.get("reconnected") else "checkpoint-fallback"}
     save(current); it = current
+    prior_usage = it.get("usage") or {}
+    session_id = session.get("agent_session_id")
+    def aggregate_usage(implementer: dict, reviewer_tokens: int = 0,
+                        reviewer_cost: float = 0.0, *, reviewer_tokens_complete: bool = True,
+                        reviewer_cost_complete: bool = True) -> dict:
+        measured_tokens = int(implementer.get("tokens") or 0)
+        measured_cost = float(implementer.get("cost") or 0.0)
+        if prior_usage.get("implementer_session_id") == session_id:
+            implementer_tokens = max(int(prior_usage.get("implementer_tokens") or 0), measured_tokens)
+            implementer_cost = max(float(prior_usage.get("implementer_cost") or 0.0), measured_cost)
+        else:
+            implementer_tokens = int(prior_usage.get("implementer_tokens") or 0) + measured_tokens
+            implementer_cost = float(prior_usage.get("implementer_cost") or 0.0) + measured_cost
+        all_reviewer_tokens = int(prior_usage.get("reviewer_tokens") or 0) + reviewer_tokens
+        all_reviewer_cost = float(prior_usage.get("reviewer_cost") or 0.0) + reviewer_cost
+        return {"tokens": implementer_tokens + all_reviewer_tokens,
+                "cost": implementer_cost + all_reviewer_cost,
+                "implementer_tokens": implementer_tokens, "implementer_cost": implementer_cost,
+                "reviewer_tokens": all_reviewer_tokens, "reviewer_cost": all_reviewer_cost,
+                "implementer_session_id": session_id, "usage_kind": "session-cumulative",
+                "tokens_evidence_complete": ("tokens" in implementer and reviewer_tokens_complete),
+                "cost_evidence_complete": ("cost" in implementer and reviewer_cost_complete)}
+
+    initial_evidence = herdr.usage(session)
+    try:
+        prior_turns = int(herdr.runtime_activity(session).get("runtime_input_sequence") or 0)
+    except BaseException:
+        prior_turns = 1
+    missing_initial = [f"{key} usage evidence unavailable for the existing session"
+                       for key in ("tokens", "cost")
+                       if (it.get("budgets") or {}).get(key) is not None and prior_turns > 0
+                       and key not in initial_evidence]
+    initial_usage = aggregate_usage(initial_evidence)
+    if missing_initial:
+        run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                "budget_exceeded": "; ".join(missing_initial), "agent_checkpoint": "no-model-turn-started",
+                "error": "usage evidence is fail-closed before prompt", "reviews": [], **initial_usage}
+    exhausted = [f"{key} budget already exhausted ({initial_usage[key]:g}/{limit:g})"
+                 for key in ("tokens", "cost")
+                 if (limit := (it.get("budgets") or {}).get(key)) is not None and initial_usage[key] >= limit]
+    if exhausted:
+        run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                "budget_exceeded": "; ".join(exhausted), "agent_checkpoint": "no-model-turn-started",
+                "error": "budget threshold reached before prompt", "reviews": [], **initial_usage}
     checkpoint = recovered_checkpoint or it.get("checkpoint") or {}
+    turn_head = git(wt, "rev-parse", "HEAD")
     if it["kind"] == "scout":
         prompt = ("Investigate this repository read-only. Do not modify files or commit. Return a concise Markdown report with file/line evidence.\n\n"
                   + brief.read_text())
     else:
-        prompt = (f"Continue work on the persistent branch {it['branch']} in {wt}. Run `{project.get('test_cmd') or 'true'}` and commit all intended changes. "
+        prompt = (f"Continue work in the owned worktree {wt}. Run `{project.get('test_cmd') or 'true'}`. "
+                  "Edit files, but do not run git add/commit/rebase: the controller will checkpoint only after validating your scope. "
                   f"Never touch protected paths: {project.get('protected_paths')}. If a decision is required, write .helm-ask.json and stop. "
                   f"Checkpoint SHA before this turn: {checkpoint.get('sha')}.\n\n" + brief.read_text())
-    pending = list((it.get("controls") or {}).get("pending", []))
+    event_states = {event.get("id"): event.get("state") for event in (it.get("controls") or {}).get("events", [])}
+    pending = [event for event in (it.get("controls") or {}).get("pending", [])
+               if event_states.get(event.get("id"), "pending") == "pending"]
     baseline_changed = set(worktree.changed_files(project, wt))
     monitor_started = time.monotonic(); last_heartbeat = [0.0]
-    reconnecting_active = session.get("reconnected") and (session.get("agent_status") or session.get("state")) == "working"
+    reconnecting_active = session.get("reconnected") and (
+        session.get("runtime_turn_pending") or
+        (session.get("agent_status") or session.get("state")) == "working"
+    )
     delivered_controls: set[str] = set() if reconnecting_active else {p["id"] for p in pending}
     def live_escape():
         live_item = load(it["id"])
@@ -250,53 +636,80 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         for event in controls.get("pending", []):
             event_id = event.get("id")
             if event_id and event_id not in delivered_controls:
-                herdr.steer_agent(session["agent_name"], event["text"])
-                control.consume(it["id"], [event_id], "delivered")
-                delivered_controls.add(event_id)
+                if deliver_steering(it["id"], event_id, event["text"], session,
+                                    f"runner:{os.getpid()}"):
+                    delivered_controls.add(event_id)
         if elapsed - last_heartbeat[0] >= 5:
-            live_agent = herdr.agent_get(session["agent_name"])
+            live_agent = herdr.agent_get(session["agent_name"], session)
             measured = herdr.usage(live_agent)
-            def beat(item): item["activity"] = {"last": now(), "state": "working", "elapsed_seconds": int(elapsed), **measured}
+            marker = herdr.progress_marker(live_agent or session)
+            def beat(item):
+                activity = item.setdefault("activity", {})
+                activity.update(heartbeat=now(), state="working", elapsed_seconds=int(elapsed), **measured)
+                if activity.get("progress_marker") != marker:
+                    activity.update(last=now(), progress_marker=marker)
             control.cas_update(it["id"], beat); last_heartbeat[0] = elapsed
+            total_usage = aggregate_usage(measured)
             for key in ("tokens", "cost"):
-                limit, actual = (live_item.get("budgets") or {}).get(key), measured.get(key)
+                limit, actual = (live_item.get("budgets") or {}).get(key), total_usage.get(key)
+                if limit is not None and key not in measured:
+                    return {"control": "budget", "reason": f"{key} usage evidence became unavailable"}
                 if limit is not None and actual is not None and actual >= limit:
                     return {"control": "budget", "reason": f"{key} budget reached ({actual:g}/{limit:g})"}
-        if (live_item.get("budgets") or {}).get("seconds") and elapsed >= live_item["budgets"]["seconds"]:
+        elapsed_total = float(prior_usage.get("seconds") or 0.0) + (time.monotonic() - attempt_started)
+        if (live_item.get("budgets") or {}).get("seconds") and elapsed_total >= live_item["budgets"]["seconds"]:
             return {"control": "budget", "reason": "time budget reached"}
         if controls.get("pause_requested") or controls.get("interrupt_requested"):
             return {"control": "interrupt" if controls.get("interrupt_requested") else "pause"}
         changed = set(worktree.changed_files(project, wt))
-        for line in git(wt, "status", "--porcelain", "--untracked-files=all", check=False).splitlines():
-            path = line[3:].split(" -> ")[-1]
-            if path and path.split("/", 1)[0] not in (*worktree.DEP_DIRS, ".helm-ask.json"):
-                changed.add(path)
+        changed.update(worktree.status_paths(wt, allow_ask=True))
         changed = sorted(changed - baseline_changed)
         sensitive = [p for p in changed if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
         return sorted(set(sensitive + scope.escaped((it.get("scope") or {}).get("paths"), changed)))
     if reconnecting_active:
-        agent, escaped_live = herdr.wait_agent_monitored(session["agent_name"], timeout, live_escape)
+        agent, escaped_live = herdr.wait_agent_monitored(
+            session["agent_name"], max(1, _remaining_timeout(deadline, timeout)), live_escape, session)
     else:
-        agent, escaped_live = herdr.prompt_agent_monitored(session["agent_name"], prompt, timeout, live_escape)
+        turn_timeout = _remaining_timeout(deadline, timeout)
+        if not turn_timeout:
+            run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+            run_dir.mkdir(parents=True, exist_ok=False)
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                    "budget_exceeded": "seconds budget has less than one bounded second remaining",
+                    "agent_checkpoint": "no-model-turn-started", "error": "time budget reached",
+                    "reviews": [], **initial_usage}
+        agent, escaped_live = herdr.prompt_agent_monitored(session["agent_name"], prompt, turn_timeout, live_escape, session)
         if pending:
             control.consume(it["id"], [p["id"] for p in pending], "delivered")
-    agent = herdr.agent_get(session["agent_name"]) or agent
+    agent = herdr.agent_get(session["agent_name"], session) or {**session, **agent}
     _model_drift(model, thinking, agent)
+    turn_evidence = herdr.usage(agent)
+    turn_usage = aggregate_usage(turn_evidence)
+    missing_turn = [f"{key} usage evidence unavailable after implementer turn"
+                    for key in ("tokens", "cost")
+                    if (it.get("budgets") or {}).get(key) is not None and key not in turn_evidence]
+    if missing_turn:
+        run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                "budget_exceeded": "; ".join(missing_turn), "agent_checkpoint": "turn-settled",
+                "error": "usage evidence is fail-closed after prompt", **turn_usage}
     if isinstance(escaped_live, dict) and escaped_live.get("control"):
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": escaped_live["control"],
                 "budget_exceeded": escaped_live.get("reason"), "agent_checkpoint": escaped_live.get("agent_checkpoint"),
-                "error": "cooperative control checkpoint"}
+                "error": "cooperative control checkpoint", **turn_usage}
     if escaped_live:
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
         protected_live = [p for p in escaped_live if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
         if protected_live:
             return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["protected"],
-                    "error": "live protected-path change interrupted: " + ", ".join(protected_live), "changed": escaped_live}
+                    "error": "live protected-path change interrupted: " + ", ".join(protected_live),
+                    "changed": escaped_live, **turn_usage}
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["scope-escape"], "scope_escape": escaped_live,
-                "error": "live scope escape interrupted: " + ", ".join(escaped_live)}
+                "error": "live scope escape interrupted: " + ", ".join(escaped_live), **turn_usage}
     output = herdr.agent_read(session["agent_name"], 240)
     run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -304,22 +717,53 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
     if it["kind"] == "scout":
         (item_dir(it["id"]) / "report.md").write_text(output)
         measured = herdr.usage(agent)
-        return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], **measured, "reviews": []}
+        return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], **aggregate_usage(measured), "reviews": []}
+    if git(wt, "rev-parse", "HEAD", check=False) != turn_head:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["sandbox-boundary"],
+                "error": "managed implementer changed Git metadata despite the write sandbox; work preserved", **turn_usage}
+    dirty_before_checkpoint = worktree.status_paths(wt, allow_ask=True)
+    candidate_changed = sorted(set(worktree.changed_files(project, wt) + dirty_before_checkpoint))
+    protected_candidate = [p for p in candidate_changed
+                           if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
+    escaped_candidate = scope.escaped((it.get("scope") or {}).get("paths"), candidate_changed)
+    if protected_candidate:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["protected"],
+                "error": "protected paths changed before controller checkpoint: " + ", ".join(protected_candidate),
+                "changed": candidate_changed, **turn_usage}
+    if escaped_candidate:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["scope-escape"],
+                "scope_escape": escaped_candidate,
+                "error": "changes escaped declared scope before controller checkpoint: " + ", ".join(escaped_candidate),
+                "changed": candidate_changed, **turn_usage}
+    if dirty_before_checkpoint:
+        add = sh(["git", "-C", str(wt), "add", "-A", "--",
+                  *worktree.checkpoint_pathspecs(wt)],
+                 check=False, env=agent_env)
+        if add.returncode:
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["checkpoint"],
+                    "error": "controller could not stage the validated worktree: " + add.stderr[-1000:], **turn_usage}
+        commit = sh(["git", "-C", str(wt), "-c", "user.name=First Mate Checkpoint",
+                     "-c", "user.email=firstmate@local.invalid", "commit", "-m",
+                     f"firstmate: checkpoint {it['id']}"], check=False, env=agent_env)
+        if commit.returncode:
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["checkpoint"],
+                    "error": "controller could not commit validated changes: " + commit.stderr[-1000:], **turn_usage}
     if (wt / ".helm-ask.json").exists():
         measured = herdr.usage(agent)
-        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["question"], **measured}
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["question"], **aggregate_usage(measured)}
     if not worktree.has_commits(project, wt):
-        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["implement"], "error": "implementer produced no commit"}
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["implement"],
+                "error": "implementer produced no commit", **turn_usage}
     changed = worktree.changed_files(project, wt)
     protected = [p for p in changed if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
     if protected:
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["protected"],
-                "error": "protected paths changed: " + ", ".join(protected), "changed": changed}
+                "error": "protected paths changed: " + ", ".join(protected), "changed": changed, **turn_usage}
     escaped = scope.escaped((it.get("scope") or {}).get("paths"), changed)
     if escaped:
         herdr.interrupt_agent(session["agent_name"])
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["scope-escape"], "scope_escape": escaped,
-                "error": "changed files escaped declared scope: " + ", ".join(escaped)}
+                "error": "changed files escaped declared scope: " + ", ".join(escaped), **turn_usage}
     # Integrate the latest configured local base before final verification and review.
     base_sha = git(project["path"], "rev-parse", project["base"])
     if git(wt, "merge-base", base_sha, "HEAD", check=False) != base_sha:
@@ -327,52 +771,149 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         if r.returncode != 0:
             sh(["git", "-C", str(wt), "rebase", "--abort"], check=False)
             return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-integration"], "error": r.stderr[-2000:]}
-    verify = sh(["bash", "-c", project.get("test_cmd") or "true"], cwd=wt, check=False, timeout=timeout)
+    _mark_activity(it["id"], "verifying")
+    verify_timeout = _remaining_timeout(deadline, timeout)
+    if not verify_timeout:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                "budget_exceeded": "seconds budget reached before verification",
+                "agent_checkpoint": "turn-settled", "error": "time budget reached", **turn_usage}
+    verify = sandbox.run_verification(work_id=it["id"], phase="pre-review", cwd=wt,
+                                      command=project.get("test_cmd") or "true",
+                                      timeout=verify_timeout, env=agent_env)
     (run_dir / "verify.md").write_text(verify.stdout + verify.stderr)
     if verify.returncode:
-        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["verify"], "error": (verify.stdout + verify.stderr)[-3000:]}
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["verify"],
+                "error": (verify.stdout + verify.stderr)[-3000:], **turn_usage}
+    if git(project["path"], "rev-parse", project["base"], check=False) != base_sha:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-moved"],
+                "error": "configured base moved during verification; reviews were not started"}
     sha = git(wt, "rev-parse", "HEAD")
     reviews = []
-    if it["dispatch"]["graph"] in ("direct-pr", "no-mistakes"):
-        diff = git(wt, "diff", f"{base_sha}...{sha}")[-200000:]
-        roles = ["correctness"] + (["adversarial"] if it["dispatch"]["graph"] == "no-mistakes" else [])
-        for role in roles:
+    implementer_measured = herdr.usage(agent)
+    reviewer_tokens = 0
+    reviewer_cost = 0.0
+    reviewer_tokens_complete = True
+    reviewer_cost_complete = True
+    if it["dispatch"]["graph"] == "direct-pr" or modes.high_assurance(it["dispatch"]["graph"]):
+        diff = git(wt, "diff", f"{base_sha}...{sha}")
+        diff_bytes = len(diff.encode())
+        if diff_bytes > MAX_REVIEW_DIFF_BYTES:
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["review-input-too-large"],
+                    "error": f"complete review diff is {diff_bytes} bytes; maximum is {MAX_REVIEW_DIFF_BYTES}; no truncated review was run"}
+        roles = ["correctness"] + (["adversarial"] if modes.high_assurance(it["dispatch"]["graph"]) else [])
+        for role_index, role in enumerate(roles):
+            before_review = aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
+                                            reviewer_tokens_complete=reviewer_tokens_complete,
+                                            reviewer_cost_complete=reviewer_cost_complete)
+            blocked = [f"{key} budget reached ({before_review[key]:g}/{limit:g})"
+                       for key in ("tokens", "cost")
+                       if (limit := (it.get("budgets") or {}).get(key)) is not None and before_review[key] >= limit]
+            blocked += [f"{key} usage evidence is incomplete"
+                        for key in ("tokens", "cost")
+                        if (it.get("budgets") or {}).get(key) is not None
+                        and before_review.get(f"{key}_evidence_complete") is not True]
+            if not _remaining_timeout(deadline, timeout):
+                blocked.append("seconds budget has less than one bounded second remaining")
+            if blocked:
+                return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                        "budget_exceeded": "; ".join(blocked), "agent_checkpoint": "no-review-turn-started",
+                        "error": "budget threshold reached before reviewer", "reviews": reviews, **before_review}
             phase = "review_" + role
-            reviewer = herdr.ensure_agent(it, wt, decision["models"][phase], decision["thinking"][phase], reviewer=True)
+            _mark_activity(it["id"], phase.replace("_", "-"))
+            verdict_file = run_dir / f"review_{role}.pending.json"
+            reviewer_env = {**agent_env, "HELM_AGENT_ALLOWED_WRITES": str(verdict_file.resolve())}
+            reviewer = herdr.ensure_agent(it, wt, decision["models"][phase], decision["thinking"][phase],
+                                          reviewer=True, agent_env=reviewer_env)
+            reviewer_settled = False
             try:
-                _model_drift(decision["models"][phase], decision["thinking"][phase], reviewer)
-                verdict_file = run_dir / f"review_{role}.pending.json"
+                _model_drift(decision["models"][phase], decision["thinking"][phase], reviewer,
+                             require_durable=False)
+                review_timeout = _remaining_timeout(deadline, timeout)
+                if not review_timeout:
+                    return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                            "budget_exceeded": "seconds budget reached before reviewer input",
+                            "agent_checkpoint": "no-review-turn-started", "error": "time budget reached",
+                            "reviews": reviews, **before_review}
                 herdr.prompt_agent(reviewer["agent_name"],
-                    f"You are an independent {role} reviewer. Review commit {sha}. Do not modify the repository. "
-                    f"Write genuine JSON {{\"verdict\":\"accept\" or \"reject\",\"notes\":\"...\",\"sha\":\"{sha}\"}} to "
-                    f"{verdict_file}, then reply with that path.\n\n" + brief.read_text() + "\n\nDIFF:\n" + diff, timeout)
-                live_reviewer = herdr.agent_get(reviewer["agent_name"])
+                    f"You are an independent {role} reviewer. Review exact base {base_sha} and commit {sha}. "
+                    f"Do not modify the repository. Write genuine JSON "
+                    f"{{\"verdict\":\"accept\" or \"reject\",\"notes\":\"...\",\"sha\":\"{sha}\","
+                    f"\"base_sha\":\"{base_sha}\"}} to "
+                    f"{verdict_file}, then reply with that path.\n\n" + brief.read_text() + "\n\nDIFF:\n" + diff,
+                    review_timeout, reviewer)
+                reviewer_settled = True
+                live_reviewer = herdr.agent_get(reviewer["agent_name"], reviewer)
                 if not live_reviewer:
                     raise HelmError("reviewer session disappeared before its verdict was captured")
                 _model_drift(decision["models"][phase], decision["thinking"][phase], live_reviewer)
+                reviewer_usage = herdr.usage(live_reviewer)
+                reviewer_tokens_complete = reviewer_tokens_complete and "tokens" in reviewer_usage
+                reviewer_cost_complete = reviewer_cost_complete and "cost" in reviewer_usage
+                missing_reviewer = [f"{key} usage evidence unavailable after {role} reviewer"
+                                    for key in ("tokens", "cost")
+                                    if (it.get("budgets") or {}).get(key) is not None
+                                    and key not in reviewer_usage]
+                if missing_reviewer:
+                    return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                            "budget_exceeded": "; ".join(missing_reviewer),
+                            "agent_checkpoint": "review-turn-settled",
+                            "error": "reviewer usage evidence is fail-closed", "reviews": reviews,
+                            **aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
+                                              reviewer_tokens_complete=reviewer_tokens_complete,
+                                              reviewer_cost_complete=reviewer_cost_complete)}
+                reviewer_tokens += int(reviewer_usage.get("tokens") or 0)
+                reviewer_cost += float(reviewer_usage.get("cost") or 0.0)
                 evidence = herdr.agent_read(reviewer["agent_name"], 240)
                 try:
                     verdict = json.loads(verdict_file.read_text())
                 except (OSError, json.JSONDecodeError):
                     verdict = _json_verdict(evidence)
-                if verdict.get("verdict") not in ("accept", "reject") or verdict.get("sha") != sha:
-                    raise HelmError("reviewer evidence has no valid verdict bound to the requested SHA")
-                rec = {**verdict, "sha": sha, "role": role, "reviewer": reviewer, "fresh": True,
-                       "valid": True, "evidence": evidence[-12000:], "at": now()}
+                if (verdict.get("verdict") not in ("accept", "reject") or verdict.get("sha") != sha
+                        or verdict.get("base_sha") != base_sha):
+                    raise HelmError("reviewer evidence has no valid verdict bound to the requested base/head SHAs")
+                rec = {**verdict, "sha": sha, "base_sha": base_sha, "role": role, "reviewer": reviewer, "fresh": True,
+                       "valid": True, "evidence": evidence[-12000:], "usage": reviewer_usage, "at": now()}
                 reviews.append(rec); (run_dir / f"review_{role}.json").write_text(json.dumps(rec, indent=2))
                 if verdict["verdict"] != "accept":
-                    return {"ok": False, "run_dir": str(run_dir), "failed_ids": [phase], "reviews": reviews}
+                    return {"ok": False, "run_dir": str(run_dir), "failed_ids": [phase], "reviews": reviews,
+                            **aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
+                                              reviewer_tokens_complete=reviewer_tokens_complete,
+                                              reviewer_cost_complete=reviewer_cost_complete)}
+                after_review = aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
+                                               reviewer_tokens_complete=reviewer_tokens_complete,
+                                               reviewer_cost_complete=reviewer_cost_complete)
+                exceeded = [f"{key} budget exceeded ({after_review[key]:g}/{limit:g})"
+                            for key in ("tokens", "cost")
+                            if (limit := (it.get("budgets") or {}).get(key)) is not None and after_review[key] > limit]
+                needed = [f"{key} budget reached ({after_review[key]:g}/{limit:g})"
+                          for key in ("tokens", "cost")
+                          if role_index + 1 < len(roles)
+                          and (limit := (it.get("budgets") or {}).get(key)) is not None and after_review[key] >= limit]
+                if exceeded or needed:
+                    return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                            "budget_exceeded": "; ".join(exceeded + needed),
+                            "agent_checkpoint": "review-turn-settled", "error": "reviewer budget threshold reached",
+                            "reviews": reviews, **after_review}
             finally:
-                herdr.close_agent_tab(reviewer)
-    measured = herdr.usage(agent)
+                # A transport failure after prompt submission cannot prove the
+                # reviewer stopped. Keep its exact tab/launch and the item's
+                # collision claim for explicit doctor/recovery reconciliation.
+                if reviewer_settled:
+                    herdr.close_agent_tab(reviewer)
+    if git(project["path"], "rev-parse", project["base"], check=False) != base_sha:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-moved"], "reviews": reviews,
+                "error": "configured base moved after review; all review evidence is invalid"}
+    measured = aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
+                               reviewer_tokens_complete=reviewer_tokens_complete,
+                               reviewer_cost_complete=reviewer_cost_complete)
     return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], **measured,
             "reviews": reviews, "sha": sha, "base_sha": base_sha, "changed": changed}
 
 
-def _headless_reviews(it: dict, summary: dict, sha: str) -> list[dict]:
-    """Bind only parseable pi-graph reviewer evidence to the exact post-run SHA."""
+def _headless_reviews(it: dict, summary: dict, sha: str, base_sha: str | None = None) -> list[dict]:
+    """Bind only parseable pi-graph evidence to the exact post-run base/head pair."""
     run_dir = Path(summary.get("run_dir") or "")
-    phases = ["review_correctness"] + (["review_adversarial"] if it["dispatch"]["graph"] == "no-mistakes" else [])
+    phases = ["review_correctness"] + (["review_adversarial"] if modes.high_assurance(it["dispatch"]["graph"]) else [])
     reviews = []
     for phase in phases:
         evidence = ""
@@ -384,15 +925,17 @@ def _headless_reviews(it: dict, summary: dict, sha: str) -> list[dict]:
         if not evidence:
             return []
         verdict = _json_verdict(evidence)
-        if verdict.get("sha") != sha:
+        if verdict.get("sha") != sha or (base_sha is not None and verdict.get("base_sha") != base_sha):
             return []
-        reviews.append({**verdict, "sha": sha, "role": phase.removeprefix("review_"),
+        reviews.append({**verdict, "sha": sha, "base_sha": base_sha, "role": phase.removeprefix("review_"),
                         "reviewer": {"kind": "pi-graph", "identity": f"{run_dir}:{phase}"},
                         "fresh": True, "valid": True, "at": now(), "evidence": evidence[-12000:]})
     return reviews
 
 
-def _apply_safety_pipeline(it: dict, project: dict, wt: Path, summary: dict, initial: dict, timeout: int) -> dict:
+def _apply_safety_pipeline(it: dict, project: dict, wt: Path, summary: dict, initial: dict, timeout: int,
+                           *, restricted: bool = True, deadline: float | None = None,
+                           verify_env: dict | None = None) -> dict:
     """One post-execution safety pipeline for Herdr, headless, and test runners."""
     if not summary.get("ok"):
         return summary
@@ -415,10 +958,26 @@ def _apply_safety_pipeline(it: dict, project: dict, wt: Path, summary: dict, ini
     if escaped:
         return {**summary, "ok": False, "failed_ids": ["scope-escape"], "changed": changed,
                 "scope_escape": escaped, "error": "changed files escaped declared scope: " + ", ".join(escaped)}
-    if not worktree.base_is_ancestor(project, wt):
+    if it.get("memory_request"):
+        from . import memory
+        if memory_error := memory.validate_project_change(it, project, wt):
+            return {**summary, "ok": False, "failed_ids": ["project-memory"], "changed": changed,
+                    "error": memory_error}
+    base_sha = git(project["path"], "rev-parse", project["base"])
+    if sh(["git", "-C", str(wt), "merge-base", "--is-ancestor", base_sha, "HEAD"], check=False).returncode:
         return {**summary, "ok": False, "failed_ids": ["base-moved"],
                 "error": "configured base moved during execution; full pipeline must rerun"}
-    verify = sh(["bash", "-c", project.get("test_cmd") or "true"], cwd=wt, check=False, timeout=timeout)
+    verify_timeout = _remaining_timeout(deadline, timeout)
+    if not verify_timeout:
+        return {**summary, "ok": False, "failed_ids": [], "control": "budget",
+                "budget_exceeded": "seconds budget reached before final verification",
+                "error": "time budget reached"}
+    verify = (sandbox.run_verification(work_id=it["id"], phase="final", cwd=wt,
+                                       command=project.get("test_cmd") or "true",
+                                       timeout=verify_timeout, env=verify_env)
+              if restricted else
+              sh(["bash", "-c", project.get("test_cmd") or "true"], cwd=wt,
+                 check=False, timeout=verify_timeout, env=verify_env))
     run_dir = Path(summary.get("run_dir") or item_dir(it["id"]))
     if run_dir.is_dir():
         (run_dir / "helm-final-verify.md").write_text(verify.stdout + verify.stderr)
@@ -429,13 +988,19 @@ def _apply_safety_pipeline(it: dict, project: dict, wt: Path, summary: dict, ini
     if dirty:
         return {**summary, "ok": False, "failed_ids": ["dirty-worktree"],
                 "error": "tests mutated the worktree: " + ", ".join(dirty)}
+    if git(project["path"], "rev-parse", project["base"], check=False) != base_sha:
+        return {**summary, "ok": False, "failed_ids": ["base-moved"],
+                "error": "configured base moved during final verification; full pipeline must rerun"}
     sha = git(wt, "rev-parse", "HEAD")
-    base_sha = git(project["path"], "rev-parse", project["base"])
     reviews = summary.get("reviews") or []
-    if it["dispatch"]["graph"] in ("direct-pr", "no-mistakes") and not reviews:
-        reviews = _headless_reviews(it, summary, sha)
-    required = 2 if it["dispatch"]["graph"] == "no-mistakes" else 1 if it["dispatch"]["graph"] == "direct-pr" else 0
-    if len(reviews) != required or any(r.get("verdict") != "accept" or r.get("sha") != sha for r in reviews):
+    if (it["dispatch"]["graph"] == "direct-pr" or modes.high_assurance(it["dispatch"]["graph"])) and not reviews:
+        reviews = _headless_reviews(it, summary, sha, base_sha)
+    required = 2 if modes.high_assurance(it["dispatch"]["graph"]) else 1 if it["dispatch"]["graph"] == "direct-pr" else 0
+    if len(reviews) != required or any(
+        r.get("verdict") != "accept" or r.get("sha") != sha or r.get("base_sha") != base_sha
+        or r.get("fresh") is not True or r.get("valid") is not True or not r.get("reviewer")
+        for r in reviews
+    ):
         return {**summary, "ok": False, "failed_ids": ["exact-sha-review"],
                 "error": "fresh accepting reviewer evidence is not bound to the exact final SHA", "reviews": reviews}
     return {**summary, "sha": sha, "base_sha": base_sha, "changed": changed, "reviews": reviews,
@@ -444,16 +1009,31 @@ def _apply_safety_pipeline(it: dict, project: dict, wt: Path, summary: dict, ini
 
 def _execute(it: dict, timeout: int) -> dict:
     started_monotonic = time.monotonic()
+    deadline = None
     if (it.get("budgets") or {}).get("seconds"):
-        timeout = min(timeout, int(it["budgets"]["seconds"]))
+        remaining = float(it["budgets"]["seconds"]) - float((it.get("usage") or {}).get("seconds") or 0.0)
+        timeout = min(timeout, max(1, int(remaining)))
+        deadline = started_monotonic + max(0.0, remaining)
     project = registry.get(it["project"])
+    test_mode = graphs.deterministic_test_mode()
+    if not herdr.inside() and not test_mode:
+        raise HelmError("managed execution requires a real Herdr session; no headless worker identity was fabricated")
+    # Recheck the current external gate at execution time. A queued item cannot
+    # bypass a later fail-closed project policy change.
+    gates.require_execution(project.get("gate", "native"), project["path"])
+    policy = _policy_snapshot(project)
     d = item_dir(it["id"])
+    it = _mark_activity(it["id"], "integrating")
     wt = worktree.create(project, it["id"])
     initial = worktree.signature(wt)
-    it["integration"] = worktree.integrate_latest(project, wt)
-    it["reviews"] = []
-    it["activity"] = {"last": now(), "state": "integrated"}
-    save(it)
+    integration = worktree.integrate_latest(project, wt)
+    def integrated(current):
+        if current.get("status") != "running":
+            raise HelmError("item stopped while its worktree was integrating")
+        current["integration"] = integration
+        current["reviews"] = []
+        current["activity"] = {"last": now(), "state": "integrated"}
+    it = control.cas_update(it["id"], integrated)
     initial = worktree.signature(wt)
     brief = d / "brief.md"
     brief.write_text(brief_text(it, project))
@@ -467,11 +1047,13 @@ def _execute(it: dict, timeout: int) -> dict:
                           models=dp["models"], thinking=dp["thinking"], timeout=timeout)
     graphs.validate(steps)
     env = worktree.git_env(wt, d / "gitexclude")
-    if herdr.inside() and not os.environ.get("HELM_PIW"):
-        summary = _persistent_execute(it, project, wt, brief, timeout)
+    if herdr.inside() and not test_mode:
+        summary = _persistent_execute(it, project, wt, brief, timeout, env,
+                                      attempt_started=started_monotonic, deadline=deadline)
     else:
-        # Deterministic runner fallback is retained for tests and explicit headless use;
-        # it is never represented as a Herdr agent session. A tail tab remains a display only.
+        # The inert checked-in runner is a deterministic test seam only. It is
+        # never represented as a Herdr agent session or accepted from an
+        # arbitrary HELM_PIW path.
         tab = None
         if herdr.inside():
             import shlex
@@ -479,13 +1061,15 @@ def _execute(it: dict, timeout: int) -> dict:
                                  f"{shlex.quote(str(Path(__file__).resolve().parents[1] / 'bin' / 'helm'))} tail {it['id']}")
             if tab: herdr.remember("task", {**tab, "item": it["id"]})
         try:
+            it = _mark_activity(it["id"], "executing-graph")
             monitor_started = time.monotonic()
             def headless_monitor():
                 live = load(it["id"]); controls = live.get("controls") or {}
                 elapsed = time.monotonic() - monitor_started
                 if controls.get("pause_requested") or controls.get("interrupt_requested"):
                     return {"control": "interrupt" if controls.get("interrupt_requested") else "pause"}
-                if (live.get("budgets") or {}).get("seconds") and elapsed >= live["budgets"]["seconds"]:
+                elapsed_total = float((live.get("usage") or {}).get("seconds") or 0.0) + elapsed
+                if (live.get("budgets") or {}).get("seconds") and elapsed_total >= live["budgets"]["seconds"]:
                     return {"control": "budget", "budget_exceeded": "time budget reached"}
                 changed_now = worktree.status_paths(wt, allow_ask=True)
                 escaped_now = scope.escaped((live.get("scope") or {}).get("paths"), changed_now)
@@ -497,24 +1081,68 @@ def _execute(it: dict, timeout: int) -> dict:
         finally:
             if tab:
                 herdr.close_tab(tab["tab_id"]); herdr.forget(tab["tab_id"])
-    summary = _apply_safety_pipeline(it, project, wt, summary, initial, timeout)
+    it = _mark_activity(it["id"], "final-verification")
+    current_project = registry.get(it["project"])
+    if _policy_snapshot(current_project) != policy:
+        summary = {**summary, "ok": False, "failed_ids": ["project-policy-moved"],
+                   "error": "registered project policy changed during execution; full pipeline must rerun"}
+    else:
+        summary = _apply_safety_pipeline(
+            it, project, wt, summary, initial, timeout,
+            restricted=not test_mode,
+            deadline=deadline, verify_env=env)
     elapsed = time.monotonic() - started_monotonic
+    previous_usage = it.get("usage") or {}
+    if summary.get("usage_kind") == "session-cumulative":
+        usage_record = dict(previous_usage)
+        usage_record.update({key: summary.get(key, previous_usage.get(key)) for key in (
+            "tokens", "cost", "implementer_tokens", "implementer_cost",
+            "reviewer_tokens", "reviewer_cost", "implementer_session_id",
+            "tokens_evidence_complete", "cost_evidence_complete"
+        )})
+    else:
+        usage_record = dict(previous_usage)
+        if summary.get("tokens") is not None:
+            usage_record["tokens"] = int(previous_usage.get("tokens") or 0) + int(summary["tokens"])
+        if summary.get("cost") is not None:
+            usage_record["cost"] = float(previous_usage.get("cost") or 0.0) + float(summary["cost"])
+    usage_record["seconds"] = float(previous_usage.get("seconds") or 0.0) + elapsed
+    attempt_tokens, attempt_cost = summary.get("tokens"), summary.get("cost")
+    if attempt_tokens is not None:
+        summary["tokens"] = usage_record.get("tokens")
+    if attempt_cost is not None:
+        summary["cost"] = usage_record.get("cost")
     budgets = it.get("budgets") or {}
     exceeded = []
-    for key, actual in (("tokens", summary.get("tokens")), ("cost", summary.get("cost")), ("seconds", elapsed)):
+    for key, actual in (("tokens", summary.get("tokens")), ("cost", summary.get("cost")),
+                        ("seconds", usage_record.get("seconds"))):
         limit = budgets.get(key)
-        if limit is not None and actual is None:
+        if (limit is not None and key in ("tokens", "cost")
+                and usage_record.get(f"{key}_evidence_complete") is not True):
+            exceeded.append(f"{key} evidence incomplete")
+        elif limit is not None and actual is None:
             exceeded.append(f"{key} evidence unavailable")
         elif limit is not None and actual > limit:
             exceeded.append(f"{key} {actual:g}>{limit:g}")
     if exceeded:
-        summary = {**summary, "ok": False, "failed_ids": [], "control": "budget",
-                   "budget_exceeded": "; ".join(exceeded), "error": "budget threshold reached"}
+        # Crossing the wall-clock cap after a bounded operation settles is a
+        # reason to stop, not permission to erase the operation's real failure
+        # evidence. A successful operation gets the pure budget outcome; a
+        # failed verification/review retains its exact failed phase and error.
+        failed_before_budget = list(summary.get("failed_ids") or [])
+        summary = {**summary, "ok": False, "failed_ids": failed_before_budget,
+                   "control": "budget", "budget_exceeded": "; ".join(exceeded),
+                   "error": (summary.get("error") if failed_before_budget else "budget threshold reached")}
     it = load(it["id"])
+    it["usage"] = usage_record
     it["attempts"] += 1
     it["runs"].append({"attempt": it["attempts"], "at": now(), "ok": bool(summary.get("ok")),
                        "run_dir": summary.get("run_dir"), "failed_ids": summary.get("failed_ids"),
-                       "tokens": summary.get("tokens"), "cost": summary.get("cost"), "sha": summary.get("sha")})
+                       "control": summary.get("control"), "budget_exceeded": summary.get("budget_exceeded"),
+                       "agent_checkpoint": summary.get("agent_checkpoint"),
+                       "tokens": summary.get("tokens"), "cost": summary.get("cost"),
+                       "attempt_tokens": attempt_tokens, "attempt_cost": attempt_cost,
+                       "usage_total": usage_record, "sha": summary.get("sha")})
     it["reviews"] = summary.get("reviews") or it.get("reviews", [])
     it["head_sha"] = summary.get("sha") or (git(wt, "rev-parse", "HEAD") if wt.exists() else None)
     it["changed_scope"] = summary.get("changed") or (worktree.changed_files(project, wt) if wt.exists() else [])
@@ -523,6 +1151,7 @@ def _execute(it: dict, timeout: int) -> dict:
                         "changed_scope": it["changed_scope"], "worktree": worktree.signature(wt) if wt.exists() else None,
                         "attempt": it["attempts"], "run_dir": summary.get("run_dir"),
                         "failed_ids": summary.get("failed_ids") or [], "agent_checkpoint": summary.get("agent_checkpoint"),
+                        "control": summary.get("control"), "budget_exceeded": summary.get("budget_exceeded"),
                         "usage": {"tokens": summary.get("tokens"), "cost": summary.get("cost")},
                         "remaining_guidance": list((it.get("controls") or {}).get("pending", [])),
                         "previous_sha": prior_checkpoint.get("sha")}
@@ -532,7 +1161,7 @@ def _execute(it: dict, timeout: int) -> dict:
                                  verification_failed=bool(failed_ids.intersection({"verify", "protected", "review_correctness", "review_adversarial"})),
                                  scope_escaped=bool(summary.get("scope_escape")))
     if not summary.get("ok") and (it.get("rigor") or {}).get("level") == "high-risk":
-        it["dispatch"]["graph"] = "no-mistakes"
+        it["dispatch"]["graph"] = modes.HIGH_ASSURANCE
     it.setdefault("verification", []).append({"at": now(), "ok": bool(summary.get("ok")), "run_dir": summary.get("run_dir"),
                                                "base_sha": summary.get("base_sha"), "head_sha": summary.get("sha"),
                                                "fingerprint": summary.get("fingerprint"), "complete": bool(summary.get("final_verify"))})
@@ -571,7 +1200,7 @@ def _execute(it: dict, timeout: int) -> dict:
         return it
 
     if summary.get("ok") and (it.get("rigor") or {}).get("escalated_from"):
-        target_graph = "no-mistakes" if it["rigor"]["level"] == "high-risk" else project["mode"]
+        target_graph = modes.HIGH_ASSURANCE if it["rigor"]["level"] == "high-risk" else project["mode"]
         if it["dispatch"]["graph"] != target_graph:
             it["dispatch"]["graph"] = target_graph; it["reviews"] = []; it["phase"] = "rigor-escalation"
             transition(it, "queued", f"observed evidence escalated rigor to {it['rigor']['level']}; rerunning stronger gates")
@@ -582,8 +1211,10 @@ def _execute(it: dict, timeout: int) -> dict:
             src = Path(summary.get("run_dir") or "") / "report.md"
             if src.is_file():
                 shutil.copy(src, d / "report.md")
-            worktree.remove(project, it["id"], delete_branch=True)
-            if it.get("session"): herdr.close_agent_tab(it["session"])
+            if it.get("session") and not herdr.close_agent_tab(it["session"]):
+                raise herdr.UnsettledAgentError("scout session is not positively quiesced; preserving its worktree")
+            clean_signature = worktree.signature(wt)
+            worktree.remove(project, it["id"], delete_branch=True, expected=clean_signature)
             it["phase"] = "done"
             transition(it, "done", f"report at {d / 'report.md'}")
             return it
@@ -591,12 +1222,13 @@ def _execute(it: dict, timeout: int) -> dict:
             transition(it, "failed", "graph passed but produced no commits")
             return it
         it["phase"] = "merge-ready"
+        it["activity"] = {"last": now(), "state": "delivering"}; it["phase"] = "delivering"; save(it)
         deliver.after_success(it, project, wt)
         herdr.notify(f"{project['id']}: {it['status']}", it["text"].splitlines()[0][:120])
         return it
 
     notes = graphs.failure_notes(summary) or str(summary.get("error") or "unknown execution failure")
-    signature = __import__("hashlib").sha256(("|".join(summary.get("failed_ids") or []) + "\n" + notes).encode()).hexdigest()
+    signature = _failure_signature(summary, notes)
     repeated = bool(it["failure_notes"] and it["failure_notes"][-1].get("signature") == signature)
     it["failure_notes"].append({"attempt": it["attempts"], "notes": notes, "signature": signature})
     it["phase"] = "revision"
@@ -617,6 +1249,9 @@ def respond(work_id: str, guidance: str) -> dict:
     it = load(work_id)
     if it["status"] not in ("needs-you", "failed"):
         raise HelmError(f"{work_id} is {it['status']}, not needs-you/failed")
+    if blockers := budget_blockers(it):
+        raise HelmError("response cannot start a new turn with exhausted budget or unproven usage (" + "; ".join(blockers) +
+                        "); raise it explicitly with `helm budget` first")
     it["guidance"].append({"at": now(), "text": guidance.strip(), "question": (it.get("ask") or {}).get("question")})
     it["ask"] = None
     ask_file = worktree.worktree_root() / it["project"] / it["id"] / ".helm-ask.json"
@@ -633,20 +1268,174 @@ def retry(work_id: str) -> dict:
     it = load(work_id)
     if it["status"] != "failed":
         raise HelmError(f"{work_id} is {it['status']}, not failed")
+    if blockers := budget_blockers(it):
+        raise HelmError("retry refused with exhausted budget or unproven usage (" + "; ".join(blockers) +
+                        "); raise it explicitly with `helm budget` first")
     it["attempts"] = 0
     transition(it, "queued", "manual retry")
     return it
 
 
-def cancel(work_id: str) -> dict:
-    it = load(work_id)
-    if it["status"] == "running":
-        raise HelmError("cannot cancel a running item; wait for the attempt to end")
-    project = registry.get(it["project"])
-    wt = worktree.worktree_root() / project["id"] / it["id"]
-    if wt.exists() and (worktree.has_commits(project, wt) or worktree.status_paths(wt)):
-        raise HelmError(f"{work_id} has unlanded commits or edits on {it['branch']}; explicit --discard authorization is required")
-    worktree.remove(project, it["id"], delete_branch=True)
-    if it.get("session"): herdr.close_agent_tab(it["session"])
-    transition(it, "cancelled", "")
-    return it
+_OPEN_CANCELLATION = {"armed", "quiescing", "filesystem-requested", "filesystem-complete"}
+
+
+def _cancel_sessions(item: dict) -> None:
+    """Close only positively identified, settled sessions owned by this item."""
+    sessions, seen = [], set()
+    for candidate in [item.get("session"), *(item.get("agent_launches") or [])]:
+        if not isinstance(candidate, dict):
+            continue
+        identity = (candidate.get("launch_id"), candidate.get("agent_session_id"), candidate.get("tab_id"))
+        if identity in seen:
+            continue
+        if candidate is not item.get("session") and candidate.get("state") not in herdr.OPEN_LAUNCH_STATES:
+            continue
+        seen.add(identity); sessions.append(candidate)
+    for session in sessions:
+        if not herdr.close_agent_tab(session):
+            raise HelmError("cancellation stopped: an exact item session is live, unsettled, reused, or unreachable")
+
+
+def _cancel_reconcile(item: dict, project: dict, *, discard: bool) -> dict:
+    """Replay a durable, non-destructive cancellation intent."""
+    cancellation = item.get("cancellation") or {}
+    intent_id = cancellation.get("id")
+    if (not intent_id or cancellation.get("state") not in _OPEN_CANCELLATION
+            or cancellation.get("project_id") != project.get("id")
+            or cancellation.get("repository_path") != str(Path(project["path"]).resolve())
+            or cancellation.get("worktree_path") != str((worktree.worktree_root() / project["id"] / item["id"]).resolve())
+            or cancellation.get("branch") != item.get("branch")):
+        raise HelmError("cancellation journal is incomplete or no longer matches the item; work was preserved")
+    if bool(cancellation.get("discard_authorized")) != bool(discard):
+        flag = " --discard" if cancellation.get("discard_authorized") else ""
+        raise HelmError(f"cancellation already armed with different authority; repeat `helm cancel {item['id']}{flag}`")
+
+    if cancellation["state"] in {"armed", "quiescing"}:
+        latest = load(item["id"])
+        if latest.get("status") != "cancelling" or (latest.get("cancellation") or {}).get("id") != intent_id:
+            raise HelmError("cancellation ownership changed; work was preserved")
+        def quiescing(current):
+            active = current.get("cancellation") or {}
+            if active.get("id") != intent_id or current.get("status") != "cancelling":
+                raise HelmError("cancellation ownership changed before session reconciliation")
+            active["state"] = "quiescing"; active["quiescing_at"] = now()
+        control.cas_update(item["id"], quiescing, expected_revision=int(latest.get("revision", 0)))
+        _cancel_sessions(load(item["id"]))
+        latest = load(item["id"])
+        def requested(current):
+            active = current.get("cancellation") or {}
+            if active.get("id") != intent_id or current.get("status") != "cancelling":
+                raise HelmError("cancellation ownership changed before filesystem reconciliation")
+            active["state"] = "filesystem-requested"; active["filesystem_requested_at"] = now()
+        item = control.cas_update(item["id"], requested, expected_revision=int(latest.get("revision", 0)))
+        cancellation = item["cancellation"]
+
+    if cancellation["state"] == "filesystem-requested":
+        wt = Path(cancellation["worktree_path"])
+        destination = Path(cancellation["quarantine_path"])
+        if wt.exists() and destination.exists():
+            raise HelmError("cancellation found both owned and quarantined worktrees; preserving both for doctor reconciliation")
+        result = worktree.quarantine(project, item["id"], reason="explicit item cancellation",
+                                     destination=destination)
+        # An absent source is only a successful replay when the exact journaled
+        # destination proves our earlier move. Unknown disappearance is never
+        # converted into success.
+        if not result.get("quarantined") and cancellation.get("worktree_present"):
+            raise HelmError("journaled worktree disappeared without its quarantine receipt; preserving branch and state")
+        latest = load(item["id"])
+        def filesystem_complete(current):
+            active = current.get("cancellation") or {}
+            if active.get("id") != intent_id or active.get("state") != "filesystem-requested":
+                raise HelmError("cancellation journal changed during filesystem reconciliation")
+            active.update(state="filesystem-complete", filesystem_completed_at=now(),
+                          quarantine_result=result)
+        item = control.cas_update(item["id"], filesystem_complete,
+                                  expected_revision=int(latest.get("revision", 0)))
+        cancellation = item["cancellation"]
+
+    claim_token = cancellation.get("claim_token")
+    claim_released = scope.release(item["id"], claim_token) if claim_token else False
+    latest = load(item["id"])
+    def complete(current):
+        active = current.get("cancellation") or {}
+        if active.get("id") != intent_id or active.get("state") != "filesystem-complete":
+            raise HelmError("cancellation journal changed before completion")
+        before = active.get("prior_status") or "unknown"
+        current.setdefault("history", []).append({"at": now(), "from": before, "to": "cancelled",
+                                                   "note": "work preserved in recoverable quarantine"})
+        current["status"] = "cancelled"; current["phase"] = "cancelled"
+        current["activity"] = {"last": now(), "state": "cancelled"}
+        current.pop("lease", None); current.pop("recovery_claim_token", None)
+        active.update(state="complete", completed_at=now(), claim_released=claim_released)
+    completed = control.cas_update(item["id"], complete, expected_revision=int(latest.get("revision", 0)))
+    try:
+        from . import supervisor
+        supervisor.observe(completed)
+    except BaseException as exc:
+        log(f"{item['id']}: supervisor observation unavailable after cancellation: {getattr(exc, 'msg', None) or exc!r}")
+    return completed
+
+
+def cancel(work_id: str, *, discard: bool = False) -> dict:
+    """Cancel without deleting work; `--discard` authorizes quarantine of unlanded work."""
+    with locked(authority_lock()):
+        it = load(work_id)
+        project = registry.get(it["project"])
+        existing = it.get("cancellation") or {}
+        if existing.get("state") == "complete" and it.get("status") == "cancelled":
+            return it
+        if existing.get("state") in _OPEN_CANCELLATION:
+            return _cancel_reconcile(it, project, discard=discard)
+        if (it.get("promotion") or {}).get("state") in {"armed", "external-requested", "merge-observed", "cleanup-pending"}:
+            raise HelmError("cannot cancel while an exact-SHA promotion requires reconciliation")
+        if (it.get("pr_delivery") or {}).get("state") in {"armed", "push-requested", "push-confirmed", "pr-create-requested"}:
+            raise HelmError("cannot cancel while exact-SHA PR delivery requires reconciliation")
+        if gates.has_open_transaction(it):
+            raise HelmError("cannot cancel while a no-mistakes transaction requires explicit reconciliation")
+        if it["status"] in {"running", "cancelling"}:
+            raise HelmError("cannot cancel a running or unjournaled cancelling item; reconcile it first")
+        if it["status"] in {"merged", "done", "cancelled"}:
+            raise HelmError(f"cannot cancel a terminal {it['status']} item")
+
+        expected_path = (worktree.worktree_root() / project["id"] / it["id"]).resolve()
+        recorded_path = Path(it.get("worktree") or expected_path).expanduser().resolve()
+        if recorded_path != expected_path:
+            raise HelmError("cancellation refused: recorded worktree escapes the item's owned path")
+        wt_present = expected_path.is_dir()
+        signature = worktree.signature(expected_path) if wt_present else None
+        if wt_present and git(expected_path, "rev-parse", "--abbrev-ref", "HEAD", check=False) != it.get("branch"):
+            raise HelmError("cancellation refused: owned worktree branch identity changed")
+        branch_sha = git(project["path"], "rev-parse", "--verify", it["branch"], check=False)
+        base_sha = git(project["path"], "rev-parse", project["base"], check=False)
+        unique_commits = bool(branch_sha and sh([
+            "git", "-C", str(project["path"]), "merge-base", "--is-ancestor", branch_sha, base_sha
+        ], check=False).returncode)
+        unlanded = bool((signature or {}).get("dirty") or unique_commits)
+        if unlanded and not discard:
+            raise HelmError(f"{work_id} has unlanded commits or edits on {it['branch']}; explicit --discard authorization is required (work will be quarantined, not deleted)")
+
+        intent_id = secrets.token_hex(16)
+        quarantine_path = (home() / "quarantine" / "worktrees" / project["id"] /
+                           f"{it['id']}-{intent_id}").resolve()
+        claim_token = ((it.get("lease") or {}).get("claim_token") or it.get("recovery_claim_token"))
+        prior_status = it["status"]
+        expected_revision = int(it.get("revision", 0))
+        def arm(current):
+            if current.get("status") != prior_status or (current.get("promotion") or {}).get("state") in {
+                "armed", "external-requested", "merge-observed", "cleanup-pending"
+            }:
+                raise HelmError("item changed before cancellation could arm; no work was touched")
+            current["cancellation"] = {
+                "id": intent_id, "state": "armed", "armed_at": now(), "prior_status": prior_status,
+                "project_id": project["id"], "repository_path": str(Path(project["path"]).resolve()),
+                "worktree_path": str(expected_path), "worktree_present": wt_present,
+                "worktree_signature": signature, "quarantine_path": str(quarantine_path),
+                "branch": it["branch"], "branch_sha": branch_sha, "base_sha": base_sha,
+                "discard_authorized": bool(discard), "unlanded_at_arm": unlanded,
+                "claim_token": claim_token,
+            }
+            current.setdefault("history", []).append({"at": now(), "from": prior_status, "to": "cancelling",
+                                                       "note": "non-destructive cancellation armed"})
+            current["status"] = "cancelling"; current["phase"] = "cancelling"
+        armed = control.cas_update(it["id"], arm, expected_revision=expected_revision)
+        return _cancel_reconcile(armed, project, discard=discard)

@@ -1,6 +1,5 @@
 """The fleet board: what the captain sees at a glance (banner, `helm watch`)."""
 from __future__ import annotations
-import os
 import shutil
 import time
 from . import registry, work
@@ -27,6 +26,13 @@ def render(workers_pid: int | None, width: int | None = None) -> str:
     summary = " · ".join(x for x in (f"{questions} question{'s' if questions != 1 else ''}" if questions else "",
                                               f"{ready} ready to merge" if ready else "") if x)
     lines.append(f"  inbox     {summary or f'{len(needs)} action(s)'}" if needs else "  inbox     clear")
+    from . import supervisor
+    supervised = supervisor.summary()
+    if supervised.get("away"):
+        pending = supervised.get("pending_wakes")
+        lines.append(f"  away      on · {pending if pending is not None else '?'} durable decision wake(s) preserved")
+    elif supervised.get("pending_wakes"):
+        lines.append(f"  wakes     {supervised['pending_wakes']} pending")
     if open_items:
         lines.append("")
         for i in open_items[-12:]:

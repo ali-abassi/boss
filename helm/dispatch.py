@@ -10,6 +10,7 @@ import shutil
 import subprocess
 from .paths import dispatch_file
 from .util import read_json, write_json, HelmError
+from . import graphs, modes
 
 PHASES = ("plan", "implement", "review_correctness", "review_adversarial", "scout")
 
@@ -59,10 +60,15 @@ def resolve(item: dict, project: dict) -> dict:
             continue
         if not set(rule.get("labels") or []) <= labels:
             continue
-        graph = rule.get("graph") or (project["mode"] if item["kind"] == "ship" else "scout")
+        graph = modes.normalize(rule.get("graph") or (project["mode"] if item["kind"] == "ship" else "scout"))
         level = (item.get("rigor") or {}).get("level")
-        if item["kind"] == "ship" and not rule.get("graph"):
-            if level == "high-risk": graph = "no-mistakes"
+        if item.get("memory_request") or "project-memory" in labels:
+            # Project knowledge becomes a normal reviewed project change. A
+            # custom dispatch rule may tune its model, but may never downgrade
+            # the review/authority path that protects AGENTS.md.
+            graph = modes.HIGH_ASSURANCE
+        elif item["kind"] == "ship" and not rule.get("graph"):
+            if level == "high-risk": graph = modes.HIGH_ASSURANCE
             elif level == "quick": graph = "local-only"
         models = {**cfg.get("models", {}), **rule.get("models", {}), **(item.get("model_overrides") or {})}
         thinking = {**cfg.get("thinking", {}), **rule.get("thinking", {}), **(item.get("thinking_overrides") or {})}
@@ -82,7 +88,7 @@ def resolve(item: dict, project: dict) -> dict:
 def assert_available(decision: dict) -> None:
     """Validate against an authoritative configured inventory when one is supplied."""
     raw = os.environ.get("HELM_AVAILABLE_MODELS")
-    if raw is None and os.environ.get("HELM_PIW"):
+    if raw is None and graphs.deterministic_test_mode():
         return  # deterministic test runner supplies model evidence in its fixture
     if raw is None:
         if not shutil.which("pi"):

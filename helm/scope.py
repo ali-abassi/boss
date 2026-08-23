@@ -2,10 +2,10 @@
 from __future__ import annotations
 import fnmatch
 import os
-import re
-from pathlib import PurePosixPath
+import secrets
 from .paths import home
 from .util import locked, now, read_json, write_json
+from . import processes
 
 SENSITIVE = (".github/workflows/*", ".helm/*", "helm.json", ".gitmodules", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock")
 _GLOBAL = {"*", "**", "**/*", ".", "unknown", "global"}
@@ -16,7 +16,10 @@ def normalize(paths) -> list[str]:
         paths = paths.split(",")
     out = []
     for raw in paths or []:
-        p = str(raw).strip().replace("\\", "/")
+        # Git path evidence is POSIX byte-preserving text. A backslash is a
+        # legal filename character there, not a directory separator; rewriting
+        # it could bind a claim to a different path than the one reviewed.
+        p = str(raw).strip()
         if p.startswith("./"):
             p = p[2:]
         if p:
@@ -67,29 +70,76 @@ def _alive(pid) -> bool:
         return False
 
 
-def claim(project: str, work_id: str, paths: list[str], owner: str, pid: int | None = None) -> bool:
+def claim(project: str, work_id: str, paths: list[str], owner: str, pid: int | None = None,
+          process_identity: dict | None = None, *, replace_token: str | None = None) -> str | None:
+    """Acquire a scope and return its unguessable ownership token.
+
+    The token is required for release/hold so an old runner can never remove a
+    newer runner's claim for the same work item.
+    """
     path = home() / "scope-claims.json"
     paths = normalize(paths)
+    pid = pid or os.getpid()
+    if process_identity is None and pid == os.getpid():
+        process_identity = processes.capture(pid, owner)
+    token = secrets.token_hex(24)
     with locked(home() / "scope-claims.lock"):
         data = read_json(path, {"version": 1, "claims": []})
-        data["claims"] = [c for c in data["claims"] if c.get("work_id") == work_id or _alive(c.get("pid"))]
+        # A dead PID does not authorize forgetting ownership: the worktree may
+        # contain unlanded changes. Confirmed doctor reconciliation removes a
+        # stale claim only into a durable recovery hold after inspecting it.
+        same = next((c for c in data["claims"] if c.get("work_id") == work_id), None)
+        if same:
+            # A queued/stale runner must not overwrite an active or recovery
+            # claim merely because it knows the item id.  Only the exact token
+            # recorded on a recovery-required item can exchange its hold for a
+            # new runner lease.
+            if (not replace_token or not same.get("held_for_recovery")
+                    or not secrets.compare_digest(str(same.get("claim_token") or ""), str(replace_token))):
+                return None
+        elif replace_token:
+            # The item expected to exchange a recovery hold, but the hold has
+            # disappeared or changed.  Continuing would lose collision proof.
+            return None
         for c in data["claims"]:
             if c["work_id"] != work_id and c["project"] == project and overlap(paths, c["paths"]):
-                write_json(path, data)
-                return False
+                return None
         data["claims"] = [c for c in data["claims"] if c.get("work_id") != work_id]
         data["claims"].append({"project": project, "work_id": work_id, "paths": paths, "owner": owner,
-                               "pid": pid or os.getpid(), "claimed": now()})
+                               "pid": pid, "process_identity": process_identity,
+                               "claim_token": token, "claimed": now()})
+        write_json(path, data)
+        return token
+
+
+def release(work_id: str, claim_token: str | None) -> bool:
+    path = home() / "scope-claims.json"
+    if not claim_token:
+        return False
+    with locked(home() / "scope-claims.lock"):
+        data = read_json(path, {"version": 1, "claims": []})
+        match = next((c for c in data["claims"] if c.get("work_id") == work_id), None)
+        if not match or not secrets.compare_digest(str(match.get("claim_token") or ""), str(claim_token)):
+            return False
+        data["claims"] = [c for c in data["claims"] if c is not match]
         write_json(path, data)
         return True
 
 
-def release(work_id: str) -> None:
+def hold(work_id: str, claim_token: str | None, reason: str) -> bool:
+    """Retain collision protection when a live external actor may still mutate."""
     path = home() / "scope-claims.json"
+    if not claim_token:
+        return False
     with locked(home() / "scope-claims.lock"):
         data = read_json(path, {"version": 1, "claims": []})
-        data["claims"] = [c for c in data["claims"] if c.get("work_id") != work_id]
-        write_json(path, data)
+        claim = next((entry for entry in data["claims"] if entry.get("work_id") == work_id), None)
+        if claim and secrets.compare_digest(str(claim.get("claim_token") or ""), str(claim_token)):
+            claim.update(pid=None, process_identity=None, owner=f"recovery:{work_id}", held_for_recovery=True,
+                         hold_reason=reason, reconciled=now())
+            write_json(path, data)
+            return True
+        return False
 
 
 def escaped(declared: list[str], changed: list[str]) -> list[str]:

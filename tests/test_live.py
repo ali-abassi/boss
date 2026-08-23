@@ -7,11 +7,11 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, shutil, subprocess, sys, tempfile, time, unittest
+import json, os, shutil, subprocess, tempfile, time, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-HELM = [sys.executable, str(REPO / "bin" / "helm")]
+HELM = [str(REPO / "bin" / "helm")]
 
 
 @unittest.skipUnless(os.environ.get("HELM_LIVE") == "1" and shutil.which("pi"),
