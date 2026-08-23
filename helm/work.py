@@ -5,34 +5,54 @@ needs-you --respond--> queued      failed --retry--> queued
 ready/pr-open --promote--> merged
 """
 from __future__ import annotations
+import fnmatch
 import json
 import os
 import secrets
 import shutil
 import time
 from pathlib import Path
-from . import dispatch, graphs, registry, worktree, deliver, herdr
+from . import dispatch, graphs, registry, worktree, deliver, herdr, scope, rigor, control
 from .paths import work_root, home
-from .util import read_json, write_json, locked, now, log, HelmError
+from .util import read_json, write_json, locked, now, log, HelmError, git, sh
 
 ACTIVE = ("running",)
-OPEN = ("queued", "running", "needs-you", "ready", "pr-open")
+OPEN = ("queued", "running", "paused", "needs-you", "ready", "pr-open")
 
 
 def item_dir(work_id: str) -> Path: return work_root() / work_id
 def item_path(work_id: str) -> Path: return item_dir(work_id) / "item.json"
 
 
+def _hydrate(it: dict) -> dict:
+    """Read-compatible migration for version-1 records; the next CAS write persists it."""
+    it.setdefault("schema_version", control.SCHEMA_VERSION); it.setdefault("revision", 0)
+    it.setdefault("phase", it.get("status", "queued")); it.setdefault("scope", {"paths": ["unknown"], "claim": "global"})
+    it.setdefault("controls", {"paused": False, "away": False, "pending": []})
+    for key, default in (("session", None), ("checkpoint", None), ("reviews", []), ("verification", []), ("changed_scope", [])):
+        it.setdefault(key, default)
+    if not it.get("model_decision") and it.get("dispatch"):
+        it["model_decision"] = {"models": it["dispatch"].get("models", {}), "thinking": it["dispatch"].get("thinking", {}),
+                                "rationale": "migrated pinned dispatch", "resolved_at": it.get("created")}
+    return it
+
+
 def load(work_id: str) -> dict:
     it = read_json(item_path(work_id))
     if not it:
         raise HelmError(f"unknown work item '{work_id}'")
-    return it
+    return _hydrate(it)
 
 
 def save(it: dict) -> None:
-    it["updated"] = now()
-    write_json(item_path(it["id"]), it)
+    """CAS-save an item. Stale writers fail instead of erasing concurrent controls."""
+    expected = int(it.get("revision", 0))
+    def replace(current):
+        if int(current.get("revision", 0)) != expected:
+            raise HelmError(f"stale work item revision {expected}; current revision is {current.get('revision', 0)}")
+        current.clear(); current.update(it)
+    updated = control.cas_update(it["id"], replace, expected)
+    it.clear(); it.update(updated)
 
 
 def transition(it: dict, status: str, note: str = "") -> None:
@@ -48,26 +68,46 @@ def all_items() -> list[dict]:
         for d in sorted(work_root().iterdir()):
             it = read_json(d / "item.json")
             if it:
-                out.append(it)
+                out.append(_hydrate(it))
     return sorted(out, key=lambda i: i["created"])
 
 
 def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | None = None,
-           max_attempts: int = 3) -> dict:
+           max_attempts: int = 3, declared_scope: list[str] | None = None,
+           model: str | None = None, thinking: str | None = None) -> dict:
     project = registry.get(project_id)
     if kind not in ("ship", "scout"):
         raise HelmError("kind must be ship or scout")
+    if model and "/" not in model:
+        raise HelmError("model override must be provider/model")
+    available = {m.strip() for m in os.environ.get("HELM_AVAILABLE_MODELS", "").split(",") if m.strip()}
+    if model and available and model not in available:
+        raise HelmError(f"resolved model {model} is unavailable; refusing silent substitution")
     if kind == "ship" and project["authority"] < 1:
         raise HelmError(f"project '{project_id}' has authority 0 (observe): only scout tasks allowed")
     wid = f"{project_id}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+    declared = scope.normalize(declared_scope)
+    global_claim = scope.is_global(declared) or any(scope.overlap(declared, [p]) for p in project.get("protected_paths", []))
     it = {
         "id": wid, "project": project_id, "kind": kind, "text": text.strip(),
         "labels": sorted(set(labels or [])), "status": "queued", "attempts": 0,
         "max_attempts": max_attempts, "created": now(), "updated": now(),
         "guidance": [], "failure_notes": [], "runs": [], "history": [],
-        "branch": worktree.branch_name(wid), "pr_url": None, "ask": None, "dispatch": None,
+        "schema_version": control.SCHEMA_VERSION, "revision": 0,
+        "branch": worktree.branch_name(wid), "worktree": str(worktree.worktree_root() / project_id / wid),
+        "pr_url": None, "ask": None, "dispatch": None, "phase": "queued",
+        "scope": {"paths": declared, "claim": "global" if global_claim else "paths"},
+        "controls": {"paused": False, "away": False, "pending": []}, "session": None,
+        "checkpoint": None, "reviews": [], "verification": [], "changed_scope": [],
+        "model_overrides": ({("scout" if kind == "scout" else "implement"): model} if model else {}),
+        "thinking_overrides": ({("scout" if kind == "scout" else "implement"): thinking} if thinking else {}),
     }
-    it["dispatch"] = dispatch.resolve(it, project)   # fail at intake, not at run time
+    it["rigor"] = rigor.route(it)
+    if global_claim and declared != ["unknown"] and it["rigor"]["level"] != "high-risk":
+        it["rigor"] = {"level": "high-risk", "rationale": "project-sensitive declared scope"}
+    it["dispatch"] = dispatch.resolve(it, project)   # pinned before execution
+    it["model_decision"] = {"models": it["dispatch"]["models"], "thinking": it["dispatch"]["thinking"],
+                            "rationale": it["dispatch"]["rationale"], "resolved_at": now()}
     write_json(item_path(wid), it)
     log(f"{wid}: queued ({kind}, rule={it['dispatch']['rule']}, graph={it['dispatch']['graph']})")
     return it
@@ -99,32 +139,176 @@ def _pid_alive(pid) -> bool:
 
 
 def claim_next(owner: str) -> dict | None:
-    """Oldest queued item whose project has no running item. Lock-protected."""
+    """Claim the oldest queued item whose durable scope is mechanically disjoint."""
     with locked(home() / "claim.lock"):
         items = all_items()
         for it in items:                      # a dead owner's lease is not a running item
             if it["status"] == "running" and not _pid_alive((it.get("lease") or {}).get("pid")):
                 it.pop("lease", None)
                 transition(it, "queued", "stale lease (owner died); requeued without burning an attempt")
-        busy = {i["project"] for i in items if i["status"] in ACTIVE}
         for it in items:
-            if it["status"] == "queued" and it["project"] not in busy:
-                it["lease"] = {"owner": owner, "started": now(), "pid": os.getpid()}
-                transition(it, "running", f"leased by {owner}")
+            if it["status"] == "queued" and not (it.get("controls") or {}).get("paused"):
+                declared = (it.get("scope") or {}).get("paths") or ["unknown"]
+                paths = ["global"] if (it.get("scope") or {}).get("claim") == "global" else declared
+                if not scope.claim(it["project"], it["id"], paths, owner, os.getpid()):
+                    continue
+                it["lease"] = {"owner": owner, "started": now(), "pid": os.getpid(), "scope": paths}
+                it["phase"] = "implementing"
+                try:
+                    transition(it, "running", f"leased by {owner}")
+                except BaseException:
+                    scope.release(it["id"])
+                    raise
                 return it
     return None
 
 
 def execute(it: dict, timeout: int = 3600) -> dict:
-    """Run one attempt. Any crash on the way marks the item failed instead of leaving it leased."""
+    """Run one attempt. Claims are always released and crashes retain branch/checkpoint."""
     try:
         return _execute(it, timeout)
     except BaseException as e:          # includes HelmError (a SystemExit) and KeyboardInterrupt
         it = load(it["id"])
         if it["status"] == "running":
-            it.pop("lease", None)
+            it.pop("lease", None); it["phase"] = "failed"
             transition(it, "failed", f"attempt crashed: {getattr(e, 'msg', None) or e!r}")
         raise
+    finally:
+        scope.release(it["id"])
+
+
+def _model_drift(expected: str, agent: dict) -> None:
+    actual = agent.get("model")
+    provider = agent.get("provider")
+    if actual and "/" not in str(actual) and provider:
+        actual = f"{provider}/{actual}"
+    if actual and actual != expected:
+        raise HelmError(f"model drift: resolved {expected}, Herdr agent reports {actual}")
+
+
+def _json_verdict(text: str) -> dict:
+    decoder = json.JSONDecoder()
+    found = []
+    for pos, char in enumerate(text):
+        if char == "{":
+            try:
+                value, _ = decoder.raw_decode(text[pos:])
+                if isinstance(value, dict) and value.get("verdict") in ("accept", "reject"):
+                    found.append(value)
+            except json.JSONDecodeError:
+                pass
+    if not found:
+        raise HelmError("reviewer produced no parseable verdict; approval was not inferred")
+    return found[-1]
+
+
+def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout: int) -> dict:
+    """Use one real reconnectable Herdr implementer and fresh independent reviewers."""
+    decision = it["model_decision"]
+    model = decision["models"]["scout" if it["kind"] == "scout" else "implement"]
+    thinking = decision["thinking"]["scout" if it["kind"] == "scout" else "implement"]
+    session = herdr.ensure_agent(it, wt, model, thinking)
+    _model_drift(model, session)
+    current = load(it["id"])
+    previous = current.get("session")
+    if previous and not session.get("reconnected"):
+        current.setdefault("session_history", []).append({**previous, "lost_at": now(), "recovered_from_checkpoint": True})
+    current["session"] = session; current["phase"] = "investigating" if it["kind"] == "scout" else "implementing"
+    current["checkpoint"] = {"sha": git(wt, "rev-parse", "HEAD"), "at": now(), "recovery": "herdr" if session.get("reconnected") else "new-session"}
+    save(current); it = current
+    checkpoint = it.get("checkpoint") or {}
+    if it["kind"] == "scout":
+        prompt = ("Investigate this repository read-only. Do not modify files or commit. Return a concise Markdown report with file/line evidence.\n\n"
+                  + brief.read_text())
+    else:
+        prompt = (f"Continue work on the persistent branch {it['branch']} in {wt}. Run `{project.get('test_cmd') or 'true'}` and commit all intended changes. "
+                  f"Never touch protected paths: {project.get('protected_paths')}. If a decision is required, write .helm-ask.json and stop. "
+                  f"Checkpoint SHA before this turn: {checkpoint.get('sha')}.\n\n" + brief.read_text())
+    for steer in (it.get("controls") or {}).get("pending", []):
+        prompt += f"\nCAPTAIN STEERING ({steer['at']}): {steer['text']}\n"
+    baseline_changed = set(worktree.changed_files(project, wt))
+    def live_escape():
+        changed = set(worktree.changed_files(project, wt))
+        for line in git(wt, "status", "--porcelain", "--untracked-files=all", check=False).splitlines():
+            path = line[3:].split(" -> ")[-1]
+            if path and path.split("/", 1)[0] not in (*worktree.DEP_DIRS, ".helm-ask.json"):
+                changed.add(path)
+        changed = sorted(changed - baseline_changed)
+        sensitive = [p for p in changed if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
+        return sorted(set(sensitive + scope.escaped((it.get("scope") or {}).get("paths"), changed)))
+    agent, escaped_live = herdr.prompt_agent_monitored(session["agent_name"], prompt, timeout, live_escape)
+    _model_drift(model, agent)
+    if escaped_live:
+        run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        protected_live = [p for p in escaped_live if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
+        if protected_live:
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["protected"],
+                    "error": "live protected-path change interrupted: " + ", ".join(protected_live), "changed": escaped_live}
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["scope-escape"], "scope_escape": escaped_live,
+                "error": "live scope escape interrupted: " + ", ".join(escaped_live)}
+    output = herdr.agent_read(session["agent_name"], 240)
+    run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    (run_dir / "implementer.md").write_text(output)
+    if it["kind"] == "scout":
+        (item_dir(it["id"]) / "report.md").write_text(output)
+        return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], "tokens": agent.get("tokens"), "cost": agent.get("cost"), "reviews": []}
+    if (wt / ".helm-ask.json").exists():
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["question"], "tokens": agent.get("tokens"), "cost": agent.get("cost")}
+    if not worktree.has_commits(project, wt):
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["implement"], "error": "implementer produced no commit"}
+    changed = worktree.changed_files(project, wt)
+    protected = [p for p in changed if any(fnmatch.fnmatch(p, pattern) for pattern in project.get("protected_paths", []))]
+    if protected:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["protected"],
+                "error": "protected paths changed: " + ", ".join(protected), "changed": changed}
+    escaped = scope.escaped((it.get("scope") or {}).get("paths"), changed)
+    if escaped:
+        herdr.interrupt_agent(session["agent_name"])
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["scope-escape"], "scope_escape": escaped,
+                "error": "changed files escaped declared scope: " + ", ".join(escaped)}
+    # Integrate the latest configured local base before final verification and review.
+    base_sha = git(project["path"], "rev-parse", project["base"])
+    if git(wt, "merge-base", base_sha, "HEAD", check=False) != base_sha:
+        r = sh(["git", "-C", str(wt), "rebase", base_sha], check=False)
+        if r.returncode != 0:
+            sh(["git", "-C", str(wt), "rebase", "--abort"], check=False)
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-integration"], "error": r.stderr[-2000:]}
+    verify = sh(["bash", "-lc", project.get("test_cmd") or "true"], cwd=wt, check=False, timeout=timeout)
+    (run_dir / "verify.md").write_text(verify.stdout + verify.stderr)
+    if verify.returncode:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["verify"], "error": (verify.stdout + verify.stderr)[-3000:]}
+    sha = git(wt, "rev-parse", "HEAD")
+    reviews = []
+    if it["dispatch"]["graph"] in ("direct-pr", "no-mistakes"):
+        diff = git(wt, "diff", f"{base_sha}...{sha}")[-200000:]
+        roles = ["correctness"] + (["adversarial"] if it["dispatch"]["graph"] == "no-mistakes" else [])
+        for role in roles:
+            phase = "review_" + role
+            reviewer = herdr.ensure_agent(it, wt, decision["models"][phase], decision["thinking"][phase], reviewer=True)
+            try:
+                _model_drift(decision["models"][phase], reviewer)
+                verdict_file = run_dir / f"review_{role}.pending.json"
+                herdr.prompt_agent(reviewer["agent_name"],
+                    f"You are an independent {role} reviewer. Review commit {sha}. Do not modify the repository. "
+                    "Write genuine JSON {\"verdict\":\"accept\" or \"reject\",\"notes\":\"...\"} to "
+                    f"{verdict_file}, then reply with that path.\n\n" + brief.read_text() + "\n\nDIFF:\n" + diff, timeout)
+                evidence = herdr.agent_read(reviewer["agent_name"], 240)
+                try:
+                    verdict = json.loads(verdict_file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    verdict = _json_verdict(evidence)
+                if verdict.get("verdict") not in ("accept", "reject"):
+                    raise HelmError("reviewer evidence has no valid verdict")
+                rec = {**verdict, "sha": sha, "role": role, "reviewer": reviewer, "evidence": evidence[-12000:], "at": now()}
+                reviews.append(rec); (run_dir / f"review_{role}.json").write_text(json.dumps(rec, indent=2))
+                if verdict["verdict"] != "accept":
+                    return {"ok": False, "run_dir": str(run_dir), "failed_ids": [phase], "reviews": reviews}
+            finally:
+                herdr.close_agent_tab(reviewer)
+    return {"ok": True, "run_dir": str(run_dir), "failed_ids": [], "tokens": agent.get("tokens"), "cost": agent.get("cost"),
+            "reviews": reviews, "sha": sha, "base_sha": base_sha, "changed": changed}
 
 
 def _execute(it: dict, timeout: int) -> dict:
@@ -133,29 +317,52 @@ def _execute(it: dict, timeout: int) -> dict:
     wt = worktree.create(project, it["id"])
     brief = d / "brief.md"
     brief.write_text(brief_text(it, project))
-    dp = dispatch.resolve(it, project)      # fresh each attempt so rule/model changes apply; recorded for audit
-    it["dispatch"] = dp
+    pinned = it.get("dispatch") or dispatch.resolve(it, project)
+    fresh = dispatch.resolve(it, project)
+    if fresh["models"] != pinned["models"] or fresh["thinking"] != pinned["thinking"]:
+        raise HelmError("model/thinking configuration drifted after resolution; retry with an explicit override")
+    dp = pinned
     steps = graphs.render(dp["graph"], d, cwd=wt, branch=it["branch"], project=project,
                           models=dp["models"], thinking=dp["thinking"], timeout=timeout)
     graphs.validate(steps)
     env = worktree.git_env(wt, d / "gitexclude")
-    tab = None
-    if herdr.inside():
-        import shlex
-        tab = herdr.open_tab(f"⚙ {project['id']}: {it['text'].splitlines()[0][:28]}",
-                             f"{shlex.quote(str(Path(__file__).resolve().parents[1] / 'bin' / 'helm'))} tail {it['id']}")
-        if tab:
-            herdr.remember("task", {**tab, "item": it["id"]})
-    try:
-        summary = graphs.run(steps, brief, timeout + 60, env=env)
-    finally:
-        if tab:
-            herdr.close_tab(tab["tab_id"]); herdr.forget(tab["tab_id"])
+    if herdr.inside() and not os.environ.get("HELM_PIW"):
+        summary = _persistent_execute(it, project, wt, brief, timeout)
+    else:
+        # Deterministic runner fallback is retained for tests and explicit headless use;
+        # it is never represented as a Herdr agent session. A tail tab remains a display only.
+        tab = None
+        if herdr.inside():
+            import shlex
+            tab = herdr.open_tab(f"⚙ {project['id']}: {it['text'].splitlines()[0][:28]}",
+                                 f"{shlex.quote(str(Path(__file__).resolve().parents[1] / 'bin' / 'helm'))} tail {it['id']}")
+            if tab: herdr.remember("task", {**tab, "item": it["id"]})
+        try:
+            summary = graphs.run(steps, brief, timeout + 60, env=env)
+        finally:
+            if tab:
+                herdr.close_tab(tab["tab_id"]); herdr.forget(tab["tab_id"])
+    it = load(it["id"])
     it["attempts"] += 1
     it["runs"].append({"attempt": it["attempts"], "at": now(), "ok": bool(summary.get("ok")),
                        "run_dir": summary.get("run_dir"), "failed_ids": summary.get("failed_ids"),
-                       "tokens": summary.get("tokens"), "cost": summary.get("cost")})
+                       "tokens": summary.get("tokens"), "cost": summary.get("cost"), "sha": summary.get("sha")})
+    it["reviews"] = summary.get("reviews") or it.get("reviews", [])
+    it["head_sha"] = summary.get("sha") or (git(wt, "rev-parse", "HEAD") if wt.exists() else None)
+    it["changed_scope"] = summary.get("changed") or (worktree.changed_files(project, wt) if wt.exists() else [])
+    it["checkpoint"] = {"sha": it["head_sha"], "at": now(), "changed_scope": it["changed_scope"]}
+    failed_ids = set(summary.get("failed_ids") or [])
+    it["rigor"] = rigor.escalate(it.get("rigor") or {}, changed=it["changed_scope"],
+                                 verification_failed=bool(failed_ids.intersection({"verify", "protected", "review_correctness", "review_adversarial"})),
+                                 scope_escaped=bool(summary.get("scope_escape")))
+    it.setdefault("verification", []).append({"at": now(), "ok": bool(summary.get("ok")), "run_dir": summary.get("run_dir"),
+                                               "base_sha": summary.get("base_sha"), "head_sha": summary.get("sha")})
     it.pop("lease", None)
+
+    if (it.get("controls") or {}).get("paused") or (it.get("controls") or {}).get("pause_requested"):
+        it["controls"]["paused"] = True; it["controls"]["pause_requested"] = False; it["phase"] = "paused"
+        transition(it, "paused", "cooperative checkpoint complete; waiting for resume")
+        return it
 
     ask_file = wt / ".helm-ask.json"
     if ask_file.exists():
@@ -168,12 +375,28 @@ def _execute(it: dict, timeout: int) -> dict:
         herdr.notify(f"{project['id']} needs you", it["ask"].get("question", "")[:160])
         return it
 
+    if summary.get("scope_escape"):
+        it["ask"] = {"question": "Changed scope escaped the declared claim; approve a broader scope?",
+                     "context": ", ".join(summary["scope_escape"])}
+        it["controls"]["paused"] = True; it["phase"] = "scope-escalation"
+        transition(it, "needs-you", it["ask"]["question"])
+        return it
+
+    if summary.get("ok") and it.get("session") and (it.get("rigor") or {}).get("escalated_from"):
+        target_graph = "no-mistakes" if it["rigor"]["level"] == "high-risk" else project["mode"]
+        if it["dispatch"]["graph"] != target_graph:
+            it["dispatch"]["graph"] = target_graph; it["reviews"] = []; it["phase"] = "rigor-escalation"
+            transition(it, "queued", f"observed evidence escalated rigor to {it['rigor']['level']}; rerunning stronger gates")
+            return it
+
     if summary.get("ok"):
         if it["kind"] == "scout":
             src = Path(summary.get("run_dir") or "") / "report.md"
             if src.is_file():
                 shutil.copy(src, d / "report.md")
             worktree.remove(project, it["id"], delete_branch=True)
+            if it.get("session"): herdr.close_agent_tab(it["session"])
+            it["phase"] = "done"
             transition(it, "done", f"report at {d / 'report.md'}")
             return it
         if not worktree.has_commits(project, wt):
@@ -183,9 +406,9 @@ def _execute(it: dict, timeout: int) -> dict:
         herdr.notify(f"{project['id']}: {it['status']}", it["text"].splitlines()[0][:120])
         return it
 
-    notes = graphs.failure_notes(summary)
+    notes = graphs.failure_notes(summary) or str(summary.get("error") or "unknown execution failure")
     it["failure_notes"].append({"attempt": it["attempts"], "notes": notes})
-    worktree.remove(project, it["id"], delete_branch=True)
+    it["phase"] = "revision"
     if it["attempts"] < it["max_attempts"]:
         transition(it, "queued", f"attempt {it['attempts']} failed ({','.join(summary.get('failed_ids') or [])}); requeued")
     else:
@@ -200,11 +423,13 @@ def respond(work_id: str, guidance: str) -> dict:
         raise HelmError(f"{work_id} is {it['status']}, not needs-you/failed")
     it["guidance"].append({"at": now(), "text": guidance.strip(), "question": (it.get("ask") or {}).get("question")})
     it["ask"] = None
-    project = registry.get(it["project"])
-    worktree.remove(project, it["id"], delete_branch=True)
+    ask_file = worktree.worktree_root() / it["project"] / it["id"] / ".helm-ask.json"
+    ask_file.unlink(missing_ok=True)
     if it["status"] == "failed":
         it["attempts"] = 0
-    transition(it, "queued", "captain responded; fresh attempt budget")
+    it.setdefault("controls", {})["paused"] = False
+    it["phase"] = "queued"
+    transition(it, "queued", "captain responded; persistent session queued with guidance")
     return it
 
 
@@ -223,8 +448,9 @@ def cancel(work_id: str) -> dict:
         raise HelmError("cannot cancel a running item; wait for the attempt to end")
     project = registry.get(it["project"])
     wt = worktree.worktree_root() / project["id"] / it["id"]
-    if wt.exists() and worktree.has_commits(project, wt) and it["status"] in ("ready", "pr-open"):
-        raise HelmError(f"{work_id} has unlanded commits on {it['branch']}; use --discard to throw them away")
+    if wt.exists() and worktree.has_commits(project, wt):
+        raise HelmError(f"{work_id} has unlanded commits on {it['branch']}; explicit --discard authorization is required")
     worktree.remove(project, it["id"], delete_branch=True)
+    if it.get("session"): herdr.close_agent_tab(it["session"])
     transition(it, "cancelled", "")
     return it

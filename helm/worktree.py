@@ -16,7 +16,12 @@ def create(project: dict, work_id: str) -> Path:
     repo = Path(project["path"])
     wt = worktree_root() / project["id"] / work_id
     if wt.exists():
-        remove(project, work_id)
+        # A work item owns one branch/worktree through questions, steering and revisions.
+        # Validate that it is still attached instead of destructively recreating it.
+        if (wt / ".git").exists() and git(wt, "rev-parse", "--abbrev-ref", "HEAD", check=False) == branch_name(work_id):
+            link_deps(repo, wt)
+            return wt
+        raise HelmError(f"persistent worktree {wt} exists but is not attached to {branch_name(work_id)}")
     wt.parent.mkdir(parents=True, exist_ok=True)
     base = project["base"]
     if git(repo, "rev-parse", "--verify", "--quiet", base, check=False) == "":

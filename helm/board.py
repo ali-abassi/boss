@@ -8,7 +8,7 @@ from .paths import home
 
 BANNER = "\n  ⚓  F I R S T   M A T E   ·  graph\n  ─────────────────────────────────\n"
 
-STATUS_ICON = {"queued": "·", "running": "▶", "needs-you": "?", "ready": "✓", "pr-open": "⇡",
+STATUS_ICON = {"queued": "·", "running": "▶", "paused": "Ⅱ", "needs-you": "?", "ready": "✓", "pr-open": "⇡",
                "failed": "✗", "merged": "⇣", "done": "✓", "cancelled": "–"}
 
 
@@ -22,7 +22,11 @@ def render(workers_pid: int | None, width: int | None = None) -> str:
     lines.append(f"  workers   {where}")
     lines.append(f"  projects  {len(projects)}" + ("   " + " · ".join(f"{p['id']} [{p['mode']}/a{p['authority']}]" for p in list(projects.values())[:6]) if projects else '   none yet — say: "add ~/code/my-repo"'))
     needs = [i for i in items if i["status"] in ("needs-you", "failed", "ready", "pr-open")]
-    lines.append(f"  inbox     {len(needs)} need you" if needs else "  inbox     clear")
+    questions = sum(i["status"] == "needs-you" for i in needs)
+    ready = sum(i["status"] in ("ready", "pr-open") for i in needs)
+    summary = " · ".join(x for x in (f"{questions} question{'s' if questions != 1 else ''}" if questions else "",
+                                              f"{ready} ready to merge" if ready else "") if x)
+    lines.append(f"  inbox     {summary or f'{len(needs)} action(s)'}" if needs else "  inbox     clear")
     if open_items:
         lines.append("")
         for i in open_items[-12:]:

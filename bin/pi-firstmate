@@ -11,6 +11,16 @@ case "${1:-}" in
   stop)   exec "$helm" down ;;
   status) exec "$helm" watch --once ;;
   setup)  shift; exec "$helm" setup "$@" ;;
-  "")     exec "$helm" captain pi ;;
-  *)      exec "$helm" captain "$@" ;;
+  "")
+    if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+      exec "$helm" captain pi
+    fi
+    exec "$helm" launch
+    ;;
+  *)
+    if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+      exec "$helm" captain "$@"
+    fi
+    exec "$helm" launch --harness "$1"
+    ;;
 esac

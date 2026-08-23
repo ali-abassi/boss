@@ -68,6 +68,35 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(notes[0][2], "p: ready")
         self.assertEqual(json.loads((self.home / "herdr.json").read_text())["tabs"], [])
 
+    def test_pi_firstmate_outside_herdr_launches_named_session_without_recursion(self):
+        env = {k: v for k, v in self.env.items() if not k.startswith("HERDR_")}
+        env["FAKE_HERDR_LOG"] = str(self.log)
+        r = subprocess.run([str(REPO / "bin" / "pi-firstmate")], env=env, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertIn(["--session", "firstmate", "workspace", "list"], calls)
+        run = next(c for c in calls if c[2:4] == ["pane", "run"])
+        self.assertIn("pi-firstmate", run[-1])
+        self.assertEqual(calls[-1], ["session", "attach", "firstmate"])
+
+    def test_real_implementer_identity_reconnects_and_reviewers_are_fresh(self):
+        old = os.environ.copy(); os.environ.update(self.env)
+        try:
+            from helm import herdr
+            item = {"id": "p-item", "project": "p", "session": None}
+            first = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
+            self.assertTrue(first["agent_session_id"].startswith("real-"))
+            item["session"] = first
+            again = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
+            self.assertEqual(again["agent_session_id"], first["agent_session_id"])
+            self.assertTrue(again["reconnected"])
+            a = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high", reviewer=True)
+            b = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high", reviewer=True)
+            self.assertNotEqual(a["agent_session_id"], b["agent_session_id"])
+            self.assertNotEqual(a["agent_session_id"], first["agent_session_id"])
+        finally:
+            os.environ.clear(); os.environ.update(old)
+
     def test_ask_notifies_captain(self):
         self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
         self.helm("task", "p", "thing [fake:ask]")

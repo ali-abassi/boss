@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from . import registry, dispatch, work, deliver, worktree, herdr, board, __version__
+from . import registry, dispatch, work, deliver, worktree, herdr, board, control, scope, __version__
 from .paths import home, projects_file, dispatch_file, GRAPHS
 from .util import HelmError, log
 
@@ -116,7 +116,7 @@ HARNESS = {
 # A default, not a cage: every model the login provides stays selectable (/model), and the
 # crew's per-step models live in dispatch.json, which the captain can change by asking.
 PI_HOME_SETTINGS = {"defaultProvider": "openai-codex", "defaultModel": "gpt-5.6-sol",
-                    "defaultThinkingLevel": "medium", "quietStartup": True}
+                    "defaultThinkingLevel": "high", "quietStartup": True}
 
 
 def pi_home() -> Path:
@@ -175,6 +175,56 @@ def cmd_setup(a):
         out({"ready": True, "pi_home": str(dst)}, False, f"✓ connected to the Codex subscription · pi home {dst}")
     else:
         raise HelmError("still not connected to Codex — run `pi-firstmate setup` again")
+
+
+def cmd_launch(a):
+    """Outside Herdr, create/attach the one named persistent First Mate session."""
+    if herdr.inside():
+        return cmd_captain(argparse.Namespace(harness=a.harness, workers=a.workers))
+    binary = shutil.which("herdr")
+    if not binary:
+        if os.environ.get("PI_FIRSTMATE_HEADLESS") == "1":
+            return cmd_captain(argparse.Namespace(harness=a.harness, workers=a.workers))
+        raise HelmError("Herdr is required for persistent First Mate sessions. Install Herdr, or set PI_FIRSTMATE_HEADLESS=1 for the documented non-persistent fallback.")
+    session = a.session
+    def call(*args):
+        return subprocess.run([binary, "--session", session, *args], text=True, capture_output=True, stdin=subprocess.DEVNULL)
+    probe = call("workspace", "list")
+    if probe.returncode and "server_not_running" in (probe.stderr or probe.stdout):
+        home().mkdir(parents=True, exist_ok=True)
+        logf = open(home() / "herdr-server.log", "ab")
+        subprocess.Popen([binary, "--session", session, "server"], stdin=subprocess.DEVNULL,
+                         stdout=logf, stderr=logf, start_new_session=True)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(0.1); probe = call("workspace", "list")
+            if probe.returncode == 0: break
+    def hc(*args):
+        r = probe if args == ("workspace", "list") else call(*args)
+        if r.returncode:
+            raise HelmError(f"Herdr session '{session}' unavailable: {(r.stderr or r.stdout).strip()[:400]}")
+        try: return json.loads(r.stdout) if r.stdout.strip() else {}
+        except json.JSONDecodeError: raise HelmError("Herdr returned an invalid session response")
+    listed = (hc("workspace", "list").get("result") or {}).get("workspaces") or []
+    if listed:
+        workspace_id = listed[0]["workspace_id"]
+    else:
+        made = hc("workspace", "create", "--cwd", str(Path(__file__).resolve().parents[1]), "--label", "First Mate", "--no-focus",
+                  "--env", f"HELM_HOME={home()}", "--env", f"PI_CODING_AGENT_DIR={pi_home()}")
+        workspace_id = (made.get("result") or {}).get("workspace", {}).get("workspace_id")
+    if not workspace_id:
+        raise HelmError("Herdr did not return a workspace identity; nothing was launched")
+    tabs = (hc("tab", "list", "--workspace", workspace_id).get("result") or {}).get("tabs") or []
+    if not any(t.get("label") == "⚓ First Mate" for t in tabs):
+        made = hc("tab", "create", "--workspace", workspace_id, "--cwd", str(Path(__file__).resolve().parents[1]),
+                  "--label", "⚓ First Mate", "--no-focus", "--env", f"HELM_HOME={home()}",
+                  "--env", f"PI_CODING_AGENT_DIR={pi_home()}")
+        pane = (made.get("result") or {}).get("root_pane", {}).get("pane_id")
+        if not pane: raise HelmError("Herdr did not return a pane identity; nothing was launched")
+        command = shlex.quote(str(Path(__file__).resolve().parents[1] / "bin" / "pi-firstmate"))
+        if a.harness != "pi": command += " " + shlex.quote(a.harness)
+        hc("pane", "run", pane, command)
+    os.execv(binary, [binary, "session", "attach", session])
 
 
 def cmd_captain(a):
@@ -242,8 +292,60 @@ def cmd_task(a):
     text = Path(a.file).read_text() if a.file else " ".join(a.text)
     if not text.strip():
         raise HelmError("empty task")
-    it = work.create(a.project, text, a.kind, a.labels.split(",") if a.labels else [], a.max_attempts)
-    out(it, a.json, f"{it['id']} queued → graph {it['dispatch']['graph']} (rule {it['dispatch']['rule']})")
+    it = work.create(a.project, text, a.kind, a.labels.split(",") if a.labels else [], a.max_attempts,
+                     a.scope.split(",") if a.scope else None, a.model, a.thinking)
+    out(it, a.json, f"{it['id']} queued → {it['rigor']['level']} rigor · graph {it['dispatch']['graph']} (rule {it['dispatch']['rule']})")
+
+
+def cmd_inspect(a):
+    it = work.load(a.id)
+    recent = ""
+    session = it.get("session") or {}
+    if session.get("agent_name") and herdr.inside():
+        recent = herdr.agent_read(session["agent_name"], a.lines)
+    data = control.inspection(it, recent)
+    out(data, a.json, json.dumps(data, indent=2))
+
+
+def cmd_control(a):
+    it = work.load(a.id)
+    session = it.get("session") or {}
+    target = session.get("agent_name")
+    value = " ".join(getattr(a, "value", []) or [])
+    it = control.request(a.id, a.action, value if a.action == "steer" else (value.lower() in ("on", "true", "1") if a.action == "away" else None))
+    if a.action in ("steer", "pause", "interrupt") and target and herdr.inside():
+        if a.action == "interrupt":
+            herdr.interrupt_agent(target)
+            herdr.steer_agent(target, "Checkpoint current work, do not discard it, then wait for resume.")
+        elif a.action == "pause":
+            herdr.steer_agent(target, "Cooperatively checkpoint current work, commit safe progress if appropriate, then pause for resume.")
+        else:
+            herdr.steer_agent(target, value)
+    if a.action in ("pause", "interrupt"):
+        def paused(x):
+            x["controls"]["paused"] = True; x["phase"] = "paused"
+            if x["status"] == "queued": x["status"] = "paused"
+        it = control.cas_update(a.id, paused)
+    elif a.action in ("resume", "recover") and it["status"] in ("paused", "failed"):
+        def resumed(x):
+            x.update(status="queued", phase="queued")
+            x["controls"]["paused"] = False; x["controls"]["recovery_requested"] = False
+            if a.action == "recover": x["attempts"] = 0
+        it = control.cas_update(a.id, resumed)
+    out(control.redact(it), a.json, f"{a.id}: {a.action} recorded")
+
+
+def cmd_scope(a):
+    paths = scope.normalize(a.paths.split(","))
+    def mutate(it):
+        if it["status"] == "running": raise HelmError("cannot replace scope while running; pause first")
+        project = registry.get(it["project"])
+        global_claim = scope.is_global(paths) or any(scope.overlap(paths, [p]) for p in project.get("protected_paths", []))
+        it["scope"] = {"paths": paths, "claim": "global" if global_claim else "paths"}
+        it.setdefault("controls", {})["paused"] = False; it["reviews"] = []
+        if it["status"] in ("paused", "needs-you", "ready", "pr-open"): it["status"] = "queued"; it["phase"] = "queued"
+    it = control.cas_update(a.id, mutate)
+    out(it, a.json, f"{a.id}: declared scope {', '.join(paths)}")
 
 
 def cmd_work(a):
@@ -251,14 +353,14 @@ def cmd_work(a):
     if not a.all:
         items = [i for i in items if i["status"] in work.OPEN]
     if a.json:
-        return out(items, True)
+        return out(control.redact(items), True)
     for i in items:
         extra = i.get("pr_url") or (i.get("ask") or {}).get("question", "")[:60] or ""
         print(f"{i['id']:<44} {i['status']:<10} {i['kind']:<5} a{i['attempts']}/{i['max_attempts']} {extra}")
 
 
 def cmd_show(a):
-    it = work.load(a.id)
+    it = control.redact(work.load(a.id))
     if a.json:
         return out(it, True)
     print(json.dumps({k: v for k, v in it.items() if k not in ("history",)}, indent=2))
@@ -272,7 +374,7 @@ def cmd_show(a):
 def cmd_inbox(a):
     items = [i for i in work.all_items() if i["status"] in ("needs-you", "failed", "ready", "pr-open")]
     if a.json:
-        return out(items, True)
+        return out(control.redact(items), True)
     if not items:
         print("nothing needs you")
     for i in items:
@@ -420,8 +522,14 @@ def main(argv=None):
     p = S("task", cmd_task, "queue a ship or scout task"); p.add_argument("project"); p.add_argument("text", nargs="*")
     p.add_argument("--file"); p.add_argument("--kind", default="ship", choices=("ship", "scout"))
     p.add_argument("--labels", help="comma-separated dispatch labels, e.g. cheap,hard"); p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--scope", help="comma-separated declared path/glob claims; unknown serializes")
+    p.add_argument("--model", help="captain override for implement/scout provider/model"); p.add_argument("--thinking", choices=("off","minimal","low","medium","high","xhigh"))
     p = S("work", cmd_work, "list work items"); p.add_argument("--all", action="store_true")
     p = S("show", cmd_show, "show one item with history"); p.add_argument("id")
+    p = S("inspect", cmd_inspect, "secret-safe live item inspection"); p.add_argument("id"); p.add_argument("--lines", type=int, default=120)
+    for action in ("steer", "pause", "resume", "away", "interrupt", "recover"):
+        p = S(action, cmd_control, f"{action} a persistent item"); p.set_defaults(action=action); p.add_argument("id"); p.add_argument("value", nargs="*")
+    p = S("scope", cmd_scope, "replace a paused item's declared scope"); p.add_argument("id"); p.add_argument("paths")
     p = S("inbox", cmd_inbox, "what needs the captain"); p.add_argument("--hints", action="store_true", help="show the helm commands (for the first mate)")
     p = S("respond", cmd_respond, "answer a question / give guidance, requeue"); p.add_argument("id"); p.add_argument("guidance", nargs="+")
     p = S("retry", cmd_retry, "requeue a failed item"); p.add_argument("id")
@@ -443,6 +551,9 @@ def main(argv=None):
     p = S("captain", cmd_captain, "start workers and open the liaison (pi by default)")
     p.add_argument("harness", nargs="?", default="pi", help="pi | claude | codex | any command")
     p.add_argument("--workers", type=int, default=2)
+    p = S("launch", cmd_launch, "create/attach the persistent Herdr First Mate session")
+    p.add_argument("--session", default="firstmate"); p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--harness", default="pi")
     p = S("doctor", cmd_doctor, "check tools, models, graphs"); p.add_argument("--probe", action="store_true", help="live 1-word call per model (costs a few tokens)")
     a = ap.parse_args(argv)
     os.environ["PI_CODING_AGENT_DIR"] = str(pi_home())

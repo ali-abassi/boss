@@ -97,8 +97,13 @@ pi-firstmate
 > **first mate:** Merged `api` to main. Guidance passed to the scout; it's back under way.
 
 The first mate wakes itself when the crew has news, and `/wake 20m` schedules a check-in.
-Inside Pi: `/fleet` shows the board, `/inbox` what needs you. In [Herdr](https://herdr.dev)
-you also get a `⚓ fleet` tab, a tab per worker, a tab per running task, and notifications.
+Inside Pi: `/fleet` shows the board, `/inbox` what needs you. `pi-firstmate` is the sole
+launcher: outside [Herdr](https://herdr.dev) it creates or attaches the named persistent
+`firstmate` session; inside Herdr it runs directly, without recursion. Each item keeps one
+real implementer agent/tab and worktree through questions, steering, review feedback, and
+recovery; independent reviews use fresh agents. If Herdr is unavailable the launcher exits
+without changing work. `PI_FIRSTMATE_HEADLESS=1 pi-firstmate` is the explicit non-persistent
+fallback.
 
 `pi-firstmate stop` stops the crew. `pi-firstmate claude` opens the same first mate in
 Claude Code. That's the whole surface; the machinery underneath is in
@@ -110,10 +115,10 @@ Claude Code. That's the whole surface; the machinery underneath is in
 |---|---|
 | **Delivery** per repo | a branch for you to merge (default) · a pull request · or the careful mode: plan, protected-path gate, two independent reviews, then a PR. You pick by saying so ("open PRs for api") |
 | **Authority** per repo | investigate only · build · open PRs · merge on your word. Starts at build; raised only when you ask |
-| **Models** | GPT-5.6 Sol by default; every model your login offers is available (`/model`), and each step's model changes when you ask ("use luna for implementation"). A drifted model fails the step instead of silently swapping |
+| **Models** | GPT-5.6 Sol with high thinking by default. Resolution, overrides, and rationale are pinned before execution; unavailable or drifted models fail instead of silently swapping |
 | **Retries** | a failed gate discards the worktree, keeps the evidence, retries up to 3 times |
 | **Questions** | a worker that needs a decision stops and asks; it does not guess |
-| **Evidence** | every task keeps its brief, exact graph, every step's output, tokens and cost on disk; the first mate quotes it |
+| **Evidence** | every task keeps its brief, exact graph, checkpoint, real session identity, exact-SHA reviews, tests, output, tokens and cost; inspection recursively redacts secrets |
 
 ## Status
 

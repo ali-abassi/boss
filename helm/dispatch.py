@@ -21,8 +21,8 @@ DEFAULT = {
         "review_adversarial": "openai-codex/gpt-5.6-sol",
         "scout": "openai-codex/gpt-5.6-sol",
     },
-    "thinking": {"plan": "high", "implement": "medium", "review_correctness": "medium",
-                 "review_adversarial": "high", "scout": "medium"},
+    "thinking": {"plan": "high", "implement": "high", "review_correctness": "high",
+                 "review_adversarial": "high", "scout": "high"},
     "rules": [
         {"name": "scout", "kind": "scout", "graph": "scout"},
         {"name": "cheap", "kind": "ship", "labels": ["cheap"],
@@ -46,7 +46,7 @@ def load() -> dict:
 
 
 def resolve(item: dict, project: dict) -> dict:
-    """Return {rule, graph, models{phase:model}, thinking{phase:level}} deterministically."""
+    """Resolve and explain exact model pins; overrides are deterministic and auditable."""
     cfg = load()
     labels = set(item.get("labels") or [])
     for rule in cfg.get("rules", []):
@@ -57,10 +57,18 @@ def resolve(item: dict, project: dict) -> dict:
         if not set(rule.get("labels") or []) <= labels:
             continue
         graph = rule.get("graph") or (project["mode"] if item["kind"] == "ship" else "scout")
-        models = {**cfg.get("models", {}), **rule.get("models", {})}
-        thinking = {**cfg.get("thinking", {}), **rule.get("thinking", {})}
+        level = (item.get("rigor") or {}).get("level")
+        known_scope = (item.get("scope") or {}).get("paths") not in (None, ["unknown"])
+        if item["kind"] == "ship" and not rule.get("graph") and (known_scope or "high-risk" in labels or "quick" in labels):
+            if level == "high-risk": graph = "no-mistakes"
+            elif level == "quick": graph = "local-only"
+        models = {**cfg.get("models", {}), **rule.get("models", {}), **(item.get("model_overrides") or {})}
+        thinking = {**cfg.get("thinking", {}), **rule.get("thinking", {}), **(item.get("thinking_overrides") or {})}
         missing = [p for p in PHASES if p not in models]
         if missing:
             raise HelmError(f"dispatch rule '{rule.get('name')}' leaves phases without a model: {missing}")
-        return {"rule": rule.get("name", "?"), "graph": graph, "models": models, "thinking": thinking}
+        override = sorted((item.get("model_overrides") or {}).keys())
+        rationale = (f"captain override for {', '.join(override)}; " if override else "") + f"deterministic rule {rule.get('name', '?')}"
+        return {"rule": rule.get("name", "?"), "graph": graph, "models": models, "thinking": thinking,
+                "rationale": rationale, "resolved": True}
     raise HelmError(f"no dispatch rule matches kind={item['kind']} labels={sorted(labels)}")
