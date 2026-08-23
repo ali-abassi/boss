@@ -34,9 +34,22 @@ export function statusLine(s: Status | null): string {
 }
 
 export function renderBanner(theme: Theme, width: number, status: Status | null, noColor = false): string[] {
-  const line = noColor ? `${ANCHOR} first mate · ${statusLine(status)}`
-    : `${theme.fg("warning", ANCHOR)} ${theme.bold?.("first mate") ?? "first mate"}${theme.fg("dim", " · ")}${theme.fg("muted", statusLine(status))}`;
-  return fit([line], width);
+  const titlePlain = `${ANCHOR}  F I R S T   M A T E`;
+  const title = noColor ? titlePlain
+    : `${theme.fg("warning", ANCHOR)}  ${theme.bold?.("F I R S T   M A T E") ?? "F I R S T   M A T E"}`;
+  const statePlain = statusLine(status);
+  const state = noColor ? statePlain : theme.fg("muted", statePlain);
+  if (width < 52) return fit([title, state], width);
+
+  const ruleWidth = Math.max(3, inner(width) - visibleWidth(titlePlain) - 4);
+  const rule = noColor ? "─".repeat(ruleWidth) : theme.fg("borderMuted", "─".repeat(ruleWidth));
+  const hintPlain = "/fleet  ·  /inbox  ·  /wake 20m";
+  const hint = noColor ? hintPlain : theme.fg("dim", hintPlain);
+  return fit([
+    `${title}  ${rule}`,
+    `   ${state}`,
+    `   ${hint}`,
+  ], width);
 }
 
 // ------------------------------------------------------------------ wake
@@ -66,7 +79,6 @@ const WORKING = ["hailing the crew", "checking the ledger", "trimming the sails"
 export default function firstmate(pi: ExtensionAPI) {
   const helm = (...args: string[]) => pi.exec("helm", args, { timeout: 15_000 });
   const noColor = () => process.env.NO_COLOR !== undefined || process.env.TERM === "dumb";
-  const seed = (Date.now() ^ (process.pid * 0x9e3779b1)) | 0;
   let ui: any;
   let poll: ReturnType<typeof setInterval> | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
@@ -102,9 +114,10 @@ export default function firstmate(pi: ExtensionAPI) {
     lastNeeds = needs;
   }
 
-  // Banner in the transcript, once per session, carrying the status it was born with.
+  // Put a fresh banner at the bottom of the transcript on every launch. Historical
+  // entries still render correctly, while restored sessions never open on a buried header.
   pi.registerEntryRenderer("-firstmate-hello", (entry: any, _opts: unknown, theme: Theme) => ({
-    render: (width: number) => renderBanner(theme, width, entry?.data?.status ?? null, noColor(), seed),
+    render: (width: number) => renderBanner(theme, width, entry?.data?.status ?? null, noColor()),
     invalidate() {},
   }));
   // Board and inbox as transcript entries (plain text, themed dim), not toasts.
@@ -117,8 +130,7 @@ export default function firstmate(pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     ui = ctx.ui;
     try {
-      const entries = ctx.sessionManager?.getEntries?.() ?? [];
-      if (!entries.some((e: any) => e?.customType === "-firstmate-hello")) pi.appendEntry("-firstmate-hello", { status: await status() });
+      pi.appendEntry("-firstmate-hello", { status: await status() });
       ctx.ui.setTitle?.("⚓ first mate");
     } catch {}
     await refreshStrip();
@@ -196,12 +208,12 @@ if (process.argv[1]?.endsWith("firstmate.ts")) {
   const theme: Theme = { fg: (_t, s) => s, bold: (s) => s };
   const st: Status = { projects: 2, workers: 123, items: { running: 1, "needs-you": 1 } };
   for (const width of [120, 80, 60]) {
-    const lines = renderBanner(theme, width, st, false, 42);
-    ok(lines.length === 1 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
-    ok(lines[0].includes("first mate") && lines[0].includes("2 projects"), `identity + status at ${width}`);
+    const lines = renderBanner(theme, width, st, false);
+    ok(lines.length === 3 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
+    ok(lines[0].includes("F I R S T") && lines[1].includes("2 projects"), `identity + status at ${width}`);
   }
-  ok(renderBanner(theme, 50, st, false, 1)[0].includes("first mate"), "narrow banner keeps identity");
-  ok(renderBanner(theme, 80, st, false, 7).join("|") === renderBanner(theme, 80, st, false, 7).join("|"), "seeded render is stable");
+  ok(renderBanner(theme, 50, st, false)[0].includes("F I R S T") && renderBanner(theme, 50, st, false).length === 2, "narrow banner keeps identity");
+  ok(renderBanner(theme, 80, st, false).join("|") === renderBanner(theme, 80, st, false).join("|"), "render is stable");
   ok(statusLine({ projects: 1, workers: null, items: {} }) === "1 project · workers stopped · inbox clear", "status line when idle");
   ok(statusLine(st).includes("1 need you") && statusLine(st).includes("1 running"), "status line counts");
   ok(parseWake("20m") === 1_200_000 && parseWake("1h") === 3_600_000 && parseWake("1h30m") === 5_400_000 && parseWake("45") === 2_700_000, "wake durations parse");
