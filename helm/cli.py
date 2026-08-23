@@ -35,13 +35,27 @@ def cmd_add(a):
 
 def _pid_file(): return home() / "daemon.pid"
 
-def daemon_pid():
+def daemon_pids() -> list[int]:
     try:
-        pid = int(_pid_file().read_text().strip())
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError):
-        return None
+        raw = _pid_file().read_text().strip()
+        value = json.loads(raw)
+        candidates = value if isinstance(value, list) else [int(value)]
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    alive = []
+    for value in candidates:
+        try:
+            pid = int(value); os.kill(pid, 0); alive.append(pid)
+        except (OSError, TypeError, ValueError):
+            pass
+    if alive != candidates:
+        if alive: _pid_file().write_text(json.dumps(alive))
+        else: _pid_file().unlink(missing_ok=True)
+    return alive
+
+def daemon_pid():
+    pids = daemon_pids()
+    return pids[0] if pids else None
 
 
 HELM_BIN = str(Path(__file__).resolve().parents[1] / "bin" / "helm")
@@ -51,45 +65,47 @@ def cmd_up(a):
     home().mkdir(parents=True, exist_ok=True)
     if herdr.inside():
         return _up_herdr(a)
-    if daemon_pid():
-        out({"pid": daemon_pid()}, a.json, f"workers already running (pid {daemon_pid()})")
+    return _up_background(a)
+
+
+def _up_background(a, *, quiet: bool = False):
+    existing = daemon_pids()
+    desired = max(1, a.workers)
+    if len(existing) >= desired:
+        if a.json: out({"pids": existing}, True)
+        elif not quiet: print(f"{len(existing)} worker{'s' if len(existing) != 1 else ''} already running")
         return
     logf = open(home() / "daemon.log", "ab")
-    p = subprocess.Popen([sys.executable, HELM_BIN, "daemon", "--owner", f"worker-{os.getpid()}", "--interval", str(a.interval)],
-                         stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True, env=os.environ)
-    _pid_file().write_text(str(p.pid))
-    out({"pid": p.pid}, a.json, f"workers running (pid {p.pid}) · log {home() / 'daemon.log'}")
+    pids = list(existing)
+    for n in range(len(existing) + 1, desired + 1):
+        p = subprocess.Popen([sys.executable, HELM_BIN, "daemon", "--owner", f"worker-{n}", "--interval", str(a.interval)],
+                             stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True, env=os.environ)
+        pids.append(p.pid)
+    _pid_file().write_text(json.dumps(pids))
+    if a.json: out({"pids": pids}, True)
+    elif not quiet: print(f"{len(pids)} worker{'s' if len(pids) != 1 else ''} running")
 
 
 def _up_herdr(a):
-    """Inside Herdr: a fleet board tab plus one tab per worker, beside the captain."""
+    """Herdr shows real task agents; schedulers stay invisible in the background."""
     from .util import read_json
     existing = read_json(home() / "herdr.json", {"tabs": []})["tabs"]
-    if any(t["kind"] == "worker" for t in existing):
-        out({"tabs": existing}, a.json, f"workers already open in herdr ({sum(t['kind']=='worker' for t in existing)} tabs)")
-        return
-    opened = []
-    t = herdr.open_tab("⚓ fleet", f"{shlex.quote(HELM_BIN)} watch")
-    if t:
-        herdr.remember("board", t); opened.append(t)
-    for n in range(1, a.workers + 1):
-        t = herdr.open_tab(f"worker {n}", f"{shlex.quote(HELM_BIN)} daemon --owner worker-{n} --interval {min(a.interval, 5)}")
-        if t:
-            herdr.remember("worker", t); opened.append(t)
-    if not opened:
-        raise HelmError("could not open herdr tabs (see ~/.helm/helm.log)")
-    out({"tabs": opened}, a.json, f"opened {len(opened)} herdr tabs: " + ", ".join(t["label"] for t in opened))
+    for tab in [t for t in existing if t.get("kind") in ("board", "worker")]:
+        herdr.close_tab(tab["tab_id"]); herdr.forget(tab["tab_id"])
+    return _up_background(a, quiet=True)
 
 
 def cmd_down(a):
     closed = herdr.close_all() if (home() / "herdr.json").exists() else 0
-    pid = daemon_pid()
-    if not pid:
+    pids = daemon_pids()
+    if not pids:
         out({"stopped": False, "tabs_closed": closed}, a.json, f"closed {closed} herdr tabs" if closed else "workers not running")
         return
-    os.killpg(os.getpgid(pid), signal.SIGTERM)
+    for pid in pids:
+        try: os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError): pass
     _pid_file().unlink(missing_ok=True)
-    out({"stopped": True, "pid": pid}, a.json, f"stopped workers (pid {pid}); a running attempt will be reclaimed next start")
+    out({"stopped": True, "pids": pids}, a.json, f"stopped {len(pids)} workers; a running attempt will be reclaimed next start")
 
 
 def cmd_status(a):
@@ -206,9 +222,11 @@ def cmd_launch(a):
         try: return json.loads(r.stdout) if r.stdout.strip() else {}
         except json.JSONDecodeError: raise HelmError("Herdr returned an invalid session response")
     listed = (hc("workspace", "list").get("result") or {}).get("workspaces") or []
+    created_workspace = False
     if listed:
         workspace_id = listed[0]["workspace_id"]
     else:
+        created_workspace = True
         made = hc("workspace", "create", "--cwd", str(Path(__file__).resolve().parents[1]), "--label", "First Mate", "--no-focus",
                   "--env", f"HELM_HOME={home()}", "--env", f"PI_CODING_AGENT_DIR={pi_home()}")
         workspace_id = (made.get("result") or {}).get("workspace", {}).get("workspace_id")
@@ -224,6 +242,13 @@ def cmd_launch(a):
         command = shlex.quote(str(Path(__file__).resolve().parents[1] / "bin" / "pi-firstmate"))
         if a.harness != "pi": command += " " + shlex.quote(a.harness)
         hc("pane", "run", pane, command)
+        # Some Herdr versions create a default shell tab with a new workspace.
+        # Once the real First Mate tab exists, close those initial placeholders.
+        if created_workspace:
+            new_tab = (made.get("result") or {}).get("tab", {}).get("tab_id")
+            for old in tabs:
+                if old.get("tab_id") and old.get("tab_id") != new_tab:
+                    hc("tab", "close", old["tab_id"])
     os.execv(binary, [binary, "session", "attach", session])
 
 
@@ -236,16 +261,15 @@ def cmd_captain(a):
                 "codex": "install Codex:  npm install -g @openai/codex"}.get(cmd[0], "")
         raise HelmError(f"{cmd[0]} is not installed. {hint}".strip())
     from .util import read_json
-    have_tabs = any(t["kind"] == "worker" for t in read_json(home() / "herdr.json", {"tabs": []})["tabs"])
-    if not daemon_pid() and not (herdr.inside() and have_tabs):
+    # Always pass through the Herdr startup path so upgrades clean up the old
+    # permanent fleet/worker tabs even when background schedulers are alive.
+    if herdr.inside() or not daemon_pid():
         cmd_up(argparse.Namespace(json=False, interval=20, workers=a.workers))
     if a.harness == "pi":
         if not codex_ready():
             cmd_setup(argparse.Namespace(json=False, import_login=False))
-        print("  ⚓ crew ready · first mate coming on deck…", file=sys.stderr)
     else:
-        print(board.banner(daemon_pid()))
-        print(f"  first mate: {' '.join(cmd)}\n", file=sys.stderr)
+        print(f"first mate: {' '.join(cmd)}", file=sys.stderr)
     repo = Path(__file__).resolve().parents[1]
     os.chdir(repo)
     os.execvp(cmd[0], cmd)

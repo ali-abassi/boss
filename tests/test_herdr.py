@@ -1,4 +1,4 @@
-"""Inside Herdr the fleet is visible: a board tab, worker tabs, one tab per running task, notifications."""
+"""Inside Herdr the fleet is visible without a redundant board tab."""
 try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
@@ -32,26 +32,19 @@ class HerdrTests(unittest.TestCase):
     def calls(self):
         return [json.loads(l) for l in self.log.read_text().splitlines() if l.strip()]
 
-    def test_up_opens_board_and_worker_tabs_beside_the_captain_and_down_closes_them(self):
+    def test_up_runs_workers_in_background_without_empty_herdr_tabs(self):
         out = self.helm("up", "--workers", "3").stdout
-        self.assertIn("opened 4 herdr tabs", out)
+        self.assertEqual(out, "")
         creates = [c for c in self.calls() if c[:2] == ["tab", "create"]]
-        self.assertEqual(len(creates), 4)
-        for c in creates:
-            self.assertIn("--workspace", c); self.assertEqual(c[c.index("--workspace") + 1], "w1")
-            self.assertIn("--no-focus", c)                                   # never steal the captain's focus
-            self.assertEqual(c[-2:], ["--session", "pi-x"])                    # always the captain's session
-            self.assertIn(f"HELM_HOME={self.home}", c)                          # tabs share the captain's home
-        labels = [c[c.index("--label") + 1] for c in creates]
-        self.assertEqual(labels, ["⚓ fleet", "worker 1", "worker 2", "worker 3"])
-        runs = [c for c in self.calls() if c[:2] == ["pane", "run"]]
-        self.assertIn("watch", runs[0][3]); self.assertIn("daemon --owner worker-1", runs[1][3])
-        self.assertIn("workers already open", self.helm("up").stdout)        # idempotent
-        self.assertIn("herdr tabs", self.helm("status").stdout)
+        self.assertEqual(creates, [])
+        pids = json.loads((self.home / "daemon.pid").read_text())
+        self.assertEqual(len(pids), 3)
+        self.assertEqual(self.helm("up").stdout, "")                         # idempotent and quiet
+        self.assertIn("background", self.helm("status").stdout)
         self.helm("down")
         closes = [c for c in self.calls() if c[:2] == ["tab", "close"]]
-        self.assertEqual(sorted(c[2] for c in closes), sorted(c for c in ["w1:t1", "w1:t3", "w1:t5", "w1:t7"]))
-        self.assertEqual(json.loads((self.home / "herdr.json").read_text())["tabs"], [])
+        self.assertEqual(closes, [])
+        self.assertFalse((self.home / "herdr.json").exists())
 
     def test_each_running_task_gets_a_tab_then_it_closes_and_captain_is_notified(self):
         self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
@@ -78,6 +71,15 @@ class HerdrTests(unittest.TestCase):
         run = next(c for c in calls if c[2:4] == ["pane", "run"])
         self.assertIn("pi-firstmate", run[-1])
         self.assertEqual(calls[-1], ["session", "attach", "firstmate"])
+
+    def test_new_workspace_closes_the_default_empty_shell_tab(self):
+        env = {k: v for k, v in self.env.items() if not k.startswith("HERDR_")}
+        env.update(FAKE_HERDR_LOG=str(self.log), FAKE_HERDR_NEW_WORKSPACE="1")
+        r = subprocess.run([str(REPO / "bin" / "pi-firstmate")], env=env, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c[2:4] == ["workspace", "create"] for c in calls))
+        self.assertIn(["--session", "firstmate", "tab", "close", "w1:t-default"], calls)
 
     def test_real_implementer_identity_reconnects_and_reviewers_are_fresh(self):
         old = os.environ.copy(); os.environ.update(self.env)
@@ -159,7 +161,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_banner_and_watch_once(self):
         out = self.helm("watch", "--once").stdout
-        self.assertIn("F I R S T   M A T E", out); self.assertIn("workers   in herdr tabs", out); self.assertIn("none yet", out)
+        self.assertIn("F I R S T   M A T E", out); self.assertIn("workers   stopped", out); self.assertIn("none yet", out)
 
 
 if __name__ == "__main__":

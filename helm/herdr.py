@@ -335,13 +335,13 @@ def open_tab(label: str, command: str, cwd: Path | None = None) -> dict | None:
     if not (tab and pane):
         return None
     _cli("pane", "run", pane, command)
-    log(f"herdr: opened tab {tab} '{label}'")
+    log(f"herdr: opened tab {tab} '{label}'", console=False)
     return {"tab_id": tab, "pane_id": pane, "label": label}
 
 
 def close_tab(tab_id: str) -> None:
     _cli("tab", "close", tab_id)
-    log(f"herdr: closed tab {tab_id}")
+    log(f"herdr: closed tab {tab_id}", console=False)
 
 
 def notify(title: str, body: str = "") -> None:

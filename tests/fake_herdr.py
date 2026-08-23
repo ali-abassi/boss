@@ -62,9 +62,16 @@ elif args[:2] in (["agent", "prompt"], ["agent", "wait"]):
 elif args[:2] == ["agent", "read"]:
     print("fake durable agent output")
 elif args[:2] == ["workspace", "list"]:
-    print(json.dumps({"result": {"workspaces": [{"workspace_id": "w1", "label": "First Mate"}]}}))
+    workspaces = [] if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1" else [{"workspace_id": "w1", "label": "First Mate"}]
+    print(json.dumps({"result": {"workspaces": workspaces}}))
+elif args[:2] == ["workspace", "create"]:
+    print(json.dumps({"result": {"workspace": {"workspace_id": "w1"},
+                                 "tab": {"tab_id": "w1:t-default"},
+                                 "root_pane": {"pane_id": "w1:p-default"}}}))
 elif args[:2] == ["tab", "list"]:
-    print(json.dumps({"result": {"tabs": []}}))
+    tabs = ([{"tab_id": "w1:t-default", "label": "Shell"}]
+            if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1" else [])
+    print(json.dumps({"result": {"tabs": tabs}}))
 elif args[:2] in (["tab", "close"], ["pane", "run"], ["notification", "show"], ["agent", "send-keys"]):
     print(json.dumps({"result": {"type": "ok"}}))
 else:

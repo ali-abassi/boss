@@ -1,5 +1,5 @@
 // firstmate graph — Pi extension.
-// A banner on deck, a live fleet strip in the footer, a nautical working state,
+// A compact status line, a live fleet strip in the footer, a working state,
 // /fleet and /inbox that never spend a model turn, and a wake: the mate turns by itself
 // when the crew has news or when the captain schedules a check-in (/wake 20m). The first mate's voice and
 // rules are instructions in AGENTS.md, as in firstmate — nothing here forces them.
@@ -11,7 +11,6 @@ type Status = { projects: number; workers: number | null; herdr_tabs?: { kind: s
 
 // ------------------------------------------------------------------ rendering
 
-const WORDMARK = "F I R S T   M A T E";
 const ANCHOR = "⚓";
 
 function gutter(width: number): number { return width >= 70 ? 2 : width >= 32 ? 1 : 0; }
@@ -20,41 +19,10 @@ function fit(lines: string[], width: number): string[] {
   const pad = " ".repeat(gutter(width));
   return lines.map((l) => pad + truncateToWidth(l, inner(width), ""));
 }
-function centered(content: string, contentWidth: number, w: number): string {
-  return " ".repeat(Math.max(0, Math.floor((w - contentWidth) / 2))) + content;
-}
-
-/** Two rows of sea: swell, crest glints, foam. Seeded so repaints never flicker. */
-export function sea(width: number, rows: number, seedInput: number): string[] {
-  let seed = seedInput | 0 || 0x5ea5ea;
-  const rnd = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) / 0xffffffff; };
-  return Array.from({ length: rows }, () =>
-    Array.from({ length: width }, () => {
-      const r = rnd();
-      if (r < 0.012) return "✦";
-      if (r < 0.09) return "≈";
-      if (r < 0.26) return "~";
-      if (r < 0.33) return "·";
-      return " ";
-    }).join(""));
-}
-
-function paintSea(theme: Theme, row: string, noColor: boolean): string {
-  if (noColor) return row;
-  const tok: Record<string, string> = { "✦": "warning", "≈": "accent", "~": "muted", "·": "dim" };
-  return [...row].map((c) => (tok[c] ? theme.fg(tok[c], c) : c)).join("");
-}
-
-function rail(theme: Theme, w: number, noColor: boolean): string {
-  const left = Math.max(1, Math.floor(w * 0.3)), eye = 5, right = Math.max(1, w - left - eye - 4);
-  if (noColor) return `${"─".repeat(left)}  ${"─".repeat(eye)}  ${"─".repeat(right)}`;
-  return [theme.fg("borderMuted", "─".repeat(left)), "  ", theme.fg("accent", "──"), theme.fg("warning", ANCHOR), theme.fg("accent", "──"), "  ", theme.fg("borderMuted", "─".repeat(right))].join("");
-}
-
 export function statusLine(s: Status | null): string {
   if (!s) return "crew tools missing · re-run install.sh";
   const workers = s.herdr_tabs?.some((t) => t.kind === "worker")
-    ? `${s.herdr_tabs!.filter((t) => t.kind === "worker").length} workers in herdr tabs`
+    ? `${s.herdr_tabs!.filter((t) => t.kind === "worker").length} workers`
     : s.workers ? "workers in background" : "workers stopped";
   const needs = (s.items["needs-you"] || 0) + (s.items["failed"] || 0) + (s.items["ready"] || 0) + (s.items["pr-open"] || 0);
   const running = s.items["running"] || 0, queued = s.items["queued"] || 0;
@@ -65,28 +33,10 @@ export function statusLine(s: Status | null): string {
   return parts.join(" · ");
 }
 
-export function renderBanner(theme: Theme, width: number, status: Status | null, noColor = false, seed = 0x5ea5ea): string[] {
-  const w = inner(width);
-  if (width < 60) {
-    const line = noColor ? `${ANCHOR} first mate · ${statusLine(status)}`
-      : `${theme.fg("warning", ANCHOR)} ${theme.bold?.("first mate") ?? "first mate"}${theme.fg("dim", " · ")}${theme.fg("muted", statusLine(status))}`;
-    return fit([line], width);
-  }
-  const water = sea(w, 2, seed).map((r) => paintSea(theme, r, noColor));
-  const markPlain = `${ANCHOR}  ${WORDMARK}  ${ANCHOR}`;
-  const mark = noColor ? markPlain
-    : `${theme.fg("warning", ANCHOR)}  ${theme.bold?.(WORDMARK) ?? WORDMARK}  ${theme.fg("warning", ANCHOR)}`;
-  const subPlain = statusLine(status);
-  const sub = noColor ? subPlain : theme.fg("muted", subPlain);
-  const hintPlain = "/fleet  ·  /inbox";
-  const hint = noColor ? hintPlain : `${theme.fg("accent", "/fleet")}${theme.fg("dim", "  ·  ")}${theme.fg("accent", "/inbox")}`;
-  return fit([
-    ...water,
-    centered(mark, visibleWidth(markPlain), w),
-    centered(sub, visibleWidth(subPlain), w),
-    centered(hint, visibleWidth(hintPlain), w),
-    rail(theme, w, noColor),
-  ], width);
+export function renderBanner(theme: Theme, width: number, status: Status | null, noColor = false): string[] {
+  const line = noColor ? `${ANCHOR} first mate · ${statusLine(status)}`
+    : `${theme.fg("warning", ANCHOR)} ${theme.bold?.("first mate") ?? "first mate"}${theme.fg("dim", " · ")}${theme.fg("muted", statusLine(status))}`;
+  return fit([line], width);
 }
 
 // ------------------------------------------------------------------ wake
@@ -247,9 +197,8 @@ if (process.argv[1]?.endsWith("firstmate.ts")) {
   const st: Status = { projects: 2, workers: 123, items: { running: 1, "needs-you": 1 } };
   for (const width of [120, 80, 60]) {
     const lines = renderBanner(theme, width, st, false, 42);
-    ok(lines.length === 6 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
-    ok(lines.join("\n").includes(WORDMARK) && lines.join("\n").includes("2 projects"), `identity + status at ${width}`);
-    ok(lines.slice(0, 2).join("").includes("~"), `sea rows at ${width}`);
+    ok(lines.length === 1 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
+    ok(lines[0].includes("first mate") && lines[0].includes("2 projects"), `identity + status at ${width}`);
   }
   ok(renderBanner(theme, 50, st, false, 1)[0].includes("first mate"), "narrow banner keeps identity");
   ok(renderBanner(theme, 80, st, false, 7).join("|") === renderBanner(theme, 80, st, false, 7).join("|"), "seeded render is stable");

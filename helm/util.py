@@ -61,7 +61,7 @@ def git(repo: Path | str, *args: str, check: bool = True) -> str:
     return sh(["git", *GIT_OPTS, "-C", str(repo), *args], check=check, env=env).stdout.strip()
 
 
-def log(msg: str) -> None:
+def log(msg: str, *, console: bool = True) -> None:
     from .paths import log_file
     line = f"{now()} {msg}"
     try:
@@ -70,7 +70,8 @@ def log(msg: str) -> None:
             fh.write(line + "\n")
     except OSError:
         pass
-    print(line, file=sys.stderr)
+    if console:
+        print(line, file=sys.stderr)
 
 
 class HelmError(SystemExit):
