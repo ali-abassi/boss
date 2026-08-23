@@ -66,10 +66,11 @@ ok "bundled runner ready"
 mkdir -p "$bindir"
 ln -sf "$here/bin/helm" "$bindir/helm"
 ln -sf "$here/bin/pi-firstmate" "$bindir/pi-firstmate"
+ln -sf "$here/bin/pi-firstmate-quit" "$bindir/pi-firstmate-quit"
 for d in "$HOME/.pi/agent/skills" "$HOME/.claude/skills" "$HOME/.agents/skills"; do
   mkdir -p "$d" && ln -sfn "$here" "$d/firstmate-graph"
 done
-ok "pi-firstmate → $bindir/pi-firstmate"
+ok "pi-firstmate + pi-firstmate-quit → $bindir"
 
 # ---------------------------------------------------------------- pi + codex
 if command -v pi >/dev/null 2>&1; then

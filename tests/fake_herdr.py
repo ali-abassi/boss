@@ -69,10 +69,19 @@ elif args[:2] == ["workspace", "create"]:
                                  "tab": {"tab_id": "w1:t-default"},
                                  "root_pane": {"pane_id": "w1:p-default"}}}))
 elif args[:2] == ["tab", "list"]:
-    tabs = ([{"tab_id": "w1:t-default", "label": "Shell"}]
-            if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1" else [])
+    if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1":
+        tabs = [{"tab_id": "w1:t-default", "label": "Shell"}]
+    elif os.environ.get("FAKE_HERDR_EXISTING_DEAD_MATE") == "1":
+        tabs = [{"tab_id": "w1:t-mate", "label": "⚓ First Mate"}]
+    else:
+        tabs = []
     print(json.dumps({"result": {"tabs": tabs}}))
-elif args[:2] in (["tab", "close"], ["pane", "run"], ["notification", "show"], ["agent", "send-keys"]):
+elif args[:2] == ["pane", "list"]:
+    print(json.dumps({"result": {"panes": [{"pane_id": "w1:p-mate", "tab_id": "w1:t-mate",
+                                               "agent_status": "unknown"}]}}))
+elif args[:2] == ["pane", "get"]:
+    print(json.dumps({"result": {"pane": {"pane_id": args[2], "agent": "pi", "agent_status": "idle"}}}))
+elif args[:2] in (["tab", "close"], ["tab", "focus"], ["pane", "run"], ["notification", "show"], ["agent", "send-keys"]):
     print(json.dumps({"result": {"type": "ok"}}))
 else:
     print(json.dumps({"result": {}}))

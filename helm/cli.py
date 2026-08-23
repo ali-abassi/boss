@@ -233,22 +233,45 @@ def cmd_launch(a):
     if not workspace_id:
         raise HelmError("Herdr did not return a workspace identity; nothing was launched")
     tabs = (hc("tab", "list", "--workspace", workspace_id).get("result") or {}).get("tabs") or []
-    if not any(t.get("label") == "⚓ First Mate" for t in tabs):
+    mate_tab = next((t for t in tabs if t.get("label") == "⚓ First Mate"), None)
+    pane = None
+    if mate_tab:
+        panes = (hc("pane", "list").get("result") or {}).get("panes") or []
+        pane_info = next((p for p in panes if p.get("tab_id") == mate_tab.get("tab_id")), None)
+        pane = (pane_info or {}).get("pane_id")
+        running = (pane_info or {}).get("agent") == "pi" or (pane_info or {}).get("agent_status") in ("idle", "working")
+    else:
+        running = False
         made = hc("tab", "create", "--workspace", workspace_id, "--cwd", str(Path(__file__).resolve().parents[1]),
                   "--label", "⚓ First Mate", "--no-focus", "--env", f"HELM_HOME={home()}",
                   "--env", f"PI_CODING_AGENT_DIR={pi_home()}")
         pane = (made.get("result") or {}).get("root_pane", {}).get("pane_id")
+        mate_tab = (made.get("result") or {}).get("tab", {})
         if not pane: raise HelmError("Herdr did not return a pane identity; nothing was launched")
-        command = shlex.quote(str(Path(__file__).resolve().parents[1] / "bin" / "pi-firstmate"))
-        if a.harness != "pi": command += " " + shlex.quote(a.harness)
-        hc("pane", "run", pane, command)
         # Some Herdr versions create a default shell tab with a new workspace.
         # Once the real First Mate tab exists, close those initial placeholders.
         if created_workspace:
-            new_tab = (made.get("result") or {}).get("tab", {}).get("tab_id")
+            new_tab = mate_tab.get("tab_id")
             for old in tabs:
                 if old.get("tab_id") and old.get("tab_id") != new_tab:
                     hc("tab", "close", old["tab_id"])
+    if not pane:
+        raise HelmError("The First Mate tab has no pane; close it and run pi-firstmate again")
+    if not running:
+        command = shlex.quote(str(Path(__file__).resolve().parents[1] / "bin" / "pi-firstmate"))
+        if a.harness != "pi": command += " " + shlex.quote(a.harness)
+        hc("pane", "run", pane, command)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            state = (hc("pane", "get", pane).get("result") or {}).get("pane", {})
+            if state.get("agent") == "pi" or state.get("agent_status") in ("idle", "working"):
+                running = True
+                break
+            time.sleep(0.1)
+        if not running:
+            raise HelmError("Pi did not start in the First Mate tab; the session was not attached")
+    if mate_tab.get("tab_id"):
+        hc("tab", "focus", mate_tab["tab_id"])
     os.execv(binary, [binary, "session", "attach", session])
 
 

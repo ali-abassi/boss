@@ -81,6 +81,17 @@ class HerdrTests(unittest.TestCase):
         self.assertTrue(any(c[2:4] == ["workspace", "create"] for c in calls))
         self.assertIn(["--session", "firstmate", "tab", "close", "w1:t-default"], calls)
 
+    def test_existing_shell_only_firstmate_tab_is_restarted_and_focused(self):
+        env = {k: v for k, v in self.env.items() if not k.startswith("HERDR_")}
+        env.update(FAKE_HERDR_LOG=str(self.log), FAKE_HERDR_EXISTING_DEAD_MATE="1")
+        r = subprocess.run([str(REPO / "bin" / "pi-firstmate")], env=env, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertIn(["--session", "firstmate", "pane", "run", "w1:p-mate",
+                       str(REPO / "bin" / "pi-firstmate")], calls)
+        self.assertIn(["--session", "firstmate", "tab", "focus", "w1:t-mate"], calls)
+        self.assertEqual(calls[-1], ["session", "attach", "firstmate"])
+
     def test_real_implementer_identity_reconnects_and_reviewers_are_fresh(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:

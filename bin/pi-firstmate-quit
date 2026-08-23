@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stop the First Mate workers and close its persistent Herdr session.
+set -u
+
+bindir="$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")"
+"$bindir/helm" down >/dev/null 2>&1 || true
+
+herdr_bin="${HERDR_BIN:-$(command -v herdr 2>/dev/null || true)}"
+if [ -z "$herdr_bin" ]; then
+  printf 'pi-firstmate-quit: herdr is not installed\n' >&2
+  exit 1
+fi
+
+"$herdr_bin" --session firstmate server stop >/dev/null
+printf 'first mate closed\n'

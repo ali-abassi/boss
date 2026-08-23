@@ -106,7 +106,8 @@ without changing work. `PI_FIRSTMATE_HEADLESS=1 pi-firstmate` is the explicit no
 fallback.
 
 `pi-firstmate stop` stops the crew. `pi-firstmate claude` opens the same first mate in
-Claude Code. That's the whole surface; the machinery underneath is in
+Claude Code. `pi-firstmate-quit` stops the crew and closes its Herdr session. That's the
+whole surface; the machinery underneath is in
 [`docs/cli.md`](docs/cli.md) for the curious.
 
 ## Rules
