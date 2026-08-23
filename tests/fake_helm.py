@@ -21,7 +21,7 @@ def fake_sandbox_status() -> dict:
         "platform": "test-fake-herdr",
         "sandbox_exec": None,
         "wrapper": str(REPO / "libexec" / "pi"),
-        "tool_runner": str(REPO / "libexec" / "firstmate-tool"),
+        "tool_runner": str(REPO / "tests" / "fake_firstmate_tool.py"),
         "real_pi": "/usr/bin/true",
         "reaper_ready": True,
         "reaper_detail": "fake Herdr does not execute managed processes",
