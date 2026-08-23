@@ -223,6 +223,66 @@ class PiExtensionTests(unittest.TestCase):
         self.assertIn("promote", agents)
 
 
+class NodeBudgetTests(Isolated):
+    def test_node_budget_schema_and_non_model_metrics_fail_closed(self):
+        from helm import work
+        self.assertEqual(work.validate_node_budgets({"implement": {"tokens": 100, "seconds": 30}}),
+                         {"implement": {"tokens": 100, "cost": None, "seconds": 30}})
+        with self.assertRaises(SystemExit):
+            work.validate_node_budgets({"verify": {"tokens": 1}})
+        with self.assertRaises(SystemExit):
+            work.validate_node_budgets({"mystery": {"seconds": 1}})
+        with self.assertRaises(SystemExit):
+            work.validate_node_budgets({"implement": {"cost": float("nan")}})
+
+    def test_session_receipts_are_cumulative_per_node_and_never_double_counted(self):
+        from helm import work
+        usage = {}
+        first = {"agent_session_id": "first"}
+        work._record_node_session(usage, "implement", first, {}, started=False)
+        self.assertEqual(usage["implement"]["receipts"], {})
+        self.assertTrue(usage["implement"]["tokens_evidence_complete"])
+        work._record_node_session(usage, "implement", first, {"tokens": 10, "cost": 0.1}, started=True)
+        work._record_node_session(usage, "implement", first, {"tokens": 15, "cost": 0.2}, started=True)
+        work._record_node_session(usage, "implement", {"agent_session_id": "second"},
+                                  {"tokens": 5, "cost": 0.05}, started=True)
+        self.assertEqual(usage["implement"]["tokens"], 20)
+        self.assertAlmostEqual(usage["implement"]["cost"], 0.25)
+        item = {"node_budgets": {"implement": {"tokens": 18, "cost": None, "seconds": None}},
+                "node_usage": usage}
+        self.assertIn("implement tokens budget exhausted", "; ".join(work.node_budget_blockers(item)))
+
+    def test_invalid_node_usage_measurements_fail_closed(self):
+        from helm import work
+        usage = {"implement": work._new_node_usage()}
+        identity = {"agent_session_id": "session-invalid"}
+        work._record_node_session(usage, "implement", identity,
+                                  {"tokens": float("nan"), "cost": -1}, started=True)
+        state = usage["implement"]
+        self.assertEqual(state["tokens"], 0)
+        self.assertEqual(state["cost"], 0.0)
+        self.assertFalse(state["tokens_evidence_complete"])
+        self.assertFalse(state["cost_evidence_complete"])
+
+    def test_active_first_turn_waits_for_provider_receipt_but_settled_turn_fails_closed(self):
+        from helm import work
+        budgets = {"tokens": 100, "cost": 1.0}
+        self.assertEqual(work._missing_settled_usage(
+            budgets, {}, 0, "became unavailable"), [])
+        self.assertEqual(work._missing_settled_usage(
+            budgets, {}, 1, "became unavailable"),
+            ["tokens usage evidence became unavailable", "cost usage evidence became unavailable"])
+
+    def test_cli_node_budget_parser_rejects_duplicates_and_normalizes(self):
+        from helm import cli
+        self.assertEqual(cli._node_budget_args(["implement=100"], ["review_correctness=0.5"], ["verify=20"]),
+                         {"implement": {"tokens": 100, "cost": None, "seconds": None},
+                          "review_correctness": {"tokens": None, "cost": 0.5, "seconds": None},
+                          "verify": {"tokens": None, "cost": None, "seconds": 20}})
+        with self.assertRaises(SystemExit):
+            cli._node_budget_args(["implement=10", "implement=20"], [], [])
+
+
 class OwnPiHomeTests(Isolated):
     def test_first_mate_has_its_own_pi_home_and_inherits_nothing(self):
         src = self.home / "captain-pi"; src.mkdir()

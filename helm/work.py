@@ -5,8 +5,12 @@ needs-you --respond--> queued      failed --retry--> queued
 ready/pr-open --promote--> merged
 """
 from __future__ import annotations
+import copy
+import datetime as dt
 import fnmatch
+import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -20,6 +24,21 @@ from .util import read_json, write_json, locked, now, log, HelmError, git, sh
 ACTIVE = ("running",)
 OPEN = ("queued", "running", "paused", "needs-you", "ready", "pr-open")
 MAX_REVIEW_DIFF_BYTES = 200_000
+MODEL_BUDGET_NODES = ("implement", "scout", "review_correctness", "review_adversarial")
+BUDGET_NODES = (*MODEL_BUDGET_NODES, "verify")
+
+
+def valid_budget_value(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and float(value) > 0)
+
+
+def _valid_usage_value(key: str, value) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    numeric = float(value)
+    return (math.isfinite(numeric) and numeric >= 0
+            and (key != "tokens" or numeric.is_integer()))
 
 
 def _remaining_timeout(deadline: float | None, cap: int) -> int:
@@ -27,6 +46,157 @@ def _remaining_timeout(deadline: float | None, cap: int) -> int:
         return max(1, int(cap))
     remaining = deadline - time.monotonic()
     return 0 if remaining < 1.0 else max(1, min(int(cap), int(remaining)))
+
+
+def validate_node_budgets(value: dict | None) -> dict:
+    """Normalize the explicit runtime-node budget contract."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise HelmError("node budgets must be an object keyed by runtime node")
+    normalized = {}
+    for node, raw in value.items():
+        if node not in BUDGET_NODES:
+            raise HelmError(f"unknown budget node '{node}'; choose from {', '.join(BUDGET_NODES)}")
+        if not isinstance(raw, dict):
+            raise HelmError(f"node budget '{node}' must be an object")
+        unknown = set(raw) - {"tokens", "cost", "seconds"}
+        if unknown:
+            raise HelmError(f"node budget '{node}' has unknown fields: {', '.join(sorted(unknown))}")
+        limits = {key: raw.get(key) for key in ("tokens", "cost", "seconds")}
+        for key, limit in limits.items():
+            if limit is not None and not valid_budget_value(limit):
+                raise HelmError(f"{node} {key} budget must be positive")
+        if node == "verify" and any(limits[key] is not None for key in ("tokens", "cost")):
+            raise HelmError("verify is a non-model node; only its seconds budget is meaningful")
+        if any(limit is not None for limit in limits.values()):
+            normalized[node] = limits
+    return normalized
+
+
+def _new_node_usage(*, complete: bool = True) -> dict:
+    return {"tokens": 0, "cost": 0.0, "seconds": 0.0,
+            "tokens_evidence_complete": complete, "cost_evidence_complete": complete,
+            "seconds_evidence_complete": complete, "receipts": {}}
+
+
+def _node_usage_snapshot(it: dict) -> dict:
+    raw = it.get("node_usage") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    result = copy.deepcopy(raw)
+    historical = bool(it.get("attempts") or it.get("runs") or it.get("session") or it.get("agent_launches"))
+    for node in (it.get("node_budgets") or {}):
+        result.setdefault(node, _new_node_usage(complete=not historical))
+    return result
+
+
+def _node_state(node_usage: dict, node: str, *, complete: bool = True) -> dict:
+    state = node_usage.setdefault(node, _new_node_usage(complete=complete))
+    state.setdefault("tokens", 0); state.setdefault("cost", 0.0); state.setdefault("seconds", 0.0)
+    state.setdefault("tokens_evidence_complete", complete)
+    state.setdefault("cost_evidence_complete", complete)
+    state.setdefault("seconds_evidence_complete", complete)
+    state.setdefault("receipts", {})
+    return state
+
+
+def _record_node_session(node_usage: dict, node: str, identity: dict, evidence: dict,
+                         *, started: bool) -> None:
+    """Monotonically attribute one node's cumulative Pi session receipt."""
+    state = _node_state(node_usage, node)
+    session_id = str(identity.get("agent_session_id") or "")
+    if not session_id:
+        if started:
+            state["tokens_evidence_complete"] = False
+            state["cost_evidence_complete"] = False
+        return
+    has_evidence = any(_valid_usage_value(key, evidence.get(key)) for key in ("tokens", "cost"))
+    if not started and not has_evidence:
+        return
+    receipt = state["receipts"].setdefault(session_id, {})
+    for key in ("tokens", "cost"):
+        value = evidence.get(key)
+        if _valid_usage_value(key, value):
+            receipt[key] = max(float(receipt.get(key) or 0), float(value))
+            if key == "tokens":
+                receipt[key] = int(receipt[key])
+            receipt[f"{key}_available"] = True
+        elif started:
+            receipt[f"{key}_available"] = False
+    receipt["observed_at"] = now()
+    receipts = list(state["receipts"].values())
+    state["tokens"] = sum(int(entry.get("tokens") or 0) for entry in receipts)
+    state["cost"] = sum(float(entry.get("cost") or 0.0) for entry in receipts)
+    if receipts:
+        state["tokens_evidence_complete"] = all(entry.get("tokens_available") is True for entry in receipts)
+        state["cost_evidence_complete"] = all(entry.get("cost_available") is True for entry in receipts)
+
+
+def _record_node_seconds(node_usage: dict, node: str, seconds: float, *, complete: bool = True) -> None:
+    state = _node_state(node_usage, node)
+    state["seconds"] = float(state.get("seconds") or 0.0) + max(0.0, float(seconds))
+    state["seconds_evidence_complete"] = state.get("seconds_evidence_complete") is True and complete
+    state["seconds_accounted_at"] = now()
+
+
+def _persist_node_usage(work_id: str, node_usage: dict) -> dict:
+    """Merge one runner's node ledger without overwriting concurrent controls."""
+    snapshot = copy.deepcopy(node_usage)
+    return control.cas_update(work_id, lambda item: item.update(node_usage=snapshot))
+
+
+def _missing_settled_usage(budgets: dict, evidence: dict, settled_sequence: int,
+                           label: str) -> list[str]:
+    """Usage is unavailable only after Pi proves at least one turn settled."""
+    if settled_sequence <= 0:
+        return []
+    return [f"{key} usage evidence {label}" for key in ("tokens", "cost")
+            if budgets.get(key) is not None and key not in evidence]
+
+
+def _node_budget_findings(node_budgets: dict, node_usage: dict, node: str, *,
+                          exhausted: bool) -> list[str]:
+    limits = node_budgets.get(node) or {}
+    usage = node_usage.get(node) or {}
+    findings = []
+    for key in ("tokens", "cost", "seconds"):
+        limit = limits.get(key)
+        if limit is None:
+            continue
+        if usage.get(f"{key}_evidence_complete") is not True:
+            findings.append(f"{node} {key} usage evidence is incomplete")
+            continue
+        actual = usage.get(key)
+        if not isinstance(actual, (int, float)) or isinstance(actual, bool):
+            findings.append(f"{node} {key} usage evidence is unavailable")
+        elif (float(actual) >= float(limit) if exhausted else float(actual) > float(limit)):
+            word = "exhausted" if exhausted else "exceeded"
+            findings.append(f"{node} {key} budget {word} ({actual:g}/{limit:g})")
+        elif exhausted and key == "seconds" and float(limit) - float(actual) < 1.0:
+            findings.append(f"{node} seconds budget has less than one bounded second remaining ({actual:g}/{limit:g})")
+    return findings
+
+
+def node_budget_blockers(it: dict, node: str | None = None, *, node_usage: dict | None = None) -> list[str]:
+    budgets = validate_node_budgets(it.get("node_budgets"))
+    usage = node_usage if node_usage is not None else _node_usage_snapshot(it)
+    nodes = [node] if node else list(budgets)
+    return [finding for name in nodes for finding in _node_budget_findings(budgets, usage, name, exhausted=True)]
+
+
+def _node_timeout(it: dict, node_usage: dict, node: str, deadline: float | None, cap: int) -> int:
+    bounded = _remaining_timeout(deadline, cap)
+    limit = ((it.get("node_budgets") or {}).get(node) or {}).get("seconds")
+    if limit is None:
+        return bounded
+    state = node_usage.get(node) or {}
+    if state.get("seconds_evidence_complete") is not True:
+        return 0
+    remaining = float(limit) - float(state.get("seconds") or 0.0)
+    if remaining < 1.0:
+        return 0
+    return min(bounded, max(1, int(remaining)))
 
 
 def _policy_snapshot(project: dict) -> dict:
@@ -43,12 +213,13 @@ def _hydrate(it: dict) -> dict:
     """Read-compatible migration for version-1 records; the next CAS write persists it."""
     it.setdefault("schema_version", control.SCHEMA_VERSION); it.setdefault("revision", 0)
     it.setdefault("phase", it.get("status", "queued")); it.setdefault("scope", {"paths": ["unknown"], "claim": "global"})
-    it.setdefault("controls", {"paused": False, "away": False, "pending": []})
+    it.setdefault("controls", {"paused": False, "pending": []})
     for key, default in (("session", None), ("checkpoint", None), ("reviews", []), ("verification", []),
                          ("changed_scope", []), ("agent_launches", [])):
         it.setdefault(key, default)
     it.setdefault("activity", {"last": it.get("updated"), "state": it.get("phase")})
     it.setdefault("budgets", {"tokens": None, "cost": None, "seconds": None})
+    it["node_budgets"] = validate_node_budgets(it.get("node_budgets"))
     it.setdefault("usage", {"tokens": 0, "cost": 0.0, "seconds": 0.0,
                             "implementer_tokens": 0, "implementer_cost": 0.0,
                             "reviewer_tokens": 0, "reviewer_cost": 0.0})
@@ -59,6 +230,7 @@ def _hydrate(it: dict) -> dict:
     # is unknown, never a trustworthy zero. Brand-new items have proven zero use.
     usage.setdefault("tokens_evidence_complete", not historical_turn)
     usage.setdefault("cost_evidence_complete", not historical_turn)
+    it["node_usage"] = _node_usage_snapshot(it)
     if not it.get("model_decision") and it.get("dispatch"):
         it["model_decision"] = {"models": it["dispatch"].get("models", {}), "thinking": it["dispatch"].get("thinking", {}),
                                 "rationale": "migrated pinned dispatch", "resolved_at": it.get("created")}
@@ -124,6 +296,7 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
            max_attempts: int = 3, declared_scope: list[str] | None = None,
            model: str | None = None, thinking: str | None = None,
            max_tokens: int | None = None, max_cost: float | None = None, max_seconds: int | None = None,
+           node_budgets: dict | None = None,
            memory_request: dict | None = None) -> dict:
     project = registry.get(project_id)
     gates.require_execution(project.get("gate", "native"), project["path"])
@@ -131,12 +304,13 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
         raise HelmError("kind must be ship or scout")
     if model and "/" not in model:
         raise HelmError("model override must be provider/model")
-    if any(v is not None and v <= 0 for v in (max_tokens, max_cost, max_seconds)):
+    if any(v is not None and not valid_budget_value(v) for v in (max_tokens, max_cost, max_seconds)):
         raise HelmError("budgets must be positive")
+    node_budgets = validate_node_budgets(node_budgets)
     if project.get("gate") == "no-mistakes" and kind == "ship":
         if project.get("authority", 0) < 2 or project.get("mode") == modes.LOCAL_ONLY:
             raise HelmError("no-mistakes can push/open a PR and requires non-local mode with authority >= 2")
-        if any(value is not None for value in (max_tokens, max_cost, max_seconds)):
+        if any(value is not None for value in (max_tokens, max_cost, max_seconds)) or node_budgets:
             raise HelmError("no-mistakes cannot prove First Mate token/cost/time caps; configured budgets fail closed")
     available = {m.strip() for m in os.environ.get("HELM_AVAILABLE_MODELS", "").split(",") if m.strip()}
     if model and available and model not in available:
@@ -161,10 +335,12 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
         "branch": worktree.branch_name(wid), "worktree": str(worktree.worktree_root() / project_id / wid),
         "pr_url": None, "ask": None, "dispatch": None, "phase": "queued",
         "scope": {"paths": declared, "claim": "global" if global_claim else "paths"},
-        "controls": {"paused": False, "away": False, "pending": []}, "session": None, "agent_launches": [],
+        "controls": {"paused": False, "pending": []}, "session": None, "agent_launches": [],
         "checkpoint": None, "reviews": [], "verification": [], "changed_scope": [],
         "activity": {"last": now(), "state": "queued"},
         "budgets": {"tokens": max_tokens, "cost": max_cost, "seconds": max_seconds},
+        "node_budgets": node_budgets,
+        "node_usage": {node: _new_node_usage() for node in node_budgets},
         "usage": {"tokens": 0, "cost": 0.0, "seconds": 0.0,
                   "implementer_tokens": 0, "implementer_cost": 0.0,
                   "reviewer_tokens": 0, "reviewer_cost": 0.0,
@@ -237,25 +413,27 @@ def budget_blockers(it: dict) -> list[str]:
             blockers.append(f"{key} budget exhausted ({actual:g}/{limit:g})")
         elif key == "seconds" and float(limit) - float(actual) < 1.0:
             blockers.append(f"seconds budget has less than one bounded second remaining ({actual:g}/{limit:g})")
-    return blockers
+    return blockers + node_budget_blockers(it)
 
 
 def _harvest_usage(work_id: str, elapsed: float = 0.0) -> dict:
     """Persist monotonic per-session receipts on every exceptional exit."""
     current = load(work_id)
     identities = []
+    implement_node = "scout" if current.get("kind") == "scout" else "implement"
     if isinstance(current.get("session"), dict):
-        identities.append(("implementer", current["session"]))
+        identities.append(("implementer", current["session"].get("node") or implement_node, current["session"]))
     for historical in current.get("session_history") or []:
         if isinstance(historical, dict):
-            identities.append(("implementer", historical))
+            identities.append(("implementer", historical.get("node") or implement_node, historical))
     for launch in current.get("agent_launches") or []:
         # Closed reviewers are still billable model sessions. In particular,
         # an invalid verdict/model-drift error may close a settled reviewer
         # before the outer exception path harvests its receipt.
         if (launch.get("role") in {"implementer", "reviewer"}
                 and launch.get("agent_session_id") and launch.get("agent_session_path")):
-            identities.append((launch["role"], launch))
+            fallback = implement_node if launch["role"] == "implementer" else None
+            identities.append((launch["role"], launch.get("node") or fallback, launch))
 
     def mutate(item):
         usage = item.setdefault("usage", {})
@@ -272,7 +450,8 @@ def _harvest_usage(work_id: str, elapsed: float = 0.0) -> dict:
                 "tokens_available": True, "cost_available": True,
             }
         seen = set()
-        for role, identity in identities:
+        node_usage = _node_usage_snapshot(item)
+        for role, node, identity in identities:
             session_id = str(identity.get("agent_session_id") or "")
             if not session_id or session_id in seen:
                 continue
@@ -282,15 +461,23 @@ def _harvest_usage(work_id: str, elapsed: float = 0.0) -> dict:
                 started = int(herdr.runtime_activity(identity).get("runtime_input_sequence") or 0) > 0
             except BaseException:
                 started = True
+            if node in BUDGET_NODES:
+                _record_node_session(node_usage, node, identity, evidence, started=started)
+            elif role == "reviewer" and started:
+                for review_node in ("review_correctness", "review_adversarial"):
+                    if review_node in (item.get("node_budgets") or {}):
+                        state = _node_state(node_usage, review_node, complete=False)
+                        state["tokens_evidence_complete"] = False
+                        state["cost_evidence_complete"] = False
             receipt = receipts.setdefault(session_id, {"role": role})
             receipt["role"] = role
             for key in ("tokens", "cost"):
                 value = evidence.get(key)
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if _valid_usage_value(key, value):
                     receipt[key] = max(float(receipt.get(key) or 0), float(value))
                     if key == "tokens": receipt[key] = int(receipt[key])
                     receipt[f"{key}_available"] = True
-                elif started and key not in receipt:
+                elif started:
                     receipt[f"{key}_available"] = False
             receipt["harvested_at"] = now()
         measured_implementer_tokens = sum(int(r.get("tokens") or 0) for key, r in receipts.items()
@@ -339,7 +526,51 @@ def _harvest_usage(work_id: str, elapsed: float = 0.0) -> dict:
         active = list(receipts.values())
         usage["tokens_evidence_complete"] = all(r.get("tokens_available") is True for r in active)
         usage["cost_evidence_complete"] = all(r.get("cost_available") is True for r in active)
-        usage["seconds"] = float(usage.get("seconds") or 0.0) + max(0.0, elapsed)
+        bounded_elapsed = max(0.0, float(elapsed)) if math.isfinite(float(elapsed)) else 0.0
+        if bounded_elapsed:
+            lease = item.get("lease") or {}
+            receipt_identity = {
+                "claim_token": lease.get("claim_token"),
+                "process_identity": lease.get("process_identity"),
+                "pid": lease.get("pid"),
+                "started": lease.get("started"),
+            }
+            receipt_key = hashlib.sha256(json.dumps(receipt_identity, sort_keys=True,
+                                                    separators=(",", ":")).encode()).hexdigest()
+            seconds_receipts = usage.setdefault("seconds_receipts", {})
+            previous_raw = seconds_receipts.get(receipt_key, 0.0)
+            seconds_raw = usage.get("seconds", 0.0)
+            if (not _valid_usage_value("seconds", previous_raw)
+                    or not _valid_usage_value("seconds", seconds_raw)):
+                raise HelmError("usage seconds receipt is malformed; run pi-firstmate doctor")
+            previous_elapsed = float(previous_raw)
+            usage["seconds"] = (float(seconds_raw)
+                                + max(0.0, bounded_elapsed - previous_elapsed))
+            seconds_receipts[receipt_key] = max(previous_elapsed, bounded_elapsed)
+        activity = item.get("activity") or {}
+        active_node = activity.get("node")
+        if active_node in BUDGET_NODES and bounded_elapsed > 0:
+            raw_started = activity.get("node_started_at")
+            complete = True
+            try:
+                started_epoch = dt.datetime.fromisoformat(str(raw_started).replace("Z", "+00:00")).timestamp()
+                state = _node_state(node_usage, active_node)
+                raw_accounted = state.get("seconds_accounted_at")
+                accounted_epoch = (dt.datetime.fromisoformat(str(raw_accounted).replace("Z", "+00:00")).timestamp()
+                                   if raw_accounted else started_epoch)
+                current_epoch = time.time()
+                if started_epoch > current_epoch + 1 or accounted_epoch > current_epoch + 1:
+                    raise ValueError("node accounting clock moved backwards")
+                anchor = max(started_epoch, accounted_epoch)
+                node_elapsed = min(bounded_elapsed, max(0.0, current_epoch - anchor))
+            except (TypeError, ValueError, OverflowError):
+                node_elapsed, complete = bounded_elapsed, False
+            _record_node_seconds(node_usage, active_node, node_elapsed, complete=complete)
+        elif bounded_elapsed > 0 and item.get("node_budgets"):
+            for node, limits in item["node_budgets"].items():
+                if (limits or {}).get("seconds") is not None:
+                    _node_state(node_usage, node)["seconds_evidence_complete"] = False
+        item["node_usage"] = node_usage
     return control.cas_update(work_id, mutate)
 
 
@@ -461,10 +692,12 @@ def _model_drift(expected: str, thinking: str, agent: dict, *, require_durable: 
     herdr.validate_agent(agent, expected, thinking, require_durable=require_durable)
 
 
-def _mark_activity(work_id: str, phase: str) -> dict:
+def _mark_activity(work_id: str, phase: str, *, node: str | None = None) -> dict:
     def mark(item):
         item["phase"] = phase
         item["activity"] = {"last": now(), "state": phase}
+        if node:
+            item["activity"].update(node=node, node_started_at=now())
     return control.cas_update(work_id, mark)
 
 
@@ -531,10 +764,11 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                         deadline: float | None) -> dict:
     """Use one real reconnectable Herdr implementer and fresh independent reviewers."""
     decision = it["model_decision"]
-    model = decision["models"]["scout" if it["kind"] == "scout" else "implement"]
-    thinking = decision["thinking"]["scout" if it["kind"] == "scout" else "implement"]
+    implement_node = "scout" if it["kind"] == "scout" else "implement"
+    model = decision["models"][implement_node]
+    thinking = decision["thinking"][implement_node]
     dispatch.assert_available(it["dispatch"])
-    session = herdr.ensure_agent(it, wt, model, thinking, agent_env=agent_env)
+    session = herdr.ensure_agent(it, wt, model, thinking, agent_env=agent_env, node=implement_node)
     _model_drift(model, thinking, session, require_durable=False)
     current = load(it["id"])
     previous = current.get("session")
@@ -551,8 +785,10 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         if authorization and not authorization.get("consumed_at"):
             authorization.update(consumed_at=now(), outcome="live-reconnect" if session.get("reconnected") else "initial-session")
             current["recovery_authorized"] = authorization
+    prior_activity = dict(current.get("activity") or {})
     current["session"] = session; current["phase"] = "investigating" if it["kind"] == "scout" else "implementing"
     current["activity"] = {"last": now(), "heartbeat": now(), "state": current["phase"],
+                           "node": implement_node, "node_started_at": now(),
                            "progress_marker": herdr.progress_marker(session)}
     current["checkpoint"] = {"sha": git(wt, "rev-parse", "HEAD"), "at": now(),
                              "phase": current["phase"], "prior": recovered_checkpoint,
@@ -560,6 +796,7 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                              "recovery": "live-reconnect" if session.get("reconnected") else "checkpoint-fallback"}
     save(current); it = current
     prior_usage = it.get("usage") or {}
+    node_usage = _node_usage_snapshot(it)
     session_id = session.get("agent_session_id")
     def aggregate_usage(implementer: dict, reviewer_tokens: int = 0,
                         reviewer_cost: float = 0.0, *, reviewer_tokens_complete: bool = True,
@@ -580,18 +817,32 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                 "reviewer_tokens": all_reviewer_tokens, "reviewer_cost": all_reviewer_cost,
                 "implementer_session_id": session_id, "usage_kind": "session-cumulative",
                 "tokens_evidence_complete": ("tokens" in implementer and reviewer_tokens_complete),
-                "cost_evidence_complete": ("cost" in implementer and reviewer_cost_complete)}
+                "cost_evidence_complete": ("cost" in implementer and reviewer_cost_complete),
+                "node_usage": copy.deepcopy(node_usage)}
 
     initial_evidence = herdr.usage(session)
     try:
-        prior_turns = int(herdr.runtime_activity(session).get("runtime_input_sequence") or 0)
+        initial_activity = herdr.runtime_activity(session)
+        settled_turns = int(initial_activity.get("runtime_settled_sequence") or 0)
     except BaseException:
-        prior_turns = 1
-    missing_initial = [f"{key} usage evidence unavailable for the existing session"
-                       for key in ("tokens", "cost")
-                       if (it.get("budgets") or {}).get(key) is not None and prior_turns > 0
-                       and key not in initial_evidence]
+        settled_turns = 1
+    _record_node_session(node_usage, implement_node, session, initial_evidence, started=settled_turns > 0)
+    if session.get("reconnected") and (session.get("runtime_turn_pending") or
+                                       (session.get("agent_status") or session.get("state")) == "working"):
+        raw_started = (prior_activity.get("node_started_at") if prior_activity.get("node") == implement_node
+                       else _node_state(node_usage, implement_node).get("seconds_accounted_at"))
+        try:
+            started_epoch = dt.datetime.fromisoformat(str(raw_started).replace("Z", "+00:00")).timestamp()
+            _record_node_seconds(node_usage, implement_node, max(0.0, time.time() - started_epoch))
+        except (TypeError, ValueError):
+            _node_state(node_usage, implement_node)["seconds_evidence_complete"] = False
+    missing_initial = _missing_settled_usage(
+        it.get("budgets") or {}, initial_evidence, settled_turns,
+        "unavailable for the existing session")
     initial_usage = aggregate_usage(initial_evidence)
+    missing_initial += node_budget_blockers(it, implement_node, node_usage=node_usage)
+    it["node_usage"] = copy.deepcopy(node_usage)
+    save(it)
     if missing_initial:
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -642,6 +893,7 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         if elapsed - last_heartbeat[0] >= 5:
             live_agent = herdr.agent_get(session["agent_name"], session)
             measured = herdr.usage(live_agent)
+            live_settled = int((live_agent or {}).get("runtime_settled_sequence") or 0)
             marker = herdr.progress_marker(live_agent or session)
             def beat(item):
                 activity = item.setdefault("activity", {})
@@ -650,12 +902,20 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                     activity.update(last=now(), progress_marker=marker)
             control.cas_update(it["id"], beat); last_heartbeat[0] = elapsed
             total_usage = aggregate_usage(measured)
+            missing_live = _missing_settled_usage(
+                live_item.get("budgets") or {}, measured, live_settled, "became unavailable")
+            if missing_live:
+                return {"control": "budget", "reason": "; ".join(missing_live)}
             for key in ("tokens", "cost"):
                 limit, actual = (live_item.get("budgets") or {}).get(key), total_usage.get(key)
-                if limit is not None and key not in measured:
-                    return {"control": "budget", "reason": f"{key} usage evidence became unavailable"}
                 if limit is not None and actual is not None and actual >= limit:
                     return {"control": "budget", "reason": f"{key} budget reached ({actual:g}/{limit:g})"}
+            live_node_usage = copy.deepcopy(node_usage)
+            _record_node_session(live_node_usage, implement_node, session, measured,
+                                 started=live_settled > 0)
+            _record_node_seconds(live_node_usage, implement_node, elapsed)
+            if node_blocked := node_budget_blockers(it, implement_node, node_usage=live_node_usage):
+                return {"control": "budget", "reason": "; ".join(node_blocked)}
         elapsed_total = float(prior_usage.get("seconds") or 0.0) + (time.monotonic() - attempt_started)
         if (live_item.get("budgets") or {}).get("seconds") and elapsed_total >= live_item["budgets"]["seconds"]:
             return {"control": "budget", "reason": "time budget reached"}
@@ -668,9 +928,10 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         return sorted(set(sensitive + scope.escaped((it.get("scope") or {}).get("paths"), changed)))
     if reconnecting_active:
         agent, escaped_live = herdr.wait_agent_monitored(
-            session["agent_name"], max(1, _remaining_timeout(deadline, timeout)), live_escape, session)
+            session["agent_name"], max(1, _node_timeout(it, node_usage, implement_node, deadline, timeout)),
+            live_escape, session)
     else:
-        turn_timeout = _remaining_timeout(deadline, timeout)
+        turn_timeout = _node_timeout(it, node_usage, implement_node, deadline, timeout)
         if not turn_timeout:
             run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
             run_dir.mkdir(parents=True, exist_ok=False)
@@ -684,10 +945,16 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
     agent = herdr.agent_get(session["agent_name"], session) or {**session, **agent}
     _model_drift(model, thinking, agent)
     turn_evidence = herdr.usage(agent)
+    _record_node_session(node_usage, implement_node, session, turn_evidence, started=True)
+    _record_node_seconds(node_usage, implement_node, time.monotonic() - monitor_started)
+    _persist_node_usage(it["id"], node_usage)
     turn_usage = aggregate_usage(turn_evidence)
     missing_turn = [f"{key} usage evidence unavailable after implementer turn"
                     for key in ("tokens", "cost")
                     if (it.get("budgets") or {}).get(key) is not None and key not in turn_evidence]
+    missing_turn += [finding for finding in _node_budget_findings(
+        it.get("node_budgets") or {}, node_usage, implement_node, exhausted=False)
+        if "evidence" in finding]
     if missing_turn:
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -700,6 +967,14 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": escaped_live["control"],
                 "budget_exceeded": escaped_live.get("reason"), "agent_checkpoint": escaped_live.get("agent_checkpoint"),
                 "error": "cooperative control checkpoint", **turn_usage}
+    node_crossed = _node_budget_findings(it.get("node_budgets") or {}, node_usage,
+                                         implement_node, exhausted=False)
+    if node_crossed:
+        run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                "budget_exceeded": "; ".join(node_crossed), "agent_checkpoint": "turn-settled",
+                "error": "node budget threshold reached", **turn_usage}
     if escaped_live:
         run_dir = item_dir(it["id"]) / "runs" / f"herdr-{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -761,7 +1036,6 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                 "error": "protected paths changed: " + ", ".join(protected), "changed": changed, **turn_usage}
     escaped = scope.escaped((it.get("scope") or {}).get("paths"), changed)
     if escaped:
-        herdr.interrupt_agent(session["agent_name"])
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["scope-escape"], "scope_escape": escaped,
                 "error": "changed files escaped declared scope: " + ", ".join(escaped), **turn_usage}
     # Integrate the latest configured local base before final verification and review.
@@ -770,23 +1044,37 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         r = sh(["git", "-C", str(wt), "rebase", base_sha], check=False)
         if r.returncode != 0:
             sh(["git", "-C", str(wt), "rebase", "--abort"], check=False)
-            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-integration"], "error": r.stderr[-2000:]}
-    _mark_activity(it["id"], "verifying")
-    verify_timeout = _remaining_timeout(deadline, timeout)
-    if not verify_timeout:
+            return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-integration"],
+                    "error": r.stderr[-2000:], **turn_usage}
+    _mark_activity(it["id"], "verifying", node="verify")
+    verify_blocked = node_budget_blockers(it, "verify", node_usage=node_usage)
+    verify_timeout = _node_timeout(it, node_usage, "verify", deadline, timeout)
+    if verify_blocked or not verify_timeout:
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
-                "budget_exceeded": "seconds budget reached before verification",
+                "budget_exceeded": "; ".join(verify_blocked) or "seconds budget reached before verification",
                 "agent_checkpoint": "turn-settled", "error": "time budget reached", **turn_usage}
+    verify_started = time.monotonic()
     verify = sandbox.run_verification(work_id=it["id"], phase="pre-review", cwd=wt,
                                       command=project.get("test_cmd") or "true",
                                       timeout=verify_timeout, env=agent_env)
+    _record_node_seconds(node_usage, "verify", time.monotonic() - verify_started)
+    _persist_node_usage(it["id"], node_usage)
+    turn_usage = aggregate_usage(herdr.usage(agent))
     (run_dir / "verify.md").write_text(verify.stdout + verify.stderr)
+    verify_crossed = _node_budget_findings(it.get("node_budgets") or {}, node_usage,
+                                            "verify", exhausted=False)
     if verify.returncode:
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["verify"],
+                "control": "budget" if verify_crossed else None,
+                "budget_exceeded": "; ".join(verify_crossed) if verify_crossed else None,
                 "error": (verify.stdout + verify.stderr)[-3000:], **turn_usage}
+    if verify_crossed:
+        return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                "budget_exceeded": "; ".join(verify_crossed), "agent_checkpoint": "turn-settled",
+                "error": "verify node budget threshold reached", **turn_usage}
     if git(project["path"], "rev-parse", project["base"], check=False) != base_sha:
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-moved"],
-                "error": "configured base moved during verification; reviews were not started"}
+                "error": "configured base moved during verification; reviews were not started", **turn_usage}
     sha = git(wt, "rev-parse", "HEAD")
     reviews = []
     implementer_measured = herdr.usage(agent)
@@ -799,9 +1087,11 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
         diff_bytes = len(diff.encode())
         if diff_bytes > MAX_REVIEW_DIFF_BYTES:
             return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["review-input-too-large"],
-                    "error": f"complete review diff is {diff_bytes} bytes; maximum is {MAX_REVIEW_DIFF_BYTES}; no truncated review was run"}
+                    "error": f"complete review diff is {diff_bytes} bytes; maximum is {MAX_REVIEW_DIFF_BYTES}; no truncated review was run",
+                    **turn_usage}
         roles = ["correctness"] + (["adversarial"] if modes.high_assurance(it["dispatch"]["graph"]) else [])
         for role_index, role in enumerate(roles):
+            phase = "review_" + role
             before_review = aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
                                             reviewer_tokens_complete=reviewer_tokens_complete,
                                             reviewer_cost_complete=reviewer_cost_complete)
@@ -812,28 +1102,29 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                         for key in ("tokens", "cost")
                         if (it.get("budgets") or {}).get(key) is not None
                         and before_review.get(f"{key}_evidence_complete") is not True]
+            blocked += node_budget_blockers(it, phase, node_usage=node_usage)
             if not _remaining_timeout(deadline, timeout):
                 blocked.append("seconds budget has less than one bounded second remaining")
             if blocked:
                 return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
                         "budget_exceeded": "; ".join(blocked), "agent_checkpoint": "no-review-turn-started",
                         "error": "budget threshold reached before reviewer", "reviews": reviews, **before_review}
-            phase = "review_" + role
-            _mark_activity(it["id"], phase.replace("_", "-"))
+            _mark_activity(it["id"], phase.replace("_", "-"), node=phase)
             verdict_file = run_dir / f"review_{role}.pending.json"
             reviewer_env = {**agent_env, "HELM_AGENT_ALLOWED_WRITES": str(verdict_file.resolve())}
             reviewer = herdr.ensure_agent(it, wt, decision["models"][phase], decision["thinking"][phase],
-                                          reviewer=True, agent_env=reviewer_env)
+                                          reviewer=True, agent_env=reviewer_env, node=phase)
             reviewer_settled = False
             try:
                 _model_drift(decision["models"][phase], decision["thinking"][phase], reviewer,
                              require_durable=False)
-                review_timeout = _remaining_timeout(deadline, timeout)
+                review_timeout = _node_timeout(it, node_usage, phase, deadline, timeout)
                 if not review_timeout:
                     return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
                             "budget_exceeded": "seconds budget reached before reviewer input",
                             "agent_checkpoint": "no-review-turn-started", "error": "time budget reached",
                             "reviews": reviews, **before_review}
+                review_started = time.monotonic()
                 herdr.prompt_agent(reviewer["agent_name"],
                     f"You are an independent {role} reviewer. Review exact base {base_sha} and commit {sha}. "
                     f"Do not modify the repository. Write genuine JSON "
@@ -847,12 +1138,20 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                     raise HelmError("reviewer session disappeared before its verdict was captured")
                 _model_drift(decision["models"][phase], decision["thinking"][phase], live_reviewer)
                 reviewer_usage = herdr.usage(live_reviewer)
+                _record_node_session(node_usage, phase, reviewer, reviewer_usage, started=True)
+                _record_node_seconds(node_usage, phase, time.monotonic() - review_started)
+                _persist_node_usage(it["id"], node_usage)
                 reviewer_tokens_complete = reviewer_tokens_complete and "tokens" in reviewer_usage
                 reviewer_cost_complete = reviewer_cost_complete and "cost" in reviewer_usage
+                reviewer_tokens += int(reviewer_usage.get("tokens") or 0)
+                reviewer_cost += float(reviewer_usage.get("cost") or 0.0)
                 missing_reviewer = [f"{key} usage evidence unavailable after {role} reviewer"
                                     for key in ("tokens", "cost")
                                     if (it.get("budgets") or {}).get(key) is not None
                                     and key not in reviewer_usage]
+                missing_reviewer += [finding for finding in _node_budget_findings(
+                    it.get("node_budgets") or {}, node_usage, phase, exhausted=False)
+                    if "evidence" in finding]
                 if missing_reviewer:
                     return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
                             "budget_exceeded": "; ".join(missing_reviewer),
@@ -861,8 +1160,6 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                             **aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
                                               reviewer_tokens_complete=reviewer_tokens_complete,
                                               reviewer_cost_complete=reviewer_cost_complete)}
-                reviewer_tokens += int(reviewer_usage.get("tokens") or 0)
-                reviewer_cost += float(reviewer_usage.get("cost") or 0.0)
                 evidence = herdr.agent_read(reviewer["agent_name"], 240)
                 try:
                     verdict = json.loads(verdict_file.read_text())
@@ -882,6 +1179,8 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                 after_review = aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
                                                reviewer_tokens_complete=reviewer_tokens_complete,
                                                reviewer_cost_complete=reviewer_cost_complete)
+                node_exceeded = _node_budget_findings(it.get("node_budgets") or {}, node_usage,
+                                                       phase, exhausted=False)
                 exceeded = [f"{key} budget exceeded ({after_review[key]:g}/{limit:g})"
                             for key in ("tokens", "cost")
                             if (limit := (it.get("budgets") or {}).get(key)) is not None and after_review[key] > limit]
@@ -889,9 +1188,9 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                           for key in ("tokens", "cost")
                           if role_index + 1 < len(roles)
                           and (limit := (it.get("budgets") or {}).get(key)) is not None and after_review[key] >= limit]
-                if exceeded or needed:
+                if exceeded or needed or node_exceeded:
                     return {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
-                            "budget_exceeded": "; ".join(exceeded + needed),
+                            "budget_exceeded": "; ".join(exceeded + needed + node_exceeded),
                             "agent_checkpoint": "review-turn-settled", "error": "reviewer budget threshold reached",
                             "reviews": reviews, **after_review}
             finally:
@@ -902,7 +1201,10 @@ def _persistent_execute(it: dict, project: dict, wt: Path, brief: Path, timeout:
                     herdr.close_agent_tab(reviewer)
     if git(project["path"], "rev-parse", project["base"], check=False) != base_sha:
         return {"ok": False, "run_dir": str(run_dir), "failed_ids": ["base-moved"], "reviews": reviews,
-                "error": "configured base moved after review; all review evidence is invalid"}
+                "error": "configured base moved after review; all review evidence is invalid",
+                **aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
+                                  reviewer_tokens_complete=reviewer_tokens_complete,
+                                  reviewer_cost_complete=reviewer_cost_complete)}
     measured = aggregate_usage(implementer_measured, reviewer_tokens, reviewer_cost,
                                reviewer_tokens_complete=reviewer_tokens_complete,
                                reviewer_cost_complete=reviewer_cost_complete)
@@ -967,23 +1269,37 @@ def _apply_safety_pipeline(it: dict, project: dict, wt: Path, summary: dict, ini
     if sh(["git", "-C", str(wt), "merge-base", "--is-ancestor", base_sha, "HEAD"], check=False).returncode:
         return {**summary, "ok": False, "failed_ids": ["base-moved"],
                 "error": "configured base moved during execution; full pipeline must rerun"}
-    verify_timeout = _remaining_timeout(deadline, timeout)
-    if not verify_timeout:
+    node_usage = copy.deepcopy(summary.get("node_usage") or _node_usage_snapshot(it))
+    verify_blocked = node_budget_blockers(it, "verify", node_usage=node_usage)
+    verify_timeout = _node_timeout(it, node_usage, "verify", deadline, timeout)
+    if verify_blocked or not verify_timeout:
         return {**summary, "ok": False, "failed_ids": [], "control": "budget",
-                "budget_exceeded": "seconds budget reached before final verification",
+                "budget_exceeded": "; ".join(verify_blocked) or "seconds budget reached before final verification",
                 "error": "time budget reached"}
+    verify_started = time.monotonic()
     verify = (sandbox.run_verification(work_id=it["id"], phase="final", cwd=wt,
                                        command=project.get("test_cmd") or "true",
                                        timeout=verify_timeout, env=verify_env)
               if restricted else
               sh(["bash", "-c", project.get("test_cmd") or "true"], cwd=wt,
                  check=False, timeout=verify_timeout, env=verify_env))
+    _record_node_seconds(node_usage, "verify", time.monotonic() - verify_started)
+    _persist_node_usage(it["id"], node_usage)
+    summary = {**summary, "node_usage": node_usage}
+    verify_crossed = _node_budget_findings(it.get("node_budgets") or {}, node_usage,
+                                            "verify", exhausted=False)
     run_dir = Path(summary.get("run_dir") or item_dir(it["id"]))
     if run_dir.is_dir():
         (run_dir / "helm-final-verify.md").write_text(verify.stdout + verify.stderr)
     if verify.returncode:
         return {**summary, "ok": False, "failed_ids": ["verify"],
+                "control": "budget" if verify_crossed else summary.get("control"),
+                "budget_exceeded": "; ".join(verify_crossed) if verify_crossed else summary.get("budget_exceeded"),
                 "error": (verify.stdout + verify.stderr)[-3000:]}
+    if verify_crossed:
+        return {**summary, "ok": False, "failed_ids": [], "control": "budget",
+                "budget_exceeded": "; ".join(verify_crossed),
+                "error": "final verify node budget threshold reached"}
     dirty = worktree.status_paths(wt)
     if dirty:
         return {**summary, "ok": False, "failed_ids": ["dirty-worktree"],
@@ -1047,7 +1363,15 @@ def _execute(it: dict, timeout: int) -> dict:
                           models=dp["models"], thinking=dp["thinking"], timeout=timeout)
     graphs.validate(steps)
     env = worktree.git_env(wt, d / "gitexclude")
-    if herdr.inside() and not test_mode:
+    if test_mode and it.get("node_budgets"):
+        run_dir = d / "runs" / f"node-budget-unproven-{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        summary = {"ok": False, "run_dir": str(run_dir), "failed_ids": [], "control": "budget",
+                   "budget_exceeded": "deterministic graph seam cannot attribute usage to runtime nodes",
+                   "agent_checkpoint": "no-model-turn-started",
+                   "error": "per-node budgets require the real Herdr-native execution path",
+                   "node_usage": _node_usage_snapshot(it)}
+    elif herdr.inside() and not test_mode:
         summary = _persistent_execute(it, project, wt, brief, timeout, env,
                                       attempt_started=started_monotonic, deadline=deadline)
     else:
@@ -1081,7 +1405,8 @@ def _execute(it: dict, timeout: int) -> dict:
         finally:
             if tab:
                 herdr.close_tab(tab["tab_id"]); herdr.forget(tab["tab_id"])
-    it = _mark_activity(it["id"], "final-verification")
+    it = _mark_activity(it["id"], "final-verification",
+                        node="verify" if summary.get("ok") and it["kind"] != "scout" else None)
     current_project = registry.get(it["project"])
     if _policy_snapshot(current_project) != policy:
         summary = {**summary, "ok": False, "failed_ids": ["project-policy-moved"],
@@ -1107,6 +1432,7 @@ def _execute(it: dict, timeout: int) -> dict:
         if summary.get("cost") is not None:
             usage_record["cost"] = float(previous_usage.get("cost") or 0.0) + float(summary["cost"])
     usage_record["seconds"] = float(previous_usage.get("seconds") or 0.0) + elapsed
+    node_usage_record = copy.deepcopy(summary.get("node_usage") or it.get("node_usage") or {})
     attempt_tokens, attempt_cost = summary.get("tokens"), summary.get("cost")
     if attempt_tokens is not None:
         summary["tokens"] = usage_record.get("tokens")
@@ -1124,6 +1450,9 @@ def _execute(it: dict, timeout: int) -> dict:
             exceeded.append(f"{key} evidence unavailable")
         elif limit is not None and actual > limit:
             exceeded.append(f"{key} {actual:g}>{limit:g}")
+    for node in (it.get("node_budgets") or {}):
+        exceeded.extend(_node_budget_findings(it.get("node_budgets") or {}, node_usage_record,
+                                              node, exhausted=False))
     if exceeded:
         # Crossing the wall-clock cap after a bounded operation settles is a
         # reason to stop, not permission to erase the operation's real failure
@@ -1135,6 +1464,7 @@ def _execute(it: dict, timeout: int) -> dict:
                    "error": (summary.get("error") if failed_before_budget else "budget threshold reached")}
     it = load(it["id"])
     it["usage"] = usage_record
+    it["node_usage"] = node_usage_record
     it["attempts"] += 1
     it["runs"].append({"attempt": it["attempts"], "at": now(), "ok": bool(summary.get("ok")),
                        "run_dir": summary.get("run_dir"), "failed_ids": summary.get("failed_ids"),
@@ -1142,7 +1472,8 @@ def _execute(it: dict, timeout: int) -> dict:
                        "agent_checkpoint": summary.get("agent_checkpoint"),
                        "tokens": summary.get("tokens"), "cost": summary.get("cost"),
                        "attempt_tokens": attempt_tokens, "attempt_cost": attempt_cost,
-                       "usage_total": usage_record, "sha": summary.get("sha")})
+                       "usage_total": usage_record, "node_usage_total": node_usage_record,
+                       "sha": summary.get("sha")})
     it["reviews"] = summary.get("reviews") or it.get("reviews", [])
     it["head_sha"] = summary.get("sha") or (git(wt, "rev-parse", "HEAD") if wt.exists() else None)
     it["changed_scope"] = summary.get("changed") or (worktree.changed_files(project, wt) if wt.exists() else [])

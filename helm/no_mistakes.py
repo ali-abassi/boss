@@ -538,7 +538,8 @@ def _validate_item(item: dict, project: dict, wt: Path, capability: dict) -> dic
         raise HelmError("no-mistakes can push/open a PR and therefore requires non-local mode with authority >= 2")
     if item.get("kind") != "ship":
         raise HelmError("no-mistakes execution is available only for ship items")
-    if any(value is not None for value in (item.get("budgets") or {}).values()):
+    if (any(value is not None for value in (item.get("budgets") or {}).values())
+            or bool(item.get("node_budgets"))):
         raise HelmError("no-mistakes cannot prove First Mate token/cost/time caps; configured budgets fail closed")
     binding = capability.get("binding") or {}
     if binding.get("default_branch") != project.get("base"):

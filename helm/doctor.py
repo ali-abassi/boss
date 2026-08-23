@@ -1,7 +1,9 @@
 """Read-only control-plane audit and explicitly confirmed safe reconciliation."""
 from __future__ import annotations
+import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -16,7 +18,7 @@ from urllib.parse import unquote, urlparse
 from . import control, dispatch, gates, modes, scope, processes, ids, registry, worktree
 from .paths import (GRAPHS, dispatch_file, home, projects_file, supervisor_file,
                     wakes_file, work_root, worktree_root, supervisor_lock, authority_lock)
-from .util import HelmError, git_config, locked, now, sh, write_json
+from .util import HelmError, git_config, locked, now, read_json, sh, write_json
 
 VERSION = 1
 STATUSES = ("ok", "warning", "error", "unknown")
@@ -73,7 +75,7 @@ def _local_remote_read_paths(origin: str) -> tuple[Path, ...]:
     return (resolved,) if resolved.is_dir() else ()
 
 
-def _herdr_agent(name: str) -> dict:
+def _herdr_agent(name: str, identity: dict | None = None) -> dict:
     if not name:
         return {"state": "unknown", "reason": "Herdr agent identity is missing"}
     binary = shutil.which("herdr")
@@ -96,7 +98,21 @@ def _herdr_agent(name: str) -> dict:
     if not isinstance(agent, dict): return {"state": "unknown", "reason": "Herdr omitted agent evidence"}
     status = agent.get("agent_status") or agent.get("status") or agent.get("state")
     if status in {"idle", "done", "working", "blocked"} and agent.get("pane_id"):
-        return {"state": "live", "status": status, "pane_id": agent.get("pane_id"),
+        evidence = {"state": "live", "status": status, "agent": agent}
+        if identity is not None:
+            process = _run([binary, *(['--session', session] if session else []),
+                            "pane", "process-info", "--pane", str(agent["pane_id"])], timeout=10)
+            try:
+                process_info = (((json.loads(process.stdout).get("result") or {}).get("process_info"))
+                                if process.returncode == 0 else None)
+            except (json.JSONDecodeError, AttributeError):
+                process_info = None
+            from . import herdr
+            exact = herdr.exact_agent_liveness(identity, evidence,
+                                               process_info=process_info if isinstance(process_info, dict) else {})
+            return {**exact, "pane_id": agent.get("pane_id"),
+                    "workspace_id": agent.get("workspace_id")}
+        return {**evidence, "pane_id": agent.get("pane_id"),
                 "workspace_id": agent.get("workspace_id")}
     if status in {"dead", "exited", "stopped", "failed", "error", "closed", "terminated"}:
         return {"state": "dead", "status": status}
@@ -111,7 +127,7 @@ def _worktree_recovery_quiescence(item: dict) -> tuple[bool, dict]:
     if item.get("lease"):
         return False, {"reason": "item still has an execution lease"}
     session = item.get("session") or {}
-    session_state = (_herdr_agent(session.get("agent_name")).get("state")
+    session_state = (_herdr_agent(session.get("agent_name"), session).get("state")
                      if session.get("agent_name") else "none")
     if session_state not in {"none", "dead"}:
         return False, {"reason": f"implementer session liveness is {session_state}"}
@@ -119,7 +135,7 @@ def _worktree_recovery_quiescence(item: dict) -> tuple[bool, dict]:
     for launch in item.get("agent_launches") or []:
         if launch.get("state") not in {"reserved", "tab-created", "attested"}:
             continue
-        state = (_herdr_agent(launch.get("agent_name")).get("state")
+        state = (_herdr_agent(launch.get("agent_name"), launch).get("state")
                  if launch.get("agent_name") else "unknown")
         launch_states.append({"launch_id": launch.get("launch_id"), "state": state})
     if any(value["state"] != "dead" for value in launch_states):
@@ -327,9 +343,78 @@ def _item_schema(value: object, directory_name: str) -> str | None:
     event_ids = [event.get("id") for event in controls.get("events", [])]
     if any(not isinstance(event_id, str) for event_id in event_ids) or len(event_ids) != len(set(event_ids)):
         return "item control event identities are missing or duplicated"
-    for key in ("lease", "session", "checkpoint", "budgets", "usage", "promotion", "pr_delivery", "external_gate", "cancellation"):
+    for key in ("lease", "session", "checkpoint", "budgets", "usage", "node_budgets", "node_usage",
+                "promotion", "pr_delivery", "external_gate", "cancellation"):
         if value.get(key) is not None and not isinstance(value.get(key), dict):
             return f"item {key} must be an object or null"
+    item_usage = value.get("usage") or {}
+    for key in ("tokens", "cost", "seconds"):
+        measured = item_usage.get(key, 0)
+        if (not isinstance(measured, (int, float)) or isinstance(measured, bool)
+                or not math.isfinite(float(measured)) or measured < 0
+                or key == "tokens" and not float(measured).is_integer()):
+            return f"item usage {key} is malformed"
+    seconds_receipts = item_usage.get("seconds_receipts", {})
+    if (not isinstance(seconds_receipts, dict) or len(seconds_receipts) > MAX_RECORDS
+            or any(not isinstance(key, str) or not key
+                   or not isinstance(measured, (int, float)) or isinstance(measured, bool)
+                   or not math.isfinite(float(measured)) or measured < 0
+                   for key, measured in seconds_receipts.items())):
+        return "item usage seconds receipts are malformed"
+    node_budgets = value.get("node_budgets") or {}
+    allowed_nodes = {"implement", "scout", "review_correctness", "review_adversarial", "verify"}
+    if len(node_budgets) > len(allowed_nodes) or set(node_budgets) - allowed_nodes:
+        return "item node budgets contain an unknown runtime node"
+    for node, limits in node_budgets.items():
+        if not isinstance(limits, dict) or set(limits) - {"tokens", "cost", "seconds"}:
+            return f"item node budget {node} is malformed"
+        for key, limit in limits.items():
+            if (limit is not None and (not isinstance(limit, (int, float)) or isinstance(limit, bool)
+                                       or not math.isfinite(float(limit)) or limit <= 0)):
+                return f"item node budget {node}.{key} is malformed"
+        if node == "verify" and any(limits.get(key) is not None for key in ("tokens", "cost")):
+            return "item verify node budget contains a model-only metric"
+    node_usage = value.get("node_usage") or {}
+    if len(node_usage) > len(allowed_nodes) or set(node_usage) - allowed_nodes:
+        return "item node usage contains an unknown runtime node"
+    for node, usage in node_usage.items():
+        if not isinstance(usage, dict) or not isinstance(usage.get("receipts", {}), dict):
+            return f"item node usage {node} is malformed"
+        for key in ("tokens", "cost", "seconds"):
+            actual = usage.get(key, 0)
+            if (not isinstance(actual, (int, float)) or isinstance(actual, bool)
+                    or not math.isfinite(float(actual)) or actual < 0):
+                return f"item node usage {node}.{key} is malformed"
+        for key in ("tokens_evidence_complete", "cost_evidence_complete", "seconds_evidence_complete"):
+            if usage.get(key) is not None and not isinstance(usage.get(key), bool):
+                return f"item node usage {node}.{key} is malformed"
+        receipts = usage.get("receipts", {})
+        if len(receipts) > MAX_RECORDS or any(not isinstance(key, str) or not isinstance(receipt, dict)
+                                              for key, receipt in receipts.items()):
+            return f"item node usage {node} receipts are malformed"
+        for session_id, receipt in receipts.items():
+            if not session_id or len(session_id) > 256:
+                return f"item node usage {node} receipt identity is malformed"
+            for key in ("tokens", "cost"):
+                measured = receipt.get(key)
+                if (measured is not None
+                        and (not isinstance(measured, (int, float)) or isinstance(measured, bool)
+                             or not math.isfinite(float(measured)) or measured < 0
+                             or key == "tokens" and not float(measured).is_integer())):
+                    return f"item node usage {node} receipt {key} is malformed"
+                available = receipt.get(f"{key}_available")
+                if available is not None and not isinstance(available, bool):
+                    return f"item node usage {node} receipt {key} availability is malformed"
+            if receipt.get("tokens_available") is True and receipt.get("tokens") is None:
+                return f"item node usage {node} receipt tokens are missing"
+            if receipt.get("cost_available") is True and receipt.get("cost") is None:
+                return f"item node usage {node} receipt cost is missing"
+        receipt_tokens = sum(int(receipt.get("tokens") or 0) for receipt in receipts.values())
+        receipt_cost = sum(float(receipt.get("cost") or 0.0) for receipt in receipts.values())
+        if receipts and (usage.get("tokens", 0) != receipt_tokens
+                         or not math.isclose(float(usage.get("cost", 0.0)), receipt_cost,
+                                             rel_tol=1e-12, abs_tol=1e-12)):
+            return f"item node usage {node} receipt totals disagree"
     lease = value.get("lease") or {}
     if lease and (not isinstance(lease.get("pid"), int) or isinstance(lease.get("pid"), bool)
                   or lease.get("process_identity") is not None and not isinstance(lease.get("process_identity"), dict)
@@ -607,7 +692,7 @@ def audit(*, network: bool = True, probe_models: bool = False) -> dict:
         work_id, status = item["id"], item.get("status")
         lease = item.get("lease") or {}
         lease_state = _owner_state(lease.get("process_identity"), lease.get("pid")) if lease else "missing"
-        session = item.get("session") or {}; agent = _herdr_agent(session["agent_name"]) if session.get("agent_name") else {"state": "none"}
+        session = item.get("session") or {}; agent = _herdr_agent(session["agent_name"], session) if session.get("agent_name") else {"state": "none"}
         if status == "running":
             severity = "ok" if lease_state == "live" else "error" if lease_state == "dead" and agent["state"] in ("dead", "none") else "unknown"
             add(f"lease:{work_id}", severity, f"running lease is {lease_state}; session is {agent['state']}")
@@ -626,10 +711,9 @@ def audit(*, network: bool = True, probe_models: bool = False) -> dict:
             if launch.get("state") not in {"reserved", "tab-created", "attested"}:
                 continue
             launch_id, role, name = launch.get("launch_id"), launch.get("role"), launch.get("agent_name")
-            launch_agent = _herdr_agent(name) if name else {"state": "unknown", "reason": "agent name missing"}
+            launch_agent = _herdr_agent(name, launch) if name else {"state": "unknown", "reason": "agent name missing"}
             exact_live = (launch_agent.get("state") == "live"
-                          and (not launch.get("pane_id") or launch_agent.get("pane_id") == launch.get("pane_id"))
-                          and (not launch.get("workspace_id") or launch_agent.get("workspace_id") == launch.get("workspace_id")))
+                          and launch_agent.get("identity_verified") is True)
             if exact_live and launch.get("state") == "attested":
                 boundary = sandbox.verify_record(launch) and sandbox.verify_tool_record(launch)
                 signing = (isinstance(launch.get("event_public_key"), str)
@@ -900,7 +984,10 @@ def repair(*, confirm: bool, network: bool = True, auth_source: str | None = Non
                     else: skipped.append({**action, "skip": "evidence changed"})
             elif name == "close-dead-reviewer-launch":
                 work_id, launch_id = str(target.get("work_id")), str(target.get("launch_id"))
-                if _herdr_agent(action.get("agent_name")).get("state") != "dead":
+                current_item = read_json(home() / "work" / work_id / "item.json") or {}
+                current_launch = next((entry for entry in current_item.get("agent_launches", [])
+                                       if entry.get("launch_id") == launch_id), {})
+                if _herdr_agent(action.get("agent_name"), current_launch).get("state") != "dead":
                     skipped.append({**action, "skip": "reviewer liveness evidence changed"}); continue
                 def close_launch(item):
                     launch = next((entry for entry in item.get("agent_launches", [])
@@ -917,10 +1004,37 @@ def repair(*, confirm: bool, network: bool = True, auth_source: str | None = Non
                 work_id, expected_pid = str(target), action.get("pid")
                 expected_identity = action.get("process_identity")
                 expected_agent_name, expected_agent_state = action.get("agent_name"), action.get("agent_state")
-                current_agent_state = (_herdr_agent(expected_agent_name).get("state")
+                current_item = read_json(home() / "work" / work_id / "item.json") or {}
+                current_session = current_item.get("session") or {}
+                current_agent_state = (_herdr_agent(expected_agent_name, current_session).get("state")
                                        if expected_agent_name else "none")
                 if current_agent_state != expected_agent_state:
                     skipped.append({**action, "skip": "agent liveness evidence changed"}); continue
+                # A dead controller never reached the attempt-finalization write.
+                # Reconcile durable Pi receipts and conservatively count the
+                # open lease's elapsed wall time before authorizing recovery.
+                # The harvest is receipt-keyed, so a crash here is replay-safe.
+                lease_before = current_item.get("lease") or {}
+                elapsed = 0.0
+                try:
+                    started_epoch = dt.datetime.fromisoformat(
+                        str(lease_before.get("started")).replace("Z", "+00:00")).timestamp()
+                    elapsed = max(0.0, time.time() - started_epoch)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                try:
+                    from . import work as work_items
+                    current_item = work_items._harvest_usage(work_id, elapsed)
+                except (Exception, HelmError):
+                    skipped.append({**action, "skip": "dead execution usage could not be reconciled"})
+                    continue
+                current_session = current_item.get("session") or {}
+                current_agent_state = (_herdr_agent(expected_agent_name, current_session).get("state")
+                                       if expected_agent_name else "none")
+                if current_agent_state != expected_agent_state:
+                    skipped.append({**action, "skip": "agent liveness evidence changed after usage reconciliation"})
+                    continue
+                reconciled_revision = current_item.get("revision")
                 def pause(item):
                     lease = item.get("lease") or {}
                     current_name = (item.get("session") or {}).get("agent_name")
@@ -937,7 +1051,7 @@ def repair(*, confirm: bool, network: bool = True, auth_source: str | None = Non
                     item["ask"] = {"question": "Execution died. Inspect the preserved worktree and explicitly recover when ready.",
                                    "context": "Doctor quarantined positive death evidence; nothing was relaunched or discarded."}
                     item.setdefault("history", []).append({"at": now(), "from": "running", "to": "paused", "note": "confirmed doctor quarantine; work preserved"})
-                try: control.cas_update(work_id, pause, expected_revision=action.get("revision"))
+                try: control.cas_update(work_id, pause, expected_revision=reconciled_revision)
                 except HelmError: skipped.append({**action, "skip": "evidence changed"})
                 else: applied.append(action)
             elif name in ("hold-stale-claim", "remove-orphan-claim"):

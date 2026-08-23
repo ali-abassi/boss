@@ -64,14 +64,17 @@ class ControlPlaneTests(unittest.TestCase):
         item = control.consume("x", [event["id"]])
         self.assertEqual(item["controls"]["events"][-1]["state"], "consumed")
         self.assertEqual(item["controls"]["pending"], [])
-        for action, value in (("pause", None), ("resume", None), ("away", True), ("interrupt", None), ("recover", None)):
+        for action, value in (("pause", None), ("resume", None), ("interrupt", None), ("recover", None)):
             item = control.request("x", action, value)
             item = control.consume("x", [item["controls"]["events"][-1]["id"]])
         self.assertEqual([e["action"] for e in item["controls"]["events"]],
-                         ["steer", "pause", "resume", "away", "interrupt", "recover"])
+                         ["steer", "pause", "resume", "interrupt", "recover"])
+        with self.assertRaises(SystemExit):
+            control.request("x", "away", True)
         fields = control.inspection(item, "recent")
         for key in ("phase", "state", "last_activity", "branch", "sha", "changed_scope", "tests", "reviews",
-                    "blockers", "model", "tokens", "cost", "usage_evidence", "recent_output", "controls", "rigor"):
+                    "blockers", "model", "tokens", "cost", "usage_evidence", "node_budgets", "node_usage",
+                    "recent_output", "controls", "rigor"):
             self.assertIn(key, fields)
 
     def test_duplicate_and_racing_controls_are_idempotent_and_never_lost(self):

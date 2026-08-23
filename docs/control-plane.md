@@ -60,11 +60,13 @@ interrupts execution and asks before expansion.
 Rigor starts as scout, quick, standard, or high-risk with a recorded rationale and escalates on
 sensitive paths, expanded scope, or failed verification.
 
-`steer`, `pause`, `resume`, per-item `away`, `interrupt`, and `recover` are durable events. An
+`steer`, `pause`, `resume`, `interrupt`, and `recover` are durable per-item events. Away mode is
+one separately gated global supervisor state. Legacy `controls.away` data remains read-compatible
+but creates no command, event, or authority and is never consulted by the runtime. An
 optional request ID makes retried/racing delivery idempotent. Live steering
 is submitted without waiting on an unrelated active turn. Pause and interrupt stop the active
-turn, wait for settlement, ask the same agent to checkpoint, and then persist the paused state;
-the worktree remains the fallback checkpoint if the agent cannot respond. Pending events are
+turn, wait for settlement, and then persist the paused state without starting another model turn;
+the preserved worktree is the checkpoint. Pending events are
 claimed and reconciled against the exact Pi turn ledger so a crash after accepted input does
 not send the same steering twice. Inspection exposes phase/state, activity,
 branch/SHA, scopes, tests, reviews, blockers, frozen model/thinking rationale, usage evidence,
@@ -76,20 +78,32 @@ not an ordinary retryable failure: the scope claim and exact implementer/reviewe
 held until explicit reconciliation proves what stopped.
 
 Token, cost, and elapsed-time usage is durable and cumulative across the persistent
-implementer and every fresh reviewer. Limits are checked before each observable model turn;
-because providers report usage after a turn, one already-running turn can cross a threshold.
-The controller then settles without spending another checkpoint turn and refuses another
-turn until the captain explicitly raises the paused item's budget and resumes it.
+implementer and every fresh reviewer. The item-wide envelope is supplemented by explicit
+per-node envelopes for implementation/scouting, each independent reviewer, and verification.
+Model nodes use cumulative Pi-session receipts; verification accepts only elapsed-time limits.
+Limits are checked before, during, and after each node. Because providers report usage after a
+turn, one already-running turn can cross a threshold. The controller then settles without
+spending another checkpoint turn and refuses another turn until the captain explicitly raises
+the paused item's budget and resumes it. Missing or legacy-unattributable node evidence fails
+closed instead of being recorded as zero. Completed node receipts are durably checkpointed as
+the pipeline advances. Confirmed dead-process reconciliation harvests the open lease exactly once
+through a receipt key and accounts its active node before recovery can create another session.
 
 ## Supervisor, recovery, and away mode
 
 Item transitions feed private, fsynced atomic supervisor records and a durable wake queue. A watchdog uses only files,
 PIDs, clocks, Git/Herdr metadata, and network APIs—never a model—to classify each item as
 `healthy`, `waiting`, `needs-you`, `stale`, `wedged`, `dead`, or `unknown`. Unknown evidence is
-preserved as unknown. Durable wake keys deduplicate concurrent observers and survive daemon,
+preserved as unknown. A live Herdr name/pane is healthy only when the durable Pi session UUID's
+signed runtime attestation names the PID currently running in that exact pane; reused display
+coordinates remain unknown. Durable wake keys deduplicate concurrent observers and survive daemon,
 Herdr, and Pi restarts; claims have leases so a UI crash cannot lose a wake. Declared waits
 resurface after their deadline. Repeated unchanged stale evidence escalates to a bounded wedge
 reminder. The supervisor cannot kill, launch, release, discard, promote, or merge.
+
+The same exact identity check gates prompt submission, steering, cooperative interrupt, and tab
+closure. If the name, pane, UUID, attested PID, or durable session evidence no longer agrees, the
+operation fails as unknown and retains recovery custody rather than acting on a replacement tab.
 
 Doctor audits tools, worker PIDs, tabs, leases, claims, session identities, JSON state,
 worktrees, auth, models, test commands, clone freshness, graphs, and the optional gate boundary.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import copy
 import json
 import os
 import shlex
@@ -390,13 +391,35 @@ def cmd_projects(a):
         print(f"{p['id']:<20} {p['mode']:<12} auth {p['authority']}  open {len(open_):<3} {p['path']}")
 
 
+def _node_budget_args(token_specs=None, cost_specs=None, second_specs=None) -> dict:
+    result = {}
+    for key, specs, converter in (("tokens", token_specs or [], int),
+                                  ("cost", cost_specs or [], float),
+                                  ("seconds", second_specs or [], int)):
+        for spec in specs:
+            node, separator, raw = str(spec).partition("=")
+            if not separator or not node or not raw:
+                raise HelmError(f"--node-max-{key} requires NODE=LIMIT")
+            if node not in work.BUDGET_NODES:
+                raise HelmError(f"unknown budget node '{node}'; choose from {', '.join(work.BUDGET_NODES)}")
+            if key in result.setdefault(node, {}):
+                raise HelmError(f"duplicate {key} budget for node '{node}'")
+            try:
+                value = converter(raw)
+            except ValueError:
+                raise HelmError(f"{node} {key} budget must be numeric") from None
+            result[node][key] = value
+    return work.validate_node_budgets(result)
+
+
 def cmd_task(a):
     text = Path(a.file).read_text() if a.file else " ".join(a.text)
     if not text.strip():
         raise HelmError("empty task")
+    node_budgets = _node_budget_args(a.node_max_tokens, a.node_max_cost, a.node_max_seconds)
     it = work.create(a.project, text, a.kind, a.labels.split(",") if a.labels else [], a.max_attempts,
                      a.scope.split(",") if a.scope else None, a.model, a.thinking,
-                     a.max_tokens, a.max_cost, a.max_seconds)
+                     a.max_tokens, a.max_cost, a.max_seconds, node_budgets)
     out(it, a.json, f"{it['id']} queued → {it['rigor']['level']} rigor · graph {it['dispatch']['graph']} (rule {it['dispatch']['rule']})")
 
 
@@ -443,9 +466,7 @@ def cmd_control(a):
     session = it.get("session") or {}
     target = session.get("agent_name")
     value = " ".join(getattr(a, "value", []) or [])
-    if a.action == "away" and value.lower() not in ("on", "off", "true", "false", "1", "0"):
-        raise HelmError("away requires on or off")
-    it = control.request(a.id, a.action, value if a.action == "steer" else (value.lower() in ("on", "true", "1") if a.action == "away" else None),
+    it = control.request(a.id, a.action, value if a.action == "steer" else None,
                          request_id=getattr(a, "request_id", None))
     deduplicated = it.pop("_control_deduplicated", False)
     events = it.get("controls", {}).get("events") or []
@@ -489,17 +510,30 @@ def cmd_control(a):
 
 def cmd_budget(a):
     updates = {"tokens": a.tokens, "cost": a.cost, "seconds": a.seconds}
-    if all(value is None for value in updates.values()):
-        raise HelmError("budget requires at least one of --tokens, --cost, or --seconds")
-    if any(value is not None and value <= 0 for value in updates.values()):
+    node_updates = _node_budget_args(a.node_max_tokens, a.node_max_cost, a.node_max_seconds)
+    if all(value is None for value in updates.values()) and not node_updates:
+        raise HelmError("budget requires at least one item or per-node limit")
+    if any(value is not None and not work.valid_budget_value(value) for value in updates.values()):
         raise HelmError("budget limits must be positive")
     def mutate(item):
         if item.get("status") not in ("paused", "needs-you", "failed"):
             raise HelmError("budget changes require a paused/needs-you/failed item")
         before = dict(item.get("budgets") or {})
+        before_nodes = copy.deepcopy(item.get("node_budgets") or {})
         item.setdefault("budgets", {}).update({key: value for key, value in updates.items() if value is not None})
+        merged_nodes = copy.deepcopy(item.get("node_budgets") or {})
+        for node, limits in node_updates.items():
+            merged_nodes.setdefault(node, {}).update(limits)
+        item["node_budgets"] = work.validate_node_budgets(merged_nodes)
+        historical = bool(item.get("attempts") or item.get("runs") or item.get("session") or item.get("agent_launches"))
+        usage = item.setdefault("node_usage", {})
+        for node in node_updates:
+            if node not in usage:
+                if historical:
+                    raise HelmError(f"cannot add a retroactive {node} budget after model/runtime history; usage is unattributable")
+                usage[node] = work._new_node_usage()
         item.setdefault("history", []).append({"at": now(), "from": item.get("status"), "to": item.get("status"),
-                                               "note": f"captain updated budget from {before} to {item['budgets']}"})
+                                               "note": f"captain updated budget from {before}/{before_nodes} to {item['budgets']}/{item['node_budgets']}"})
     item = control.cas_update(a.id, mutate)
     out(control.redact(item), a.json, f"{a.id}: budget updated; use `helm resume {a.id}` when ready")
 
@@ -779,14 +813,20 @@ def _main(argv=None):
     p.add_argument("--scope", help="comma-separated declared path/glob claims; unknown serializes")
     p.add_argument("--model", help="captain override for implement/scout provider/model"); p.add_argument("--thinking", choices=("off","minimal","low","medium","high","xhigh"))
     p.add_argument("--max-tokens", type=int); p.add_argument("--max-cost", type=float); p.add_argument("--max-seconds", type=int)
+    p.add_argument("--node-max-tokens", action="append", default=[], metavar="NODE=LIMIT")
+    p.add_argument("--node-max-cost", action="append", default=[], metavar="NODE=LIMIT")
+    p.add_argument("--node-max-seconds", action="append", default=[], metavar="NODE=LIMIT")
     p = S("work", cmd_work, "list work items"); p.add_argument("--all", action="store_true")
     p = S("show", cmd_show, "show one item with history"); p.add_argument("id")
     p = S("inspect", cmd_inspect, "secret-safe live item inspection"); p.add_argument("id"); p.add_argument("--lines", type=int, default=120)
-    for action in ("steer", "pause", "resume", "away", "interrupt", "recover"):
+    for action in ("steer", "pause", "resume", "interrupt", "recover"):
         p = S(action, cmd_control, f"{action} a persistent item"); p.set_defaults(action=action); p.add_argument("id"); p.add_argument("value", nargs="*")
         p.add_argument("--request-id", help="idempotency key for retried/racing control delivery")
     p = S("budget", cmd_budget, "explicitly update a paused item's cumulative limits")
     p.add_argument("id"); p.add_argument("--tokens", type=int); p.add_argument("--cost", type=float); p.add_argument("--seconds", type=int)
+    p.add_argument("--node-max-tokens", action="append", default=[], metavar="NODE=LIMIT")
+    p.add_argument("--node-max-cost", action="append", default=[], metavar="NODE=LIMIT")
+    p.add_argument("--node-max-seconds", action="append", default=[], metavar="NODE=LIMIT")
     p = S("scope", cmd_scope, "replace a paused item's declared scope"); p.add_argument("id"); p.add_argument("paths")
     p = S("inbox", cmd_inbox, "what needs the captain"); p.add_argument("--hints", action="store_true", help="show the helm commands (for the first mate)")
     p = S("respond", cmd_respond, "answer a question / give guidance, requeue"); p.add_argument("id"); p.add_argument("guidance", nargs="+")

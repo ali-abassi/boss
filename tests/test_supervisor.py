@@ -155,12 +155,14 @@ class SupervisorTests(unittest.TestCase):
         session = {"agent_name": "impl-p", "agent_session_id": "durable-real-id", "pane_id": "w1:p1"}
         item = self.item(session=session)
         live = {"state": "live", "agent": {"pane_id": "w1:p1"}}
-        with mock.patch("helm.herdr.agent_liveness", return_value=live):
+        with mock.patch("helm.herdr.agent_liveness", return_value=live), \
+             mock.patch("helm.herdr.exact_agent_liveness", side_effect=lambda _identity, evidence: evidence):
             self.assertEqual(supervisor.observe(item, at=self.epoch)["classification"], "healthy")
         with mock.patch("helm.herdr.agent_liveness", return_value={"state": "unknown", "reason": "Herdr restarting"}):
             self.assertEqual(supervisor.observe(item, at=self.epoch + 1)["classification"], "unknown")
         self.assertEqual(supervisor.pending()[0]["classification"], "unknown")
-        with mock.patch("helm.herdr.agent_liveness", return_value=live):
+        with mock.patch("helm.herdr.agent_liveness", return_value=live), \
+             mock.patch("helm.herdr.exact_agent_liveness", side_effect=lambda _identity, evidence: evidence):
             self.assertEqual(supervisor.observe(item, at=self.epoch + 2)["classification"], "healthy")
         self.assertEqual(item["session"]["agent_session_id"], "durable-real-id")
 
@@ -188,7 +190,9 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(supervisor.observe(item, at=self.epoch + 1)["classification"], "unknown")
         with mock.patch("helm.herdr.agent_liveness", return_value={
                 "state": "live", "agent": {"pane_id": "w1:p7", "workspace_id": "w1"}}):
-            self.assertEqual(supervisor.observe(item, at=self.epoch + 2)["classification"], "healthy")
+            observation = supervisor.observe(item, at=self.epoch + 2)
+            self.assertEqual(observation["classification"], "unknown")
+            self.assertIn("model/thinking evidence is missing", observation["reason"])
 
     def test_unknown_heartbeats_do_not_create_duplicate_wakes(self):
         from unittest import mock

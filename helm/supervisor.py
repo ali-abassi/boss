@@ -255,12 +255,7 @@ def _agent_evidence(item: dict) -> dict | None:
         return None
     from . import herdr
     evidence = herdr.agent_liveness(target)
-    if evidence.get("state") == "live":
-        observed = evidence.get("agent") or {}
-        for key in ("pane_id", "workspace_id"):
-            if identity.get(key) and observed.get(key) != identity.get(key):
-                return {"state": "unknown", "reason": f"Herdr {key} no longer matches the durable launch"}
-    return evidence
+    return herdr.exact_agent_liveness(identity, evidence)
 
 
 def _enqueue(queue: dict, item: dict, observation: dict, key: str, epoch: float) -> bool:

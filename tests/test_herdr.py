@@ -292,6 +292,8 @@ class HerdrTests(unittest.TestCase):
                 return {"result": {"agent": live}}
             return {}
         with mock.patch.object(herdr, "agent_liveness", return_value={"state": "live", "agent": live}), \
+             mock.patch.object(herdr, "exact_agent_liveness",
+                               return_value={"state": "live", "identity_verified": True}), \
              mock.patch.object(herdr, "runtime_activity", return_value={"runtime_input_sequence": 0}), \
              mock.patch.object(herdr, "_runtime_input", return_value=None), \
              mock.patch.object(herdr, "focused_tab", return_value=None), \
@@ -406,6 +408,38 @@ class HerdrTests(unittest.TestCase):
         starts = [call for call in self.calls() if call[:2] == ["agent", "start"]]
         self.assertEqual(len(starts), 2, "adversarial reviewer must not start after the aggregate cap")
 
+    def test_per_node_reviewer_budget_is_receipted_and_stops_later_nodes(self):
+        self.env.pop("HELM_PIW", None)
+        self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        self.helm("add", str(self.proj), "--id", "node-cap", "--test", "true", "--mode", "high-assurance")
+        item = json.loads(self.helm("task", "node-cap", "bounded correctness review",
+                                    "--node-max-tokens", "review_correctness=5", "--json").stdout)
+        self.env["FAKE_HERDR_EXECUTE"] = "1"
+        self.helm("run-once")
+        shown = json.loads(self.helm("show", item["id"], "--json").stdout)
+        self.assertEqual(shown["status"], "paused", shown)
+        self.assertEqual(shown["node_usage"]["implement"]["tokens"], 10)
+        self.assertEqual(shown["node_usage"]["review_correctness"]["tokens"], 10)
+        self.assertIn("review_correctness tokens budget exceeded", shown["ask"]["context"])
+        starts = [call for call in self.calls() if call[:2] == ["agent", "start"]]
+        self.assertEqual(len(starts), 2, "adversarial reviewer must not start after the node cap")
+
+    def test_verify_node_seconds_cap_times_out_and_never_starts_a_reviewer(self):
+        self.env.pop("HELM_PIW", None)
+        self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        self.helm("add", str(self.proj), "--id", "verify-cap", "--test", "sleep 3",
+                  "--mode", "high-assurance")
+        item = json.loads(self.helm("task", "verify-cap", "bounded verify",
+                                    "--node-max-seconds", "verify=1", "--json").stdout)
+        self.env["FAKE_HERDR_EXECUTE"] = "1"
+        self.helm("run-once")
+        shown = json.loads(self.helm("show", item["id"], "--json").stdout)
+        self.assertEqual(shown["status"], "paused", shown)
+        self.assertEqual(shown["runs"][-1]["failed_ids"], ["verify"])
+        self.assertGreaterEqual(shown["node_usage"]["verify"]["seconds"], 0.9)
+        starts = [call for call in self.calls() if call[:2] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+
     def test_elapsed_budget_consumed_by_verification_never_starts_a_reviewer(self):
         self.env.pop("HELM_PIW", None)
         self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
@@ -494,8 +528,17 @@ class HerdrTests(unittest.TestCase):
         live = {"state": "live", "agent": {"pane_id": "w1:p7", "tab_id": "w1:t7",
                                                "agent_session_id": "session-1"}}
         with mock.patch.object(herdr, "agent_liveness", return_value=live), \
+             mock.patch.object(herdr, "exact_agent_liveness",
+                               return_value={"state": "live", "identity_verified": True}), \
              mock.patch.object(herdr, "session_evidence", return_value={}), \
              mock.patch.object(herdr, "runtime_activity", return_value={"runtime_turn_pending": True}), \
+             mock.patch.object(herdr, "_tab_matches", return_value=True), \
+             mock.patch.object(herdr, "close_tab") as close:
+            self.assertFalse(herdr.close_agent_tab(session))
+            close.assert_not_called()
+        reused = {"state": "live", "agent": {"pane_id": "w1:p7", "tab_id": "w1:t7",
+                                                "agent_session_id": "replacement"}}
+        with mock.patch.object(herdr, "agent_liveness", return_value=reused), \
              mock.patch.object(herdr, "_tab_matches", return_value=True), \
              mock.patch.object(herdr, "close_tab") as close:
             self.assertFalse(herdr.close_agent_tab(session))
@@ -505,6 +548,48 @@ class HerdrTests(unittest.TestCase):
              mock.patch.object(herdr, "close_tab") as close:
             self.assertFalse(herdr.close_agent_tab(session))
             close.assert_not_called()
+
+    def test_exact_liveness_rejects_reused_pane_or_different_session_uuid(self):
+        from helm import herdr
+        from helm.util import HelmError
+        identity = {"agent_name": "impl", "agent_session_id": "durable-session",
+                    "pane_id": "w1:p7", "workspace_id": "w1", "tab_id": "w1:t7",
+                    "resolved_model": "openai-codex/gpt-5.6-sol", "resolved_thinking": "high",
+                    "agent_cwd": str(self.proj)}
+        different = {"state": "live", "agent": {"name": "impl", "pane_id": "w1:p7",
+                     "workspace_id": "w1", "tab_id": "w1:t7", "agent_session_id": "replacement"}}
+        self.assertEqual(herdr.exact_agent_liveness(identity, different)["state"], "unknown")
+
+        # Herdr may omit the Pi UUID.  In that case the signed attestation and
+        # current pane PID are mandatory; old evidence from a reused pane fails.
+        omitted = {"state": "live", "agent": {"name": "impl", "pane_id": "w1:p7",
+                   "workspace_id": "w1", "tab_id": "w1:t7"}}
+        with mock.patch.object(herdr, "_verify_runtime_attestation",
+                               side_effect=HelmError("attested PID is no longer in this pane")):
+            result = herdr.exact_agent_liveness(identity, omitted, process_info={})
+        self.assertEqual(result["state"], "unknown")
+        self.assertIn("attested PID", result["reason"])
+        with mock.patch.object(herdr, "_verify_runtime_attestation", return_value={"pid": 123}), \
+             mock.patch.object(herdr, "session_evidence",
+                               return_value={"agent_session_id": "durable-session"}):
+            result = herdr.exact_agent_liveness(identity, omitted, process_info={})
+        self.assertEqual(result["state"], "live")
+        self.assertTrue(result["identity_verified"])
+
+    def test_manual_pause_settles_without_an_unbudgeted_checkpoint_turn(self):
+        from helm import herdr
+        identity = {"agent_name": "impl", "agent_session_id": "session-1"}
+        with mock.patch.object(herdr, "runtime_activity", return_value={"runtime_input_sequence": 1}), \
+             mock.patch.object(herdr, "_runtime_settled", side_effect=[False, True, True]), \
+             mock.patch.object(herdr, "interrupt_agent") as interrupt, \
+             mock.patch.object(herdr, "record_runtime_anchor", side_effect=lambda value: value), \
+             mock.patch.object(herdr, "agent_get", return_value=identity), \
+             mock.patch.object(herdr, "prompt_agent") as prompt:
+            _, finding = herdr._wait_runtime_monitored_inner(
+                "impl", 5, lambda: {"control": "pause"}, identity, 1)
+        interrupt.assert_called_once_with("impl", identity)
+        prompt.assert_not_called()
+        self.assertEqual(finding["agent_checkpoint"], "settled-without-extra-model-turn")
 
     def test_reviewer_loss_never_becomes_approval_or_delivery(self):
         env = {**self.env, "FAKE_HERDR_EXECUTE": "1", "FAKE_HERDR_REVIEWER_LOSS": "1",

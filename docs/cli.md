@@ -9,10 +9,12 @@ helm add PATH [--id ID] [--mode local-only|direct-pr|high-assurance] [--gate nat
 helm set ID [--mode M] [--gate G] [--authority N] [--test CMD]
 helm projects
 helm task PROJECT "request" [--kind ship|scout] [--scope GLOBS] [--model PROVIDER/MODEL] [--thinking high] [--max-tokens N] [--max-cost N] [--max-seconds N]
+          [--node-max-tokens NODE=N] [--node-max-cost NODE=N] [--node-max-seconds NODE=N]
 helm work [--all] · helm show ID · helm inspect ID · helm inbox [--hints]
 helm steer ID "guidance" · helm pause ID · helm resume ID · helm interrupt ID · helm recover ID [--request-id KEY]
 helm budget ID [--tokens N] [--cost N] [--seconds N]
-helm away ID on|off · helm scope ID "src/api/**,tests/api/**" · helm wait ID 20m "reason"
+          [--node-max-tokens NODE=N] [--node-max-cost NODE=N] [--node-max-seconds NODE=N]
+helm scope ID "src/api/**,tests/api/**" · helm wait ID 20m "reason"
 helm respond ID "captain's answer" · helm retry ID · helm cancel ID [--discard]
 helm promote ID --confirm
 helm up [--workers N] · helm down · helm status · helm watch [--once] · helm tail ID
@@ -68,17 +70,23 @@ hash-chained, prompt-free input/start/settled ledger. This is not user-account i
 Production launch fails closed when Herdr or the boundaries are absent; the checked-in inert
 runner is only a deterministic test fixture and is never represented as a production worker.
 
-Budgets are cumulative across the persistent implementer and all fresh reviewers. They are
-enforced before the next observable turn and can stop between reviewer roles; an already-running
-provider turn may cross a threshold before usage is returned. No extra checkpoint model turn is
-spent after budget interruption. `helm budget` changes a limit only on a paused, needs-you, or
-failed item, and `resume` still refuses an exhausted limit.
+Item budgets are cumulative across the persistent implementer and all fresh reviewers. Optional
+per-node limits independently cover `implement`, `scout`, `review_correctness`,
+`review_adversarial`, and the non-model `verify` node (`verify` accepts seconds only). Each model
+node keeps cumulative per-session receipts, and every node keeps elapsed-time evidence. Limits
+are enforced before, during, and after the node; an already-running provider turn may cross a
+threshold before usage is returned. Pause, interrupt, timeout, and budget settlement spend no
+extra checkpoint model turn—the preserved worktree is the checkpoint. Missing or historically
+unattributable node evidence fails closed. The inert deterministic graph seam refuses per-node
+budgets rather than fabricating attribution. `helm budget` changes a limit only on a paused,
+needs-you, or failed item; a new node limit cannot be applied retroactively after unattributed
+history, and `resume` still refuses an exhausted limit.
 
 The `--gate no-mistakes` provider is a separate, optional external transaction—not the native
 `high-assurance` graph. It accepts only the pinned v1.57.1 signed macOS release and an already
 initialized exact repository binding. First Mate does not install or repair it. The item must be
 a ship item in non-local mode with authority at least 2, a clean exact-SHA First Mate verification,
-and no configured First Mate token/cost/time limit. The request is journaled before one
+and no configured First Mate item-wide or per-node token/cost/time limit. The request is journaled before one
 `axi run`; uncertain requests are never repeated. `gate-status` reads the exact SQLite receipt,
 `gate-reconcile` durably records current external evidence without issuing another command, and
 `gate-respond` sends one captain decision for the exact observed step. `fix` requires a subset of

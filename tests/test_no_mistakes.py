@@ -391,6 +391,15 @@ class NoMistakesAdapterTests(unittest.TestCase):
             gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         driver.assert_not_called()
 
+    def test_configured_node_budget_fails_before_external_invocation(self):
+        item = work.load(self.work_id)
+        item["node_budgets"] = {"implement": {"tokens": 100, "cost": None, "seconds": None}}
+        item["node_usage"] = {"implement": work._new_node_usage()}
+        work.save(item)
+        with mock.patch("helm.no_mistakes.invoke") as driver, self.assertRaises(SystemExit):
+            gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
+        driver.assert_not_called()
+
 
 class BinaryAttestationTests(unittest.TestCase):
     def test_release_hash_build_signature_requirement_and_architecture_are_all_required(self):

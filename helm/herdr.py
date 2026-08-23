@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+import math
 import os
 import re
 import secrets
@@ -229,6 +230,7 @@ def session_evidence(agent: dict) -> dict:
     evidence = {"agent_session_path": str(path)}
     total_tokens, total_cost = 0, 0.0
     saw_tokens = saw_cost = False
+    invalid_tokens = invalid_cost = False
     try:
         with path.open() as handle:
             for line in handle:
@@ -243,15 +245,26 @@ def session_evidence(agent: dict) -> dict:
                     evidence["thinking"] = event["thinkingLevel"]
                 message = event.get("message") or {}
                 usage = message.get("usage") or {}
-                if message.get("role") == "assistant" and isinstance(usage.get("totalTokens"), (int, float)):
-                    total_tokens += usage["totalTokens"]; saw_tokens = True
+                token_value = usage.get("totalTokens")
+                token_valid = (isinstance(token_value, (int, float)) and not isinstance(token_value, bool)
+                               and math.isfinite(float(token_value)) and float(token_value) >= 0
+                               and float(token_value).is_integer())
+                if message.get("role") == "assistant":
+                    if token_valid:
+                        total_tokens += int(token_value); saw_tokens = True
+                    else:
+                        invalid_tokens = True
                     cost = usage.get("cost") or {}
-                    if isinstance(cost.get("total"), (int, float)):
-                        total_cost += cost["total"]; saw_cost = True
+                    cost_value = cost.get("total")
+                    if (isinstance(cost_value, (int, float)) and not isinstance(cost_value, bool)
+                            and math.isfinite(float(cost_value)) and float(cost_value) >= 0):
+                        total_cost += float(cost_value); saw_cost = True
+                    else:
+                        invalid_cost = True
     except OSError:
         return {}
-    if saw_tokens: evidence["tokens"] = total_tokens
-    if saw_cost: evidence["cost"] = total_cost
+    if saw_tokens and not invalid_tokens: evidence["tokens"] = total_tokens
+    if saw_cost and not invalid_cost: evidence["cost"] = total_cost
     return evidence
 
 
@@ -260,6 +273,10 @@ def agent_get(target: str, identity: dict | None = None) -> dict | None:
     evidence = agent_liveness(target)
     if evidence["state"] != "live":
         return None
+    if identity:
+        exact = exact_agent_liveness(identity, evidence)
+        if exact.get("state") != "live" or exact.get("identity_verified") is not True:
+            return None
     agent = {**(identity or {}), **evidence["agent"]}
     return {**agent, **session_evidence(agent), **runtime_activity(agent)}
 
@@ -272,7 +289,8 @@ def _reported_model(agent: dict) -> str | None:
     return str(model) if model else None
 
 
-def _verify_runtime_attestation(agent: dict, model: str, thinking: str) -> dict | None:
+def _verify_runtime_attestation(agent: dict, model: str, thinking: str, *,
+                                process_info: dict | None = None) -> dict | None:
     """Verify evidence emitted by the actual Pi process and bind it to the Herdr pane."""
     raw_path = agent.get("attestation_path")
     if not raw_path:
@@ -336,8 +354,11 @@ def _verify_runtime_attestation(agent: dict, model: str, thinking: str) -> dict 
     herdr_evidence = data.get("herdr") or {}
     if herdr_evidence.get("pane_id") and herdr_evidence.get("pane_id") != agent.get("pane_id"):
         raise HelmError("Pi runtime attestation is bound to a different Herdr pane")
-    process = _cli("pane", "process-info", "--pane", str(agent.get("pane_id")))
-    info = ((process or {}).get("result") or {}).get("process_info") or {}
+    if process_info is None:
+        process = _cli("pane", "process-info", "--pane", str(agent.get("pane_id")))
+        info = ((process or {}).get("result") or {}).get("process_info") or {}
+    else:
+        info = process_info
     foreground = info.get("foreground_processes") or []
     if pid not in {entry.get("pid") for entry in foreground}:
         raise HelmError("Pi runtime attestation PID is not the live Herdr pane process")
@@ -347,6 +368,63 @@ def _verify_runtime_attestation(agent: dict, model: str, thinking: str) -> dict 
     return {**data, "sha256": digest, "events_inode": events_stat.st_ino,
             "events_device": events_stat.st_dev,
             "event_public_key_sha256": hashlib.sha256(public_der).hexdigest()}
+
+
+def exact_agent_liveness(identity: dict, evidence: dict | None = None, *,
+                         process_info: dict | None = None) -> dict:
+    """Bind a live Herdr name/pane to one durable, attested Pi session UUID.
+
+    A name, pane, or workspace can be reused after a crash.  Those display
+    coordinates are therefore only routing hints.  Positive liveness requires
+    the controller-owned UUID and attestation to name the PID currently running
+    in that exact pane.  Any missing or conflicting evidence remains unknown.
+    """
+    from .util import HelmError
+    if not isinstance(identity, dict):
+        return {"state": "unknown", "reason": "durable Herdr identity is missing"}
+    target = str(identity.get("agent_name") or "")
+    observed_evidence = evidence if evidence is not None else agent_liveness(target)
+    if observed_evidence.get("state") != "live":
+        return observed_evidence
+    observed = observed_evidence.get("agent") or {}
+    if not isinstance(observed, dict):
+        return {"state": "unknown", "reason": "Herdr omitted the live agent identity"}
+    durable_session = identity.get("agent_session_id")
+    if not target or not durable_session:
+        return {"state": "unknown", "reason": "durable Pi session UUID is missing"}
+    observed_name = observed.get("agent_name") or observed.get("name")
+    if observed_name is not None and str(observed_name) != target:
+        return {"state": "unknown", "reason": "Herdr agent name no longer matches the durable launch"}
+    for key in ("pane_id", "workspace_id"):
+        expected = identity.get(key)
+        if expected is not None and observed.get(key) != expected:
+            return {"state": "unknown", "reason": f"Herdr {key} no longer matches the durable launch"}
+    if identity.get("tab_id") is not None and observed.get("tab_id") is not None \
+            and observed.get("tab_id") != identity.get("tab_id"):
+        return {"state": "unknown", "reason": "Herdr tab_id no longer matches the durable launch"}
+    observed_session = (observed.get("agent_session_id") or observed.get("session_id")
+                        or (observed.get("metadata") or {}).get("agent_session_id"))
+    if observed_session is not None and str(observed_session) != str(durable_session):
+        return {"state": "unknown", "reason": "Herdr live agent reports a different Pi session UUID"}
+    model = identity.get("resolved_model") or identity.get("model")
+    thinking = identity.get("resolved_thinking") or identity.get("thinking")
+    if not model or not thinking:
+        return {"state": "unknown", "reason": "durable agent model/thinking evidence is missing"}
+    candidate = {**observed, **identity,
+                 "agent_cwd": identity.get("agent_cwd") or identity.get("cwd")}
+    try:
+        runtime = _verify_runtime_attestation(candidate, str(model), str(thinking),
+                                              process_info=process_info)
+        if not runtime:
+            raise HelmError("durable Pi runtime attestation is missing")
+        session = session_evidence(candidate)
+        if (session.get("agent_session_id") is not None
+                and str(session["agent_session_id"]) != str(durable_session)):
+            raise HelmError("durable Pi session file reports a different UUID")
+    except (HelmError, OSError, ValueError, TypeError) as exc:
+        return {"state": "unknown", "reason": f"live Pi identity is unproven: {getattr(exc, 'msg', None) or exc}"}
+    return {**observed_evidence, "identity_verified": True,
+            "durable_session_id": str(durable_session)}
 
 
 def _runtime_events(agent: dict) -> list[dict]:
@@ -475,11 +553,16 @@ def runtime_activity(agent: dict) -> dict:
         return {}
     events = _runtime_events(agent)
     inputs = [event for event in events if event["type"] == "input"]
+    settled_sequences = [event["input_sequence"] for event in events
+                         if event["type"] == "agent_settled"]
     if not inputs:
-        return {"runtime_turn_pending": False, "runtime_input_sequence": 0}
+        return {"runtime_turn_pending": False, "runtime_input_sequence": 0,
+                "runtime_settled_sequence": max(settled_sequences, default=0)}
     latest = inputs[-1]["input_sequence"]
-    settled = any(event["type"] == "agent_settled" and event["input_sequence"] >= latest for event in events)
+    settled_sequence = max(settled_sequences, default=0)
+    settled = settled_sequence >= latest
     return {"runtime_turn_pending": not settled, "runtime_input_sequence": latest,
+            "runtime_settled_sequence": settled_sequence,
             "runtime_last_input_at": inputs[-1].get("at"),
             "runtime_anchor_event_sequence": int(events[-1]["event_sequence"]),
             "runtime_anchor_event_sha256": events[-1]["event_sha256"]}
@@ -786,7 +869,7 @@ def agent_read(target: str, lines: int = 120) -> str:
 
 
 def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: bool = False,
-                 agent_env: dict[str, str] | None = None) -> dict:
+                 agent_env: dict[str, str] | None = None, node: str | None = None) -> dict:
     """Reconnect a live identity; start a replacement only from one-use recovery authority."""
     if not inside():
         from .util import HelmError
@@ -813,7 +896,8 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
                 from .util import HelmError
                 raise HelmError("Herdr agent name now refers to a different session; refusing identity drift")
         if live:
-            return {**existing, **live, "reconnected": True, "liveness_validated_at": now()}
+            return {**existing, **live, "node": node or existing.get("node"),
+                    "reconnected": True, "liveness_validated_at": now()}
         from .util import HelmError
         if liveness.get("state") != "dead":
             raise HelmError("existing Herdr session liveness is unknown; refusing an automatic replacement")
@@ -856,6 +940,7 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
         "agent_name": name, "role": "reviewer" if reviewer else "implementer",
         "state": "reserved", "reserved_at": now(), "cwd": str(cwd.resolve()),
         "model": model, "thinking": thinking, "label": label,
+        "node": node,
         "session_dir": str(session_dir), "attestation_path": str(attestation_path),
         "agent_events_path": str(events_path), "attestation_nonce": nonce,
         "sandbox_profile": sandbox_record["profile"],
@@ -951,7 +1036,7 @@ def ensure_agent(item: dict, cwd: Path, model: str, thinking: str, *, reviewer: 
         validate_agent(agent, model, thinking)
         session = {**tab, **agent, "agent_name": agent.get("name") or name, "created": now(),
                    "reconnected": False, "liveness_validated_at": now(), "resolved_model": model,
-                   "resolved_thinking": thinking}
+                   "resolved_thinking": thinking, "node": node}
         _finalize_launch(item, launch_id, session, reviewer=reviewer)
     except BaseException as exc:
         closed = close_tab(tab["tab_id"])
@@ -994,6 +1079,10 @@ def prompt_agent_async(target: str, text: str, identity: dict | None = None) -> 
     before = agent_liveness(target)
     if before.get("state") != "live":
         raise HelmError("cannot submit input without a positively live Herdr agent")
+    if identity:
+        exact = exact_agent_liveness(identity, before)
+        if exact.get("state") != "live" or exact.get("identity_verified") is not True:
+            raise HelmError("cannot submit input without the exact durable Pi identity")
     before_agent = before["agent"]
     before_seq = before_agent.get("state_change_seq")
     before_status = before_agent.get("agent_status") or before_agent.get("status")
@@ -1091,11 +1180,11 @@ def _wait_runtime_monitored_inner(target: str, timeout: int, monitor, identity: 
             return record_runtime_anchor(live), None
         finding = monitor()
         if finding:
-            interrupt_agent(target)
+            interrupt_agent(target, identity)
             break
         time.sleep(0.2)
     if not finding:
-        interrupt_agent(target)
+        interrupt_agent(target, identity)
         finding = {"control": "timeout", "reason": "Pi turn reached its bounded wait"}
     settle_deadline = time.monotonic() + 30
     while time.monotonic() < settle_deadline:
@@ -1106,24 +1195,10 @@ def _wait_runtime_monitored_inner(target: str, timeout: int, monitor, identity: 
     if not _runtime_settled(identity, sequence):
         raise UnsettledAgentError("agent did not settle after cooperative interrupt; scope must remain held")
     identity = record_runtime_anchor(identity)
-    if isinstance(finding, dict) and finding.get("control") in ("budget", "timeout"):
-        # The interrupted turn is settled. Another checkpoint prompt would be
-        # a new model turn beyond the configured cap.
+    if isinstance(finding, dict) and finding.get("control") in ("budget", "timeout", "pause", "interrupt"):
+        # The interrupted turn is settled and the worktree is the durable
+        # checkpoint.  A second prompt would be an unbudgeted model turn.
         finding["agent_checkpoint"] = "settled-without-extra-model-turn"
-    elif isinstance(finding, dict) and finding.get("control") in ("pause", "interrupt"):
-        if not _runtime_settled(identity, sequence):
-            finding["agent_checkpoint"] = "unavailable"
-        else:
-            try:
-                prompt_agent(target,
-                    "Checkpoint the current work now. Preserve every useful change, commit safe progress when possible, "
-                    "summarize remaining work and blockers, then stop and wait for resume.", 120, identity)
-            except BaseException:
-                if runtime_activity(identity).get("runtime_turn_pending"):
-                    raise UnsettledAgentError("checkpoint turn did not settle; scope must remain held")
-                finding["agent_checkpoint"] = "unavailable"
-            else:
-                finding["agent_checkpoint"] = "complete"
     return agent_get(target, identity) or {**identity, **(agent_liveness(target).get("agent") or {})}, finding
 
 
@@ -1136,7 +1211,7 @@ def _wait_runtime_monitored(target: str, timeout: int, monitor, identity: dict,
         raise
     except BaseException as exc:
         try:
-            interrupt_agent(target)
+            interrupt_agent(target, identity)
         except BaseException:
             pass
         raise UnsettledAgentError(
@@ -1163,7 +1238,18 @@ def wait_agent_monitored(target: str, timeout: int, monitor,
         finding = monitor()
         timed_out = time.monotonic() >= deadline
         if finding or timed_out:
-            interrupt_agent(target); break
+            try:
+                interrupt_agent(target, identity)
+            except BaseException as exc:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.communicate()
+                raise UnsettledAgentError(
+                    "agent identity became unprovable before cooperative interrupt; scope must remain held"
+                ) from exc
+            break
         time.sleep(0.2)
     try: stdout, stderr = proc.communicate(timeout=30)
     except subprocess.TimeoutExpired:
@@ -1172,15 +1258,10 @@ def wait_agent_monitored(target: str, timeout: int, monitor,
         finding = finding or {"control": "timeout", "reason": "Herdr turn reached its bounded wait"}
         try:
             settled = wait_agent(target, 30)
-            if isinstance(finding, dict) and finding.get("control") in ("budget", "timeout"):
+            if isinstance(finding, dict):
                 finding["agent_checkpoint"] = "settled-without-extra-model-turn"
-            else:
-                prompt_agent(target,
-                    "Checkpoint the current work now. Preserve every useful change, commit safe progress when possible, "
-                    "summarize remaining work and blockers, then stop and wait for resume.", 120, identity)
         except BaseException as exc:
             raise UnsettledAgentError("legacy Herdr agent did not prove a settled checkpoint") from exc
-        else: finding.setdefault("agent_checkpoint", "complete")
         return agent_get(target, identity) or settled or {}, finding
     if proc.returncode != 0:
         raise UnsettledAgentError(
@@ -1206,7 +1287,12 @@ def steer_agent(target: str, text: str, timeout: int = 300,
     return prompt_agent_async(target, "STEERING FROM THE CAPTAIN:\n" + text, identity)
 
 
-def interrupt_agent(target: str) -> None:
+def interrupt_agent(target: str, identity: dict | None = None) -> None:
+    if identity:
+        exact = exact_agent_liveness(identity)
+        if exact.get("state") != "live" or exact.get("identity_verified") is not True:
+            from .util import HelmError
+            raise HelmError("refusing to interrupt an unproven or replaced Pi identity")
     workspace = os.environ.get("HERDR_WORKSPACE_ID")
     return_tab = focused_tab(workspace) if workspace else os.environ.get("HERDR_TAB_ID")
     cli_required("agent", "focus", target)
@@ -1230,9 +1316,13 @@ def close_agent_tab(session: dict) -> bool:
                 return True
             if liveness.get("state") != "live":
                 return False
+            exact = exact_agent_liveness(session, liveness)
+            if exact.get("state") != "live" or exact.get("identity_verified") is not True:
+                return False
             live = {**session, **(liveness.get("agent") or {})}
             live.update(session_evidence(live)); activity = runtime_activity(live); live.update(activity)
-            proven = bool(live.get("pane_id") == session.get("pane_id")
+            proven = bool(exact.get("identity_verified") is True
+                          and live.get("pane_id") == session.get("pane_id")
                           and live.get("tab_id") == session.get("tab_id")
                           and live.get("agent_session_id") == session.get("agent_session_id")
                           and activity.get("runtime_turn_pending") is False)

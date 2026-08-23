@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import doctor, supervisor, worktree
+from helm import doctor, supervisor, work, worktree
 from helm.paths import supervisor_lock
 from helm.util import HelmError, locked, write_json
 
@@ -179,14 +179,41 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(checks["state:memory"]["status"], "error")
         self.assertEqual(before, {item_path: item_path.read_bytes(), memory_path: memory_path.read_bytes()})
 
+    def test_corrupt_node_budget_state_is_reported_without_rewriting(self):
+        directory = self.home / "work" / "p-node-corrupt"; directory.mkdir(parents=True)
+        item_path = directory / "item.json"
+        write_json(item_path, {"id": "p-node-corrupt", "project": "p", "status": "paused", "revision": 0,
+                               "branch": "firstmate/p-node-corrupt",
+                               "worktree": str(self.home / "worktrees" / "p" / "p-node-corrupt"),
+                               "agent_launches": [], "controls": {"events": [], "pending": []},
+                               "node_budgets": {"implement": {"tokens": 10}},
+                               "node_usage": {"implement": {
+                                   "tokens": 0, "cost": 0.0, "seconds": 0.0,
+                                   "receipts": {"session": {"tokens": float("nan"),
+                                                               "tokens_available": True}}}}})
+        before = item_path.read_bytes()
+        report = doctor.audit(network=False)
+        check = next(value for value in report["checks"] if value["id"] == "state:item:p-node-corrupt")
+        self.assertEqual(check["status"], "error")
+        self.assertIn("receipt tokens is malformed", check["summary"])
+        self.assertEqual(item_path.read_bytes(), before)
+
     def test_dead_execution_is_paused_and_claim_held_without_touching_work(self):
         work_id = "p-dead"
         item_dir = self.home / "work" / work_id; item_dir.mkdir(parents=True)
         wt = self.home / "worktrees" / "p" / work_id; wt.mkdir(parents=True)
         marker = wt / "unlanded.txt"; marker.write_text("preserve me")
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2))
         item = {"id": work_id, "project": "p", "status": "running", "phase": "implementing",
                 "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z", "revision": 0,
-                "lease": {"pid": 999_999_999, "owner": "dead"}, "session": None,
+                "lease": {"pid": 999_999_999, "owner": "dead", "started": started},
+                "activity": {"state": "verifying", "node": "verify", "node_started_at": started},
+                "node_budgets": {"verify": {"tokens": None, "cost": None, "seconds": 60}},
+                "node_usage": {"verify": work._new_node_usage()},
+                "budgets": {"tokens": None, "cost": None, "seconds": 120},
+                "usage": {"tokens": 0, "cost": 0.0, "seconds": 0.0,
+                          "tokens_evidence_complete": True, "cost_evidence_complete": True},
+                "session": None,
                 "worktree": str(wt), "controls": {"paused": False}, "history": [], "attempts": 0}
         write_json(item_dir / "item.json", item)
         write_json(self.home / "scope-claims.json", {"version": 1, "claims": [{
@@ -196,6 +223,9 @@ class DoctorTests(unittest.TestCase):
         claim = json.loads((self.home / "scope-claims.json").read_text())["claims"][0]
         self.assertEqual(repaired["status"], "paused")
         self.assertNotIn("lease", repaired)
+        self.assertGreaterEqual(repaired["usage"]["seconds"], 1)
+        self.assertGreaterEqual(repaired["node_usage"]["verify"]["seconds"], 1)
+        self.assertTrue(repaired["node_usage"]["verify"]["seconds_evidence_complete"])
         self.assertEqual(marker.read_text(), "preserve me")
         self.assertTrue(claim["held_for_recovery"])
         self.assertIsNone(claim["pid"])

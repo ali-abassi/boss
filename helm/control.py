@@ -29,7 +29,7 @@ def _secret_key(key: object) -> bool:
     usage_keys = {
         "tokens", "tokencount", "implementertokens", "reviewertokens", "attempttokens", "maxtokens",
         "inputtokens", "outputtokens", "cachedtokens", "tokensevidencecomplete",
-        "implementertokenscomplete", "reviewertokenscomplete",
+        "implementertokenscomplete", "reviewertokenscomplete", "tokensavailable",
     }
     return normalized not in usage_keys and any(word in normalized for word in _SECRET_WORDS)
 
@@ -76,7 +76,7 @@ def redact(value):
 
 
 def request(work_id: str, action: str, value=None, request_id: str | None = None) -> dict:
-    allowed = {"steer", "pause", "resume", "away", "interrupt", "recover"}
+    allowed = {"steer", "pause", "resume", "interrupt", "recover"}
     if action not in allowed:
         raise HelmError(f"unknown control '{action}'")
     if request_id is not None and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
@@ -100,7 +100,7 @@ def request(work_id: str, action: str, value=None, request_id: str | None = None
             "response-armed", "response-requested", "unknown",
         }:
             raise HelmError(f"{action} refused while a no-mistakes transaction requires reconciliation")
-        controls = item.setdefault("controls", {"paused": False, "away": False, "pending": []})
+        controls = item.setdefault("controls", {"paused": False, "pending": []})
         existing = next((event for event in controls.get("events", []) if event.get("id") == event_id), None)
         if existing:
             expected_value = str(value).strip() if value is not None else None
@@ -115,8 +115,6 @@ def request(work_id: str, action: str, value=None, request_id: str | None = None
             controls["pause_requested"] = True
         elif action == "resume":
             controls["paused"] = False; controls["pause_requested"] = False
-        elif action == "away":
-            controls["away"] = bool(value)
         elif action == "interrupt":
             controls["interrupt_requested"] = True
         elif action == "recover":
@@ -236,6 +234,7 @@ def inspection(item: dict, recent_output: str = "") -> dict:
         "usage_evidence": {"available": usage.get("tokens") is not None or usage.get("cost") is not None,
                            "source": "Herdr agent metadata" if session else "runner ledger"},
         "activity": item.get("activity", {}), "budgets": item.get("budgets", {}), "usage": usage,
+        "node_budgets": item.get("node_budgets", {}), "node_usage": item.get("node_usage", {}),
         "session": session,
         "controls": item.get("controls", {}), "rigor": item.get("rigor"),
         "recent_output": recent_output[-12000:],
