@@ -41,8 +41,12 @@ python_bin="$found"
 ok "python $("$python_bin" -c 'import sys; print("%d.%d" % sys.version_info[:2])') ($(command -v "$python_bin"))"
 
 # ---------------------------------------------------------------- source
-if [ -f "$(dirname "${BASH_SOURCE[0]:-$0}")/bin/pi-boss" ] 2>/dev/null; then
-  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# `curl ... | bash` has no script pathname. Do not reinterpret its working
+# directory as the installer source, even when the command happens to run from
+# another BOSS checkout.
+script_source="${BASH_SOURCE[0]:-}"
+if [ -n "$script_source" ] && [ -f "$(dirname "$script_source")/bin/pi-boss" ] 2>/dev/null; then
+  here="$(cd "$(dirname "$script_source")" && pwd)"
 else
   # Piped through bash: fetch the repo.
   if [ -d "$target/.git" ]; then

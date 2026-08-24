@@ -35,6 +35,8 @@ class ProductIdentityTests(unittest.TestCase):
             self.assertIn(command, install)
         self.assertNotRegex(install, re.compile(r"git\s+-C\s+\"\$target\"\s+pull"))
         self.assertIn("existing $target checkout unchanged", install)
+        self.assertIn('script_source="${BASH_SOURCE[0]:-}"', install)
+        self.assertIn('[ -n "$script_source" ]', install)
 
     def test_prompt_role_and_portfolio_command_are_unambiguous(self):
         agents = (REPO / "AGENTS.md").read_text()
