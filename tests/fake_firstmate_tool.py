@@ -8,11 +8,9 @@ sandbox/reaper behavior is exercised separately by ``test_sandbox`` on macOS.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import signal
-import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -45,19 +43,15 @@ if (profile.is_symlink() or not profile.is_file()
 if scratch.is_symlink() or not scratch.is_dir():
     fail("scratch directory is unsafe")
 
-process = subprocess.Popen(
-    ["/bin/bash", "-lc", command],
-    stdin=subprocess.DEVNULL,
-    stdout=sys.stdout,
-    stderr=sys.stderr,
-    start_new_session=True,
-)
-try:
-    raise SystemExit(process.wait(timeout=timeout))
-except subprocess.TimeoutExpired:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
-    raise SystemExit(124)
+# The fake-Herdr fixtures use only these two verification shapes.  Do not run
+# an arbitrary shell here: even a test-only process group cannot contain a
+# hostile double-fork plus setsid() portably.  Unknown commands fail before any
+# child or side effect exists.
+if command == "true":
+    raise SystemExit(0)
+sleep_match = re.fullmatch(r"sleep ([0-9]+(?:\.[0-9]+)?)", command)
+if not sleep_match:
+    fail("unsupported fake verification command")
+duration = float(sleep_match.group(1))
+time.sleep(min(duration, float(timeout)))
+raise SystemExit(124 if duration > timeout else 0)

@@ -3,7 +3,7 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, subprocess, sys, tempfile, unittest, uuid
+import hashlib, json, os, subprocess, sys, tempfile, unittest, uuid
 from pathlib import Path
 from unittest import mock
 from tests.fake_helm import fake_sandbox_status
@@ -42,6 +42,24 @@ class HerdrTests(unittest.TestCase):
 
     def raw_calls(self):
         return [json.loads(l) for l in self.log.read_text().splitlines() if l.strip()]
+
+    def test_fake_verification_runner_refuses_shell_and_preserves_timeout_contract(self):
+        profile = self.tmp / "fake-profile.sb"; profile.write_text("(version 1)\n")
+        scratch = self.tmp / "fake-scratch"; scratch.mkdir()
+        receipt = hashlib.sha256(profile.read_bytes()).hexdigest()
+        runner = str(REPO / "tests" / "fake_firstmate_tool.py")
+        marker = self.tmp / "must-not-exist"
+        refused = subprocess.run(
+            [runner, str(profile), receipt, str(scratch), "1", f"touch {marker}"],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(refused.returncode, 126, refused.stderr)
+        self.assertFalse(marker.exists())
+        timed = subprocess.run(
+            [runner, str(profile), receipt, str(scratch), "1", "sleep 2"],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(timed.returncode, 124, timed.stderr)
 
     def test_up_runs_workers_in_background_without_empty_herdr_tabs(self):
         out = self.helm("up", "--workers", "3").stdout
