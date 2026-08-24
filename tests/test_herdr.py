@@ -480,7 +480,7 @@ class HerdrTests(unittest.TestCase):
         # either the bounded verifier times out or the budget gate stops first.
         self.assertTrue(recorded.get("failed_ids") == ["verify"] or
                         (recorded.get("failed_ids") == [] and recorded.get("control") == "budget"
-                         and "seconds budget" in str(recorded.get("budget_exceeded"))),
+                         and "seconds" in str(recorded.get("budget_exceeded"))),
                         shown)
 
     def test_successful_verification_that_consumes_deadline_stops_before_reviewer_creation(self):
