@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Run one untrusted tool command under a pinned sandbox and reap every descendant.
+
+Darwin process groups are not containment: a payload can double-fork and call
+``setsid()``.  Each invocation therefore gets a unique, inherited sandbox
+fingerprint.  The controller finds that fingerprint across the process table,
+stops every matching process, kills it, and proves the fingerprint disappeared
+before returning.  The untrusted command is held behind a pipe until this
+capability has been checked against its actual sandboxed PID.
+"""
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def fail(message: str, code: int = 126) -> "None":
+    print(f"boss-tool: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+class ReapError(RuntimeError):
+    pass
+
+
+def process_apis():
+    """Load the two Darwin APIs used for exact sandbox-policy discovery."""
+    try:
+        sandbox_lib = ctypes.CDLL("/usr/lib/system/libsystem_sandbox.dylib", use_errno=True)
+        proc_lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        sandbox_check = sandbox_lib.sandbox_check
+        # Declaring the fixed arguments is required on arm64 even though the
+        # final path filter is variadic.
+        sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        sandbox_check.restype = ctypes.c_int
+        list_all = proc_lib.proc_listallpids
+        list_all.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        list_all.restype = ctypes.c_int
+    except (AttributeError, OSError) as exc:
+        raise ReapError(f"Darwin process-policy APIs are unavailable: {type(exc).__name__}") from exc
+    return sandbox_check, list_all
+
+
+def all_pids(list_all) -> set[int]:
+    requested = list_all(None, 0)
+    if requested <= 0:
+        raise ReapError("could not enumerate the Darwin process table")
+    capacity = max(1024, requested + 128)
+    for _attempt in range(4):
+        values = (ctypes.c_int * capacity)()
+        count = list_all(values, ctypes.sizeof(values))
+        if count < 0:
+            raise ReapError("Darwin process enumeration failed")
+        if count < capacity:
+            return {int(pid) for pid in values[:count] if int(pid) > 1}
+        capacity *= 2
+    raise ReapError("Darwin process table changed too quickly to enumerate safely")
+
+
+def policy_result(sandbox_check, pid: int, path: Path) -> int | None:
+    ctypes.set_errno(0)
+    result = sandbox_check(pid, b"file-read-data", 1, ctypes.c_char_p(os.fsencode(path)))
+    return None if result < 0 else int(result)
+
+
+def has_fingerprint(sandbox_check, pid: int, denied: Path, allowed: Path) -> bool:
+    # Existing files are essential: sandbox_check conservatively rejects a
+    # nonexistent path even for an unsandboxed process.
+    return (policy_result(sandbox_check, pid, denied) == 1
+            and policy_result(sandbox_check, pid, allowed) == 0)
+
+
+def matching_pids(sandbox_check, list_all, denied: Path, allowed: Path) -> set[int]:
+    own = os.getpid()
+    return {pid for pid in all_pids(list_all) if pid != own
+            and has_fingerprint(sandbox_check, pid, denied, allowed)}
+
+
+def stop_and_reap(sandbox_check, list_all, denied: Path, allowed: Path) -> None:
+    """Freeze the fingerprint to a fixed point, kill it, then prove absence."""
+    seen: set[int] = set()
+    stable = 0
+    freeze_deadline = time.monotonic() + 2.0
+    while time.monotonic() < freeze_deadline:
+        current = matching_pids(sandbox_check, list_all, denied, allowed)
+        new = current - seen
+        for pid in current:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise ReapError(f"cannot stop owned process {pid}") from exc
+        seen.update(current)
+        stable = stable + 1 if not new else 0
+        if stable >= 3:
+            break
+        time.sleep(0.01)
+    else:
+        raise ReapError("owned process tree would not become quiescent")
+
+    for pid in seen:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise ReapError(f"cannot kill owned process {pid}") from exc
+
+    absent = 0
+    kill_deadline = time.monotonic() + 3.0
+    while time.monotonic() < kill_deadline:
+        current = matching_pids(sandbox_check, list_all, denied, allowed)
+        if current:
+            absent = 0
+            for pid in current:
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as exc:
+                    raise ReapError(f"cannot kill late owned process {pid}") from exc
+        else:
+            absent += 1
+            if absent >= 3:
+                return
+        time.sleep(0.02)
+    raise ReapError("owned sandbox fingerprint remained live after SIGKILL")
+
+
+def capability_check() -> None:
+    if not Path("/usr/bin/sandbox-exec").is_file():
+        raise ReapError("sandbox-exec is unavailable")
+    sandbox_check, list_all = process_apis()
+    if os.getpid() not in all_pids(list_all):
+        raise ReapError("process enumeration omitted the controller")
+    if policy_result(sandbox_check, os.getpid(), Path(__file__).resolve()) != 0:
+        raise ReapError("sandbox policy introspection is unavailable")
+
+
+if sys.argv[1:] == ["--capability-check"]:
+    try:
+        capability_check()
+    except ReapError as exc:
+        fail(str(exc))
+    print("sandbox fingerprint reaper available")
+    raise SystemExit(0)
+
+if len(sys.argv) != 6:
+    fail("expected PROFILE PROFILE_SHA256 SCRATCH TIMEOUT COMMAND")
+
+profile_input = Path(sys.argv[1]).expanduser()
+expected = sys.argv[2]
+scratch_input = Path(sys.argv[3]).expanduser()
+try:
+    timeout = max(1, min(3600, int(sys.argv[4])))
+except ValueError:
+    fail("invalid timeout")
+command = sys.argv[5]
+
+if not re.fullmatch(r"[0-9a-f]{64}", expected):
+    fail("invalid profile receipt")
+try:
+    if profile_input.is_symlink() or scratch_input.is_symlink():
+        fail("sandbox capability paths must not be symlinks")
+    profile = profile_input.resolve(strict=True)
+    scratch = scratch_input.resolve(strict=True)
+    profile_stat = profile.stat()
+    profile_bytes = profile.read_bytes()
+    scratch_stat = scratch.stat()
+except OSError as exc:
+    fail(f"sandbox capability is unavailable: {type(exc).__name__}")
+if (not profile.is_file() or profile_stat.st_uid != os.getuid()
+        or profile_stat.st_mode & 0o077 or hashlib.sha256(profile_bytes).hexdigest() != expected):
+    fail("sandbox profile receipt does not match")
+if (not scratch.is_dir() or scratch_stat.st_uid != os.getuid()
+        or scratch_stat.st_mode & 0o077):
+    fail("sandbox scratch directory is unsafe")
+if not Path("/usr/bin/sandbox-exec").is_file():
+    fail("sandbox-exec is unavailable")
+
+try:
+    sandbox_check, list_all = process_apis()
+except ReapError as exc:
+    fail(str(exc))
+
+
+def sbpl(path: Path) -> str:
+    value = str(path.resolve())
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# The static profile receipt remains the authority.  These rules only add a
+# per-invocation fingerprint and protect its files from the candidate.
+token = secrets.token_hex(16)
+deny_name = f".boss-reaper-{token}.deny"
+allow_name = f".boss-reaper-{token}.allow"
+profile_name = f".boss-reaper-{token}.sb"
+denied = (scratch / deny_name).resolve()
+allowed = (scratch / allow_name).resolve()
+invocation_profile = (scratch / profile_name).resolve()
+scratch_fd: int | None = None
+created_names: list[str] = []
+try:
+    scratch_fd = os.open(scratch, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    for name, payload in ((deny_name, b"deny\n"), (allow_name, b"allow\n")):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                     0o600, dir_fd=scratch_fd)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        created_names.append(name)
+    derived = profile_bytes.decode("utf-8") + "\n" + "\n".join([
+        f"(deny file-read-data (literal {sbpl(denied)}))",
+        f"(deny file-write* (literal {sbpl(denied)}))",
+        f"(deny file-write* (literal {sbpl(allowed)}))",
+        f"(deny file-write* (literal {sbpl(invocation_profile)}))",
+        "",
+    ])
+    fd = os.open(profile_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                 0o600, dir_fd=scratch_fd)
+    try:
+        os.write(fd, derived.encode())
+    finally:
+        os.close(fd)
+    created_names.append(profile_name)
+except (OSError, UnicodeError) as exc:
+    if scratch_fd is not None:
+        for name in reversed(created_names):
+            try:
+                os.unlink(name, dir_fd=scratch_fd)
+            except OSError:
+                pass
+        os.close(scratch_fd)
+    fail(f"could not create an invocation sandbox: {type(exc).__name__}")
+
+safe_env = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "HOME": str(scratch),
+    "TMPDIR": str(scratch),
+    "LANG": os.environ.get("LANG", "C.UTF-8"),
+    "LC_ALL": os.environ.get("LC_ALL", ""),
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+for key, value in os.environ.items():
+    if key == "GIT_CONFIG_COUNT" or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+        safe_env[key] = value
+
+child: subprocess.Popen[str] | None = None
+interrupted = False
+gate_read: int | None = None
+gate_write: int | None = None
+
+
+def request_stop(_signum, _frame) -> None:
+    global interrupted
+    interrupted = True
+
+
+for handled in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(handled, request_stop)
+
+
+result_code = 125
+cleanup_error: ReapError | None = None
+try:
+    gate_read, gate_write = os.pipe()
+    gated_shell = 'IFS= read -r gate <&"$1" || exit 125; /bin/bash -lc "$2"'
+    child = subprocess.Popen(
+        ["/usr/bin/sandbox-exec", "-f", str(invocation_profile),
+         "/bin/bash", "-c", gated_shell, "boss-gate", str(gate_read), command],
+        stdin=subprocess.DEVNULL,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        text=True,
+        env=safe_env,
+        start_new_session=True,
+        pass_fds=(gate_read,),
+    )
+    os.close(gate_read); gate_read = None
+    gate_deadline = time.monotonic() + 2.0
+    while (child.poll() is None and not interrupted and time.monotonic() < gate_deadline
+           and not has_fingerprint(sandbox_check, child.pid, denied, allowed)):
+        time.sleep(0.005)
+    if child.poll() is not None:
+        result_code = child.returncode
+    elif interrupted:
+        result_code = 130
+    elif not has_fingerprint(sandbox_check, child.pid, denied, allowed):
+        print("boss-tool: sandbox fingerprint could not be proven before execution", file=sys.stderr)
+        result_code = 126
+    else:
+        # The process table must also contain the exact gated PID before any
+        # candidate-controlled fork can occur.
+        if child.pid not in all_pids(list_all):
+            raise ReapError("gated sandbox process was absent from process enumeration")
+        os.write(gate_write, b"go\n")
+        os.close(gate_write); gate_write = None
+        deadline = time.monotonic() + timeout
+        while child.poll() is None and not interrupted and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if child.poll() is None:
+            result_code = 130 if interrupted else 124
+        else:
+            result_code = int(child.returncode)
+except (OSError, ReapError) as exc:
+    print(f"boss-tool: controller failure: {exc}", file=sys.stderr)
+    result_code = 126
+finally:
+    for fd in (gate_read, gate_write):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        stop_and_reap(sandbox_check, list_all, denied, allowed)
+    except ReapError as exc:
+        cleanup_error = exc
+    if child is not None:
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                cleanup_error = ReapError("direct sandbox child could not be reaped")
+    if scratch_fd is not None:
+        try:
+            os.fchmod(scratch_fd, 0o700)
+        except OSError as exc:
+            cleanup_error = cleanup_error or ReapError(f"could not restore sandbox scratch: {exc}")
+        for name in reversed(created_names):
+            try:
+                os.unlink(name, dir_fd=scratch_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                cleanup_error = cleanup_error or ReapError(f"could not remove invocation receipt: {exc}")
+        os.close(scratch_fd)
+
+if cleanup_error is not None:
+    fail(f"fail-closed descendant cleanup: {cleanup_error}", 125)
+raise SystemExit(result_code)

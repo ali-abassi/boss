@@ -7,8 +7,8 @@ import threading
 import unittest
 from pathlib import Path
 
-from helm.paths import home
-from helm.util import locked, log, write_json
+from bossctl.paths import home
+from bossctl.util import locked, log, write_json
 
 
 class DurableJSONTests(unittest.TestCase):
@@ -28,9 +28,9 @@ class DurableJSONTests(unittest.TestCase):
 
     def test_fresh_nested_controller_state_is_private_under_permissive_umask(self):
         state_home = self.root / "fresh-home"
-        previous_home = os.environ.get("HELM_HOME")
+        previous_home = os.environ.get("BOSS_HOME")
         previous_umask = os.umask(0)
-        os.environ["HELM_HOME"] = str(state_home)
+        os.environ["BOSS_HOME"] = str(state_home)
         try:
             record = home() / "work" / "p-item" / "item.json"
             write_json(record, {"id": "p-item"})
@@ -40,13 +40,13 @@ class DurableJSONTests(unittest.TestCase):
         finally:
             os.umask(previous_umask)
             if previous_home is None:
-                os.environ.pop("HELM_HOME", None)
+                os.environ.pop("BOSS_HOME", None)
             else:
-                os.environ["HELM_HOME"] = previous_home
+                os.environ["BOSS_HOME"] = previous_home
         for directory in (state_home, state_home / "work", state_home / "work" / "p-item",
                           state_home / "locks"):
             self.assertEqual(directory.stat().st_mode & 0o777, 0o700, directory)
-        for path in (record, state_home / "locks" / "controller.lock", state_home / "helm.log"):
+        for path in (record, state_home / "locks" / "controller.lock", state_home / "bossctl.log"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
 
     def test_concurrent_replacements_never_share_a_temp_file(self):

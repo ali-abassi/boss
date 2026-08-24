@@ -14,14 +14,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import control, deliver, registry, work, worktree
-from helm.util import write_json
+from bossctl import control, deliver, registry, work, worktree
+from bossctl.util import write_json
 
 
 class PRDeliveryTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()); self.home = self.root / "home"
-        os.environ["HELM_HOME"] = str(self.home)
+        os.environ["BOSS_HOME"] = str(self.home)
         self.repo = self.root / "repo"; self.repo.mkdir()
         self.git("init", "-q", "-b", "main"); self.git("config", "user.email", "t@t")
         self.git("config", "user.name", "t")
@@ -59,7 +59,7 @@ class PRDeliveryTests(unittest.TestCase):
                   "reviewer": {"kind": "test", "identity": "independent"}}
         return {"id": self.work_id, "project": "p", "status": "running", "phase": "delivering",
                 "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z",
-                "revision": 0, "branch": f"firstmate/{self.work_id}", "worktree": str(self.wt),
+                "revision": 0, "branch": f"boss/{self.work_id}", "worktree": str(self.wt),
                 "head_sha": self.head, "pr_url": None, "session": None, "agent_launches": [],
                 "text": "Ship the reviewed change", "dispatch": {"graph": "direct-pr", "rule": "test"},
                 "reviews": [review], "controls": {"events": [], "pending": []}, "history": [],
@@ -73,7 +73,7 @@ class PRDeliveryTests(unittest.TestCase):
 
         def command(args, cwd=None, check=True, **_kwargs):
             if args[:4] == ["git", "-C", str(self.repo), "ls-remote"]:
-                stdout = (f"{state['remote']}\trefs/heads/firstmate/{self.work_id}\n"
+                stdout = (f"{state['remote']}\trefs/heads/boss/{self.work_id}\n"
                           if state["remote"] else "")
                 return subprocess.CompletedProcess(args, 0, stdout, "")
             if len(args) > 4 and args[:3] == ["git", "-C", str(self.wt)] and "push" in args:
@@ -87,7 +87,7 @@ class PRDeliveryTests(unittest.TestCase):
             if args[:3] == ["gh", "pr", "create"]:
                 state["creates"] += 1
                 state["prs"] = [{"url": "https://github.com/acme/widget/pull/7", "number": 7,
-                                  "state": "OPEN", "headRefName": f"firstmate/{self.work_id}",
+                                  "state": "OPEN", "headRefName": f"boss/{self.work_id}",
                                   "headRefOid": self.head, "baseRefName": "main"}]
                 if state["crash_after_create"]:
                     state["crash_after_create"] = False
@@ -98,7 +98,7 @@ class PRDeliveryTests(unittest.TestCase):
 
     def test_exact_delivery_uses_non_force_push_and_authoritative_pr_receipt(self):
         state, command = self.fake_external()
-        with mock.patch("helm.deliver.sh", side_effect=command):
+        with mock.patch("bossctl.deliver.sh", side_effect=command):
             completed = deliver.resume_pr_delivery(work.load(self.work_id), self.project, self.wt)
         self.assertEqual(completed["status"], "pr-open")
         self.assertEqual(completed["pr_url"], "https://github.com/acme/widget/pull/7")
@@ -107,7 +107,7 @@ class PRDeliveryTests(unittest.TestCase):
 
     def test_crash_after_push_replays_without_a_second_push(self):
         state, command = self.fake_external(crash_after_push=True)
-        with mock.patch("helm.deliver.sh", side_effect=command):
+        with mock.patch("bossctl.deliver.sh", side_effect=command):
             with self.assertRaises(RuntimeError):
                 deliver.open_pr(work.load(self.work_id), self.project, self.wt)
             self.assertEqual(work.load(self.work_id)["pr_delivery"]["state"], "push-requested")
@@ -117,7 +117,7 @@ class PRDeliveryTests(unittest.TestCase):
 
     def test_crash_after_pr_create_reconciles_without_a_second_create_or_model_turn(self):
         state, command = self.fake_external(crash_after_create=True)
-        with mock.patch("helm.deliver.sh", side_effect=command):
+        with mock.patch("bossctl.deliver.sh", side_effect=command):
             with self.assertRaises(RuntimeError):
                 deliver.open_pr(work.load(self.work_id), self.project, self.wt)
         midway = work.load(self.work_id)
@@ -125,8 +125,8 @@ class PRDeliveryTests(unittest.TestCase):
         control.cas_update(self.work_id, lambda item: item.update(status="failed", phase="failed"))
         work.retry(self.work_id)
         leased = work.claim_next("recovery-worker")
-        with mock.patch("helm.deliver.sh", side_effect=command), \
-             mock.patch("helm.work._execute", side_effect=AssertionError("must not start a model turn")):
+        with mock.patch("bossctl.deliver.sh", side_effect=command), \
+             mock.patch("bossctl.work._execute", side_effect=AssertionError("must not start a model turn")):
             completed = work.execute(leased)
         self.assertEqual(completed["status"], "pr-open")
         self.assertEqual((state["pushes"], state["creates"]), (1, 1))
@@ -139,7 +139,7 @@ class PRDeliveryTests(unittest.TestCase):
                 state["creates"] += 1
                 return subprocess.CompletedProcess(args, 0, "request accepted but not visible", "")
             return original(args, **kwargs)
-        with mock.patch("helm.deliver.sh", side_effect=delayed):
+        with mock.patch("bossctl.deliver.sh", side_effect=delayed):
             with self.assertRaises(SystemExit):
                 deliver.open_pr(work.load(self.work_id), self.project, self.wt)
             self.assertEqual(work.load(self.work_id)["pr_delivery"]["state"], "pr-create-requested")
@@ -147,9 +147,9 @@ class PRDeliveryTests(unittest.TestCase):
                 deliver.open_pr(work.load(self.work_id), self.project, self.wt)
         self.assertEqual(state["creates"], 1)
         state["prs"] = [{"url": "https://github.com/acme/widget/pull/7", "number": 7,
-                          "state": "OPEN", "headRefName": f"firstmate/{self.work_id}",
+                          "state": "OPEN", "headRefName": f"boss/{self.work_id}",
                           "headRefOid": self.head, "baseRefName": "main"}]
-        with mock.patch("helm.deliver.sh", side_effect=delayed):
+        with mock.patch("bossctl.deliver.sh", side_effect=delayed):
             completed = deliver.resume_pr_delivery(work.load(self.work_id), self.project, self.wt)
         self.assertEqual(completed["status"], "pr-open")
         self.assertEqual(state["creates"], 1)
@@ -169,7 +169,7 @@ class PRDeliveryTests(unittest.TestCase):
         deliver._arm_pr_delivery(work.load(self.work_id), self.project, self.wt)
         control.cas_update(self.work_id, lambda item: item.update(reviews=[]))
         state, command = self.fake_external()
-        with mock.patch("helm.deliver.sh", side_effect=command):
+        with mock.patch("bossctl.deliver.sh", side_effect=command):
             with self.assertRaises(SystemExit):
                 deliver.open_pr(work.load(self.work_id), self.project, self.wt)
         self.assertEqual((state["pushes"], state["creates"]), (0, 0))
@@ -178,7 +178,7 @@ class PRDeliveryTests(unittest.TestCase):
     def test_current_registry_authority_is_reread_before_arming(self):
         registry.set_fields("p", authority=1)
         state, command = self.fake_external()
-        with mock.patch("helm.deliver.sh", side_effect=command):
+        with mock.patch("bossctl.deliver.sh", side_effect=command):
             with self.assertRaises(SystemExit):
                 deliver.open_pr(work.load(self.work_id), self.project, self.wt)
         self.assertEqual((state["pushes"], state["creates"]), (0, 0))
@@ -207,7 +207,7 @@ class PRDeliveryTests(unittest.TestCase):
             except BaseException as exc: errors.append(exc)
             finally: changed.set()
 
-        with mock.patch("helm.deliver.sh", side_effect=blocking_command):
+        with mock.patch("bossctl.deliver.sh", side_effect=blocking_command):
             delivery_thread = threading.Thread(target=delivery)
             delivery_thread.start(); self.assertTrue(entered.wait(2))
             policy_thread = threading.Thread(target=change_policy)

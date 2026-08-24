@@ -15,9 +15,9 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-from helm import control, gates, no_mistakes, work, worktree
-from helm.util import HelmError
-from helm.util import write_json
+from bossctl import control, gates, no_mistakes, work, worktree
+from bossctl.util import BossError
+from bossctl.util import write_json
 
 
 RUN_COLUMNS = {
@@ -35,11 +35,11 @@ RUN_COLUMNS = {
 
 class NoMistakesAdapterTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="firstmate-no-mistakes-test-"))
-        self.helm_home = self.root / "helm"; self.nm_home = self.root / "no-mistakes"
+        self.root = Path(tempfile.mkdtemp(prefix="boss-no-mistakes-test-"))
+        self.boss_home = self.root / "bossctl"; self.nm_home = self.root / "no-mistakes"
         self.repo = self.root / "repo"; self.repo.mkdir(); self.nm_home.mkdir(mode=0o700)
-        self.old_env = {key: os.environ.get(key) for key in ("HELM_HOME", "NM_HOME", "PATH")}
-        os.environ["HELM_HOME"] = str(self.helm_home); os.environ["NM_HOME"] = str(self.nm_home)
+        self.old_env = {key: os.environ.get(key) for key in ("BOSS_HOME", "NM_HOME", "PATH")}
+        os.environ["BOSS_HOME"] = str(self.boss_home); os.environ["NM_HOME"] = str(self.nm_home)
         self.bin_dir = self.root / "bin"; self.bin_dir.mkdir()
         self.binary = self.bin_dir / "no-mistakes"
         self.binary.write_text("#!/bin/sh\nexit 99\n"); self.binary.chmod(0o755)
@@ -63,16 +63,16 @@ class NoMistakesAdapterTests(unittest.TestCase):
             "id": "p", "path": str(self.repo), "mode": "direct-pr", "authority": 2,
             "base": "main", "test_cmd": "true", "protected_paths": [], "gate": "no-mistakes",
         }
-        write_json(self.helm_home / "projects.json", {"projects": {"p": self.project}})
-        write_json(self.helm_home / "supervisor.json", {"version": 1, "observations": {},
+        write_json(self.boss_home / "projects.json", {"projects": {"p": self.project}})
+        write_json(self.boss_home / "supervisor.json", {"version": 1, "observations": {},
                                                          "away": {"enabled": False}})
-        write_json(self.helm_home / "wakes.json", {"version": 1, "next_id": 1, "events": []})
+        write_json(self.boss_home / "wakes.json", {"version": 1, "next_id": 1, "events": []})
         self.work_id = "p-external-gate"
         self.wt = worktree.create(self.project, self.work_id)
         (self.wt / "change.txt").write_text("reviewed\n")
         self.wgit("add", "change.txt"); self.wgit("commit", "-qm", "reviewed")
         self.head = self.wgit("rev-parse", "HEAD")
-        directory = self.helm_home / "work" / self.work_id; directory.mkdir(parents=True)
+        directory = self.boss_home / "work" / self.work_id; directory.mkdir(parents=True)
         write_json(directory / "item.json", self.item())
         self.attestation = {
             "verified": True, "binary": str(self.binary),
@@ -81,7 +81,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             "tag_sha": no_mistakes.TAG_SHA, "team_id": no_mistakes.MACOS_TEAM_ID,
             "identifier": no_mistakes.MACOS_IDENTIFIER, "architecture": "arm64",
         }
-        self.attest = mock.patch("helm.no_mistakes._binary_attestation",
+        self.attest = mock.patch("bossctl.no_mistakes._binary_attestation",
                                  return_value=self.attestation)
         self.attest.start()
 
@@ -119,7 +119,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             "id": self.work_id, "project": "p", "kind": "ship", "status": "running",
             "phase": "delivering", "created": "2026-01-01T00:00:00Z",
             "updated": "2026-01-01T00:00:00Z", "revision": 0,
-            "branch": f"firstmate/{self.work_id}", "worktree": str(self.wt),
+            "branch": f"boss/{self.work_id}", "worktree": str(self.wt),
             "head_sha": self.head, "pr_url": None, "session": None, "agent_launches": [],
             "text": "Ship the exact reviewed change without bypassing human decisions.",
             "dispatch": {"graph": "direct-pr", "rule": "test"}, "reviews": [review],
@@ -136,7 +136,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
         head = head or self.head; base = base or self.base
         values = {name: None for name in RUN_COLUMNS}
         values.update({
-            "id": run_id, "repo_id": self.repo_id, "branch": f"firstmate/{self.work_id}",
+            "id": run_id, "repo_id": self.repo_id, "branch": f"boss/{self.work_id}",
             "head_sha": head, "base_sha": base, "submitted_head_sha": self.head,
             "no_mistakes_version": no_mistakes.VERSION,
             "no_mistakes_build_sha": build or no_mistakes.BUILD_SHA,
@@ -146,7 +146,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             "ci_ready_no_ci": 0, "last_pushed_sha": head if ready else None,
             "push_target_kind": "upstream",
             "push_target_fingerprint": no_mistakes._target_fingerprint("git@github.com:acme/widget.git"),
-            "push_ref": f"refs/heads/firstmate/{self.work_id}", "push_active": 0,
+            "push_ref": f"refs/heads/boss/{self.work_id}", "push_active": 0,
             "created_at": 1, "updated_at": 2,
         })
         with closing(sqlite3.connect(self.db_path)) as db, db:
@@ -186,7 +186,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             self.write_command_evidence(kwargs)
             self.insert_run()
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             completed = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             again = gates.start_or_reconcile(completed, self.project, self.wt)
         self.assertEqual(len(calls), 1, "a complete transaction must never be submitted twice")
@@ -200,7 +200,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
         def driver(_binary, args, **kwargs):
             calls.append(args); self.write_command_evidence(kwargs, stderr="transport ended\n")
             return subprocess.CompletedProcess(args, 1)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             first = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             second = gates.start_or_reconcile(first, self.project, self.wt)
         self.assertEqual(len(calls), 1)
@@ -214,7 +214,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             calls.append(args); self.write_command_evidence(kwargs)
             self.insert_run()
             raise RuntimeError("simulated caller crash after external commit")
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             with self.assertRaisesRegex(RuntimeError, "simulated caller crash"):
                 gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             journal = work.load(self.work_id)
@@ -238,7 +238,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
                                "ci_ready_at = 10, last_pushed_sha = ? WHERE id = 'run-1'",
                                (self.head, "https://github.com/acme/widget/pull/7", self.head))
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             waiting = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             self.assertEqual(waiting["status"], "needs-you")
             finding = waiting["ask"]["gate"]["findings"]["items"][0]
@@ -256,7 +256,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             if args[0] == "run":
                 self.insert_run(reviewed=False, ready=False); self.insert_gate()
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             uncertain = gates.respond(self.work_id, "approve")
             with self.assertRaises(SystemExit):
@@ -277,7 +277,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
                            "ci_ready_at = 10, last_pushed_sha = ? WHERE id = 'run-1'",
                            (self.head, "https://github.com/acme/widget/pull/7", self.head))
             raise RuntimeError("simulated caller crash after external response")
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             with self.assertRaisesRegex(RuntimeError, "simulated caller crash"):
                 gates.respond(self.work_id, "approve")
@@ -297,7 +297,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
                 self.insert_run(reviewed=False, ready=False); self.insert_gate()
                 return subprocess.CompletedProcess(args, 0)
             raise RuntimeError("simulated caller crash before a changed receipt")
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             with self.assertRaises(RuntimeError):
                 gates.respond(self.work_id, "approve")
@@ -312,13 +312,13 @@ class NoMistakesAdapterTests(unittest.TestCase):
         def driver(_binary, args, **kwargs):
             self.write_command_evidence(kwargs, stderr="outcome unavailable\n")
             return subprocess.CompletedProcess(args, 1)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             uncertain = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         self.assertEqual(uncertain["external_gate"]["state"], "unknown")
         for action, value in (("pause", None), ("steer", "change direction"), ("recover", None)):
-            with self.subTest(action=action), self.assertRaises(HelmError):
+            with self.subTest(action=action), self.assertRaises(BossError):
                 control.request(self.work_id, action, value)
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             work.cancel(self.work_id, discard=True)
 
     def test_new_exact_revision_archives_completed_transaction_and_submits_once(self):
@@ -326,7 +326,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
         def first_driver(_binary, args, **kwargs):
             calls.append((self.head, args)); self.write_command_evidence(kwargs); self.insert_run()
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=first_driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=first_driver):
             first = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         old_transaction = first["external_gate"]["id"]
 
@@ -349,7 +349,7 @@ class NoMistakesAdapterTests(unittest.TestCase):
             calls.append((self.head, args)); self.write_command_evidence(kwargs)
             self.insert_run(run_id="run-2")
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=second_driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=second_driver):
             second = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
             repeated = gates.start_or_reconcile(second, self.project, self.wt)
         self.assertEqual(len(calls), 2)
@@ -363,11 +363,11 @@ class NoMistakesAdapterTests(unittest.TestCase):
         def driver(_binary, args, **kwargs):
             self.write_command_evidence(kwargs); self.insert_run(head=changed)
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             result = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         self.assertEqual(result["status"], "needs-you")
         self.assertEqual(result["external_gate"]["last_observation"]["classification"], "changed-head")
-        self.assertIn("fresh First Mate verification", result["ask"]["context"])
+        self.assertIn("fresh BOSS verification", result["ask"]["context"])
 
     def test_wrong_push_target_or_closed_pr_never_becomes_success(self):
         def driver(_binary, args, **kwargs):
@@ -376,18 +376,18 @@ class NoMistakesAdapterTests(unittest.TestCase):
                 db.execute("UPDATE runs SET push_target_fingerprint = ?, pr_state = 'closed' WHERE id = 'run-1'",
                            ("0" * 64,))
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch("helm.no_mistakes.invoke", side_effect=driver):
+        with mock.patch("bossctl.no_mistakes.invoke", side_effect=driver):
             result = gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         observation = result["external_gate"]["last_observation"]
         self.assertNotEqual(observation["classification"], "checks-passed")
         self.assertFalse(observation["checks"]["push_target_fingerprint"])
         self.assertFalse(observation["checks"]["pr_open"])
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             gates.require_receipt("no-mistakes", result, self.project)
 
-    def test_configured_first_mate_budget_fails_before_external_invocation(self):
+    def test_configured_boss_budget_fails_before_external_invocation(self):
         item = work.load(self.work_id); item["budgets"]["tokens"] = 100; work.save(item)
-        with mock.patch("helm.no_mistakes.invoke") as driver, self.assertRaises(SystemExit):
+        with mock.patch("bossctl.no_mistakes.invoke") as driver, self.assertRaises(SystemExit):
             gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         driver.assert_not_called()
 
@@ -396,14 +396,14 @@ class NoMistakesAdapterTests(unittest.TestCase):
         item["node_budgets"] = {"implement": {"tokens": 100, "cost": None, "seconds": None}}
         item["node_usage"] = {"implement": work._new_node_usage()}
         work.save(item)
-        with mock.patch("helm.no_mistakes.invoke") as driver, self.assertRaises(SystemExit):
+        with mock.patch("bossctl.no_mistakes.invoke") as driver, self.assertRaises(SystemExit):
             gates.start_or_reconcile(work.load(self.work_id), self.project, self.wt)
         driver.assert_not_called()
 
 
 class BinaryAttestationTests(unittest.TestCase):
     def test_release_hash_build_signature_requirement_and_architecture_are_all_required(self):
-        root = Path(tempfile.mkdtemp(prefix="firstmate-nm-binary-test-"))
+        root = Path(tempfile.mkdtemp(prefix="boss-nm-binary-test-"))
         try:
             binary = root / "no-mistakes"; binary.write_bytes(b"fixture"); binary.chmod(0o755)
             signature = ("Identifier=com.kunchenguid.no-mistakes\n"
@@ -423,11 +423,11 @@ class BinaryAttestationTests(unittest.TestCase):
                 if "-dvvv" in args:
                     return subprocess.CompletedProcess(args, 0, "", signature)
                 return subprocess.CompletedProcess(args, 0, "", "valid on disk")
-            with mock.patch("helm.no_mistakes.platform.system", return_value="Darwin"), \
-                 mock.patch("helm.no_mistakes.platform.machine", return_value="arm64"), \
-                 mock.patch("helm.no_mistakes._sha256",
+            with mock.patch("bossctl.no_mistakes.platform.system", return_value="Darwin"), \
+                 mock.patch("bossctl.no_mistakes.platform.machine", return_value="arm64"), \
+                 mock.patch("bossctl.no_mistakes._sha256",
                             return_value=no_mistakes.MACOS_RELEASES["arm64"]["binary_sha256"]), \
-                 mock.patch("helm.no_mistakes._command", side_effect=command):
+                 mock.patch("bossctl.no_mistakes._command", side_effect=command):
                 result = no_mistakes._binary_attestation(binary)
             self.assertTrue(result["verified"], result)
             self.assertEqual(result["build_sha"], no_mistakes.TAG_SHA[:7])

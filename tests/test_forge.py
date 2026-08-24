@@ -12,14 +12,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import control, forge
-from helm.util import HelmError, write_json
+from bossctl import control, forge
+from bossctl.util import BossError, write_json
 
 
 class ForgeTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()); self.home = self.root / "home"
-        os.environ["HELM_HOME"] = str(self.home)
+        os.environ["BOSS_HOME"] = str(self.home)
         self.repo = self.root / "repo"; self.repo.mkdir()
         subprocess.run(["git", "-C", str(self.repo), "init", "-q", "-b", "main"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", "https://github.com/acme/widget.git"], check=True)
@@ -37,7 +37,7 @@ class ForgeTests(unittest.TestCase):
 
     def pr(self, **changes):
         value = {"state": "open", "merged": False, "draft": False,
-                 "head": {"sha": self.head, "ref": "firstmate/p-item", "repo": {"full_name": "acme/widget"}},
+                 "head": {"sha": self.head, "ref": "boss/p-item", "repo": {"full_name": "acme/widget"}},
                  "base": {"sha": self.base, "ref": "main", "repo": {"full_name": "acme/widget"}},
                  "updated_at": "2026-01-01T00:00:00Z"}
         value.update(changes); return value
@@ -56,7 +56,7 @@ class ForgeTests(unittest.TestCase):
             combined = "failure" if any(value.get("state") in ("failure", "error") for value in statuses) \
                 else "pending" if any(value.get("state") == "pending" for value in statuses) else "success"
             return {"sha": self.head, "state": combined, "total_count": len(statuses), "statuses": statuses}, None
-        with mock.patch("helm.forge._api", side_effect=api):
+        with mock.patch("bossctl.forge._api", side_effect=api):
             return forge.inspect(self.item, self.project)
 
     def test_check_states_are_bound_to_exact_sha(self):
@@ -81,7 +81,7 @@ class ForgeTests(unittest.TestCase):
                 {"name": "one", "status": "completed", "conclusion": "success", "head_sha": self.head}]}, None
             if "required_status_checks" in endpoint: return {"strict": True, "contexts": ["one"], "checks": []}, None
             return {"sha": self.head, "state": "success", "total_count": 0, "statuses": []}, None
-        with mock.patch("helm.forge._api", side_effect=api):
+        with mock.patch("bossctl.forge._api", side_effect=api):
             self.assertEqual(forge.inspect(self.item, self.project)["classification"], "unknown")
 
     def test_malformed_or_contradictory_check_schema_never_becomes_green(self):
@@ -140,7 +140,7 @@ class ForgeTests(unittest.TestCase):
 
     def test_repository_url_mismatch_fails_before_network(self):
         self.item["pr_url"] = "https://github.com/other/widget/pull/7"
-        with mock.patch("helm.forge._api") as api:
+        with mock.patch("bossctl.forge._api") as api:
             observation = forge.inspect(self.item, self.project)
         self.assertEqual(observation["classification"], "unknown")
         api.assert_not_called()
@@ -157,7 +157,7 @@ class ForgeTests(unittest.TestCase):
         self.persist()
         observation = {"provider": "github", "classification": "checks-green", "reason": "green",
                        "evidence_complete": True, "expected": {"head_sha": self.head}, "observed_at": "2026-01-01T00:00:00Z"}
-        with mock.patch("helm.forge.inspect", return_value=observation):
+        with mock.patch("bossctl.forge.inspect", return_value=observation):
             forge.monitor_item(self.item["id"]); forge.monitor_item(self.item["id"])
         stored = json.loads((self.home / "work" / self.item["id"] / "item.json").read_text())
         wakes = json.loads((self.home / "wakes.json").read_text())["events"]
@@ -171,8 +171,8 @@ class ForgeTests(unittest.TestCase):
         def mutate_during_network(_item, _project):
             control.cas_update(self.item["id"], lambda current: current.update(head_sha="c" * 40))
             return observation
-        with mock.patch("helm.forge.inspect", side_effect=mutate_during_network):
-            with self.assertRaises(HelmError): forge.monitor_item(self.item["id"])
+        with mock.patch("bossctl.forge.inspect", side_effect=mutate_during_network):
+            with self.assertRaises(BossError): forge.monitor_item(self.item["id"])
         stored = json.loads((self.home / "work" / self.item["id"] / "item.json").read_text())
         self.assertNotIn("forge", stored)
 

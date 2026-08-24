@@ -14,9 +14,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import doctor, supervisor, work, worktree
-from helm.paths import supervisor_lock
-from helm.util import HelmError, locked, write_json
+from bossctl import doctor, supervisor, work, worktree
+from bossctl.paths import supervisor_lock
+from bossctl.util import BossError, locked, write_json
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -24,8 +24,8 @@ REPO = Path(__file__).resolve().parents[1]
 class DoctorTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()); self.home = self.root / "home"; self.home.mkdir()
-        os.environ["HELM_HOME"] = str(self.home)
-        os.environ["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol,openai-codex/gpt-5.4-mini"
+        os.environ["BOSS_HOME"] = str(self.home)
+        os.environ["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol,openai-codex/gpt-5.4-mini"
         self.repo = self.root / "repo"; self.repo.mkdir()
         subprocess.run(["git", "-C", str(self.repo), "init", "-q", "-b", "main"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "t@t"], check=True)
@@ -41,7 +41,7 @@ class DoctorTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
-        os.environ.pop("HELM_AVAILABLE_MODELS", None)
+        os.environ.pop("BOSS_AVAILABLE_MODELS", None)
 
     def snapshot(self):
         return {str(p.relative_to(self.home)): (p.read_bytes(), p.stat().st_mtime_ns)
@@ -96,7 +96,7 @@ class DoctorTests(unittest.TestCase):
         self.home.chmod(0o700)
         work_dir = self.home / "work" / "p-old"; work_dir.mkdir(parents=True)
         item_file = work_dir / "item.json"; item_file.write_text("{}\n")
-        log_file = self.home / "helm.log"; log_file.write_text("old log\n")
+        log_file = self.home / "bossctl.log"; log_file.write_text("old log\n")
         git_store = work_dir / "runs" / "old-run" / ".git"
         hook = git_store / "hooks" / "pre-commit.sample"
         hook.parent.mkdir(parents=True); hook.write_text("#!/bin/sh\nexit 0\n")
@@ -121,7 +121,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(hook.stat().st_mode & 0o777, 0o755)
 
     def test_model_inventory_runs_in_a_disposable_pi_home(self):
-        os.environ.pop("HELM_AVAILABLE_MODELS", None)
+        os.environ.pop("BOSS_AVAILABLE_MODELS", None)
         source = self.home / "pi"; source.mkdir(); (source / "settings.json").write_text("{}\n")
         (source / "auth.json").write_text('{"openai-codex":{"type":"oauth","access":"fixture"}}\n')
         fake_bin = self.root / "bin"; fake_bin.mkdir(); fake_pi = fake_bin / "pi"
@@ -133,7 +133,7 @@ class DoctorTests(unittest.TestCase):
             available, error = doctor._offline_model_inventory()
         finally:
             os.environ["PATH"] = old_path
-            os.environ["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol,openai-codex/gpt-5.4-mini"
+            os.environ["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol,openai-codex/gpt-5.4-mini"
         self.assertIsNone(error)
         self.assertEqual(available, {"openai-codex/gpt-5.6-sol"})
         self.assertEqual(self.snapshot(), before)
@@ -142,7 +142,7 @@ class DoctorTests(unittest.TestCase):
     def test_unconfirmed_repair_changes_nothing(self):
         (self.home / "wakes.json").write_text("{broken")
         before = self.snapshot()
-        with self.assertRaises(HelmError): doctor.repair(confirm=False, network=False)
+        with self.assertRaises(BossError): doctor.repair(confirm=False, network=False)
         self.assertEqual(self.snapshot(), before)
 
     def test_confirmed_corrupt_derived_state_is_backed_up_then_rebuilt(self):
@@ -167,7 +167,7 @@ class DoctorTests(unittest.TestCase):
         directory = self.home / "work" / "p-corrupt"; directory.mkdir(parents=True)
         item_path = directory / "item.json"
         write_json(item_path, {"id": "p-corrupt", "project": "p", "status": "running", "revision": 0,
-                               "branch": "firstmate/p-corrupt",
+                               "branch": "boss/p-corrupt",
                                "worktree": str(self.home / "worktrees" / "p" / "p-corrupt"),
                                "agent_launches": [None], "controls": {"events": [], "pending": []}})
         memory_path = self.home / "memory.json"
@@ -186,7 +186,7 @@ class DoctorTests(unittest.TestCase):
         # durable writer now refuses to manufacture NaN itself.
         item_path.write_text(json.dumps({
             "id": "p-node-corrupt", "project": "p", "status": "paused", "revision": 0,
-            "branch": "firstmate/p-node-corrupt",
+            "branch": "boss/p-node-corrupt",
             "worktree": str(self.home / "worktrees" / "p" / "p-node-corrupt"),
             "agent_launches": [], "controls": {"events": [], "pending": []},
             "node_budgets": {"implement": {"tokens": 10}},
@@ -234,21 +234,21 @@ class DoctorTests(unittest.TestCase):
         self.assertIsNone(claim["pid"])
         self.assertFalse(any(a["action"].startswith("remove") for a in result["applied"]))
 
-    def test_pi_firstmate_doctor_routes_to_doctor_not_a_harness(self):
-        result = subprocess.run([str(REPO / "bin" / "pi-firstmate"), "doctor", "--offline", "--json"],
+    def test_pi_boss_doctor_routes_to_doctor_not_a_harness(self):
+        result = subprocess.run([str(REPO / "bin" / "pi-boss"), "doctor", "--offline", "--json"],
                                 env={**os.environ}, text=True, capture_output=True)
         self.assertTrue(result.stdout.lstrip().startswith("{"), result.stderr)
         self.assertTrue(json.loads(result.stdout)["read_only"])
 
     def test_legacy_or_reused_pid_never_authorizes_worker_health_or_signal(self):
-        reused = {"version": 1, "kind": "firstmate-worker", "pid": os.getpid(),
+        reused = {"version": 1, "kind": "boss-worker", "pid": os.getpid(),
                   "pgid": os.getpgid(os.getpid()), "owner": "stale",
                   "start_sha256": "0" * 64, "command_sha256": "0" * 64}
         write_json(self.home / "daemon.pid", [reused, os.getpid()])
         report = doctor.audit(network=False)
         workers = [check for check in report["checks"] if check["id"].startswith("worker:")]
         self.assertTrue(workers); self.assertTrue(all(check["status"] == "unknown" for check in workers))
-        result = subprocess.run([str(REPO / "bin" / "helm"), "down", "--json"],
+        result = subprocess.run([str(REPO / "bin" / "bossctl"), "down", "--json"],
                                 env={**os.environ}, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("could not prove", result.stderr)
@@ -264,7 +264,7 @@ class DoctorTests(unittest.TestCase):
                                     "role": "reviewer", "state": "tab-created",
                                     "agent_name": "review-x", "pane_id": "w1:p9"}]}
         write_json(directory / "item.json", item)
-        with mock.patch("helm.doctor._herdr_agent", return_value={"state": "dead", "status": "dead"}):
+        with mock.patch("bossctl.doctor._herdr_agent", return_value={"state": "dead", "status": "dead"}):
             result = doctor.repair(confirm=True, network=False)
         repaired = json.loads((directory / "item.json").read_text())
         self.assertEqual(repaired["agent_launches"][0]["state"], "dead-confirmed")
@@ -272,10 +272,10 @@ class DoctorTests(unittest.TestCase):
 
     def test_reused_herdr_tab_id_is_never_treated_as_owned_or_closed(self):
         write_json(self.home / "herdr.json", {"tabs": [{"tab_id": "w1:t7", "label": "our old tab",
-                                                          "workspace_id": "w1", "herdr_session": "firstmate"}]})
+                                                          "workspace_id": "w1", "herdr_session": "boss"}]})
         live = {"w1:t7": {"tab_id": "w1:t7", "label": "someone else's tab",
-                            "workspace_id": "w1", "herdr_session": "firstmate"}}
-        with mock.patch("helm.doctor._live_tabs", return_value=(live, None)):
+                            "workspace_id": "w1", "herdr_session": "boss"}}
+        with mock.patch("bossctl.doctor._live_tabs", return_value=(live, None)):
             report = doctor.audit(network=False)
             check = next(value for value in report["checks"] if value["id"] == "tab:w1:t7")
             self.assertEqual(check["status"], "error")
@@ -288,13 +288,13 @@ class DoctorTests(unittest.TestCase):
                             "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z",
                             "activity": {"last": "2026-01-01T00:00:00Z"}, "attempts": 1,
                             "session": None, "lease": None, "ask": None}, probe_agent=False)
-        event = supervisor.claim("mate")[0]
-        supervisor.mark_sending([event["id"]], "mate")
-        supervisor.mark_sent([event["id"]], "mate")
+        event = supervisor.claim("coo")[0]
+        supervisor.mark_sending([event["id"]], "coo")
+        supervisor.mark_sent([event["id"]], "coo")
         uncertain = doctor.audit(network=False)
         receipt = next(check for check in uncertain["checks"] if check["id"] == f"wake-receipt:{event['id']}")
-        self.assertEqual(receipt["consumer"], "mate")
-        supervisor.acknowledge([event["id"]], "mate")
+        self.assertEqual(receipt["consumer"], "coo")
+        supervisor.acknowledge([event["id"]], "coo")
         acknowledged = doctor.audit(network=False)
         self.assertFalse(any(check["id"] == f"wake-receipt:{event['id']}" for check in acknowledged["checks"]))
 
@@ -311,7 +311,7 @@ class DoctorTests(unittest.TestCase):
             time.sleep(0.1)
             blocked_while_replacing.append(not writer_acquired.is_set())
             return original(target, default)
-        with mock.patch("helm.doctor._quarantine", side_effect=wrapped):
+        with mock.patch("bossctl.doctor._quarantine", side_effect=wrapped):
             doctor.repair(confirm=True, network=False)
         for thread in thread_holder: thread.join(2)
         self.assertEqual(blocked_while_replacing, [True])
@@ -365,7 +365,7 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(wt.exists())
         self.assertEqual((destination / "uncommitted.txt").read_text(), "preserve this exact work\n")
         branch = subprocess.run(["git", "-C", str(self.repo), "show-ref", "--verify", "--quiet",
-                                 "refs/heads/firstmate/p-orphan"])
+                                 "refs/heads/boss/p-orphan"])
         self.assertEqual(branch.returncode, 0)
 
     def test_confirmed_detached_worktree_rebuild_retains_exact_source_and_payload(self):
@@ -392,7 +392,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(os.readlink(wt / "payload-link"), "untracked.txt")
         self.assertEqual(subprocess.run(["git", "-C", str(wt), "branch", "--show-current"],
                                         text=True, capture_output=True, check=True).stdout.strip(),
-                         "firstmate/p-detached")
+                         "boss/p-detached")
         status = subprocess.run(["git", "-C", str(wt), "status", "--porcelain"],
                                 text=True, capture_output=True, check=True).stdout
         self.assertIn(" M README.md", status)
@@ -413,7 +413,7 @@ class DoctorTests(unittest.TestCase):
                     if observed == phase:
                         raise RuntimeError(f"injected death after {phase}")
 
-                with mock.patch("helm.worktree._recovery_checkpoint", side_effect=crash_here):
+                with mock.patch("bossctl.worktree._recovery_checkpoint", side_effect=crash_here):
                     with self.assertRaisesRegex(RuntimeError, "injected death"):
                         doctor.repair(confirm=True, network=False)
 
@@ -436,14 +436,14 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(subprocess.run(
                     ["git", "-C", str(wt), "branch", "--show-current"],
                     text=True, capture_output=True, check=True).stdout.strip(),
-                    f"firstmate/{work_id}")
+                    f"boss/{work_id}")
 
     def test_detached_worktree_recovery_refuses_changed_branch_and_retains_source(self):
         project, wt, _item, _admin = self.detached_item("p-moved-branch")
         def crash_after_source(phase, _transaction):
             if phase == "source-preserved":
                 raise RuntimeError("injected death")
-        with mock.patch("helm.worktree._recovery_checkpoint", side_effect=crash_after_source):
+        with mock.patch("bossctl.worktree._recovery_checkpoint", side_effect=crash_after_source):
             with self.assertRaises(RuntimeError):
                 doctor.repair(confirm=True, network=False)
         interrupted = worktree.registration_recovery_status("p", "p-moved-branch")
@@ -456,7 +456,7 @@ class DoctorTests(unittest.TestCase):
                                     "-m", "external branch movement"],
                                    text=True, capture_output=True, check=True).stdout.strip()
         subprocess.run(["git", "-C", str(self.repo), "update-ref",
-                        "refs/heads/firstmate/p-moved-branch", moved_sha, old_sha], check=True)
+                        "refs/heads/boss/p-moved-branch", moved_sha, old_sha], check=True)
         result = doctor.repair(confirm=True, network=False)
         skipped = [value for value in result["skipped"]
                    if value["action"] == "resume-worktree-registration"
@@ -474,7 +474,7 @@ class DoctorTests(unittest.TestCase):
                 _project, wt, _item, _admin = self.detached_item(
                     work_id, session={"agent_name": f"agent-{state}"})
                 before = worktree.entry_manifest(wt)
-                with mock.patch("helm.doctor._herdr_agent", return_value={"state": state}):
+                with mock.patch("bossctl.doctor._herdr_agent", return_value={"state": state}):
                     report = doctor.audit(network=False)
                 self.assertFalse(any(value["action"] == "rebuild-worktree-registration"
                                      and value["target"]["work_id"] == work_id
@@ -503,7 +503,7 @@ class DoctorTests(unittest.TestCase):
             self.assertNotEqual(Path(repo), lexical, "doctor followed a symlinked worktree root")
             return original_git(repo, *args, **kwargs)
         before = (marker.read_bytes(), marker.stat().st_mtime_ns)
-        with mock.patch("helm.doctor._git", side_effect=guarded):
+        with mock.patch("bossctl.doctor._git", side_effect=guarded):
             report = doctor.audit(network=False)
         self.assertEqual((marker.read_bytes(), marker.stat().st_mtime_ns), before)
         self.assertTrue(any(check["id"] == "worktree-root" and check["status"] == "error"

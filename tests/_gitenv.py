@@ -1,5 +1,5 @@
 """Test-side git hygiene: a global `core.fsmonitor=true` can hang plain git calls on fresh
-temp repos (seen on macOS). helm disables it for its own calls; this does the same for the
+temp repos (seen on macOS). bossctl disables it for its own calls; this does the same for the
 tests' setup git and for every child process they spawn."""
 import os
 

@@ -26,9 +26,9 @@ mode = os.environ.get("FAKE_PIW_MODE", "ok")
 for marker in ("ask", "fail", "dirty", "sensitive", "scout-write", "ok"):
     if f"[fake:{marker}]" in brief:
         mode = marker
-if mode == "ask" and "Captain guidance" in brief:
+if mode == "ask" and "Boss guidance" in brief:
     mode = "ok"          # the question was answered; a real worker would proceed too
-if "workflow: helm-scout" in text and mode != "scout-write":
+if "workflow: bossctl-scout" in text and mode != "scout-write":
     mode = "scout"
 (run_dir / "mode.txt").write_text(mode)
 # Evidence for concurrency assertions: when this "worker" started and finished, and where.
@@ -43,7 +43,7 @@ def done(ok, failed):
     sys.exit(0 if ok else 1)
 
 if mode == "ask":
-    Path(cwd, ".helm-ask.json").write_text(json.dumps({"question": "Which auth provider?", "context": "two exist"}))
+    Path(cwd, ".boss-ask.json").write_text(json.dumps({"question": "Which auth provider?", "context": "two exist"}))
     (run_dir / "protected.stderr").write_text("ASKED")
     done(False, ["protected"])
 if mode == "fail":
@@ -54,10 +54,10 @@ if mode in ("scout", "scout-write"):
     if mode == "scout-write": Path(cwd, "scout-wrote.txt").write_text("forbidden\n")
     done(True, [])
 # ok: make a commit in the worktree, honouring guidance if present
-Path(cwd, "helm-change.txt").write_text("changed\n" + ("guided\n" if "Captain guidance" in brief else ""))
+Path(cwd, "bossctl-change.txt").write_text("changed\n" + ("guided\n" if "Boss guidance" in brief else ""))
 if mode == "sensitive": Path(cwd, "package-lock.json").write_text(json.dumps({"generated": time.time()}))
 subprocess.run(["git", "-C", cwd, "add", "-A"], check=True)
-subprocess.run(["git", "-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "helm: fake change"], check=True)
+subprocess.run(["git", "-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "bossctl: fake change"], check=True)
 sha = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
 base_ref = re.search(r"\(base: ([^)]+)\)", text).group(1)
 base_sha = subprocess.run(["git", "-C", cwd, "rev-parse", base_ref], check=True,

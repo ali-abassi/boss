@@ -12,14 +12,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import control, deliver, work, worktree
-from helm.util import HelmError, sh as real_sh, write_json
+from bossctl import control, deliver, work, worktree
+from bossctl.util import BossError, sh as real_sh, write_json
 
 
 class PromotionTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()); self.home = self.root / "home"
-        os.environ["HELM_HOME"] = str(self.home)
+        os.environ["BOSS_HOME"] = str(self.home)
         self.repo = self.root / "repo"; self.repo.mkdir()
         self.git("init", "-q", "-b", "main"); self.git("config", "user.email", "t@t"); self.git("config", "user.name", "t")
         (self.repo / "base.txt").write_text("base\n"); self.git("add", "-A"); self.git("commit", "-qm", "base")
@@ -57,7 +57,7 @@ class PromotionTests(unittest.TestCase):
                         "reviewer": {"kind": "test", "identity": "independent"}}]
         return {"id": self.work_id, "project": "p", "status": status, "phase": "merge-ready",
                 "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z",
-                "revision": 0, "branch": f"firstmate/{self.work_id}", "worktree": str(self.wt),
+                "revision": 0, "branch": f"boss/{self.work_id}", "worktree": str(self.wt),
                 "head_sha": self.head, "pr_url": None, "session": None, "agent_launches": [],
                 "dispatch": {"graph": graph}, "reviews": reviews, "controls": {"events": [], "pending": []},
                 "verification": [{"ok": True, "complete": True, "base_sha": self.base,
@@ -66,13 +66,13 @@ class PromotionTests(unittest.TestCase):
 
     def test_initial_promotion_refuses_a_missing_worktree(self):
         self.git("worktree", "remove", "--force", str(self.wt))
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             deliver.promote(work.load(self.work_id), self.project, True)
         self.assertNotIn("promotion", work.load(self.work_id))
         self.assertEqual(self.git("rev-parse", "main"), self.base)
 
     def test_local_merge_crash_reconciles_from_exact_base_head(self):
-        with mock.patch("helm.deliver._mark_merged", side_effect=RuntimeError("crash after git merge")):
+        with mock.patch("bossctl.deliver._mark_merged", side_effect=RuntimeError("crash after git merge")):
             with self.assertRaises(RuntimeError):
                 deliver.promote(work.load(self.work_id), self.project, True)
         self.assertEqual(self.git("rev-parse", "main"), self.head)
@@ -91,7 +91,7 @@ class PromotionTests(unittest.TestCase):
                 crashed[0] = True
                 raise RuntimeError("controller died after clean worktree removal")
             return result
-        with mock.patch("helm.worktree.remove", side_effect=remove_then_die):
+        with mock.patch("bossctl.worktree.remove", side_effect=remove_then_die):
             with self.assertRaises(RuntimeError):
                 deliver.promote(work.load(self.work_id), self.project, True)
         midway = work.load(self.work_id)
@@ -103,7 +103,7 @@ class PromotionTests(unittest.TestCase):
         stored = work.load(self.work_id)
         self.assertEqual(stored["promotion"]["state"], "complete")
         self.assertTrue(stored["promotion"]["branch_retained"])
-        self.assertEqual(self.git("rev-parse", f"firstmate/{self.work_id}"), self.head)
+        self.assertEqual(self.git("rev-parse", f"boss/{self.work_id}"), self.head)
 
     def test_gate_change_after_arm_never_reaches_local_merge(self):
         original = deliver._mark_requested
@@ -112,8 +112,8 @@ class PromotionTests(unittest.TestCase):
             changed = {**self.project, "gate": "no-mistakes"}
             write_json(self.home / "projects.json", {"projects": {"p": changed}})
             return requested
-        with mock.patch("helm.deliver._mark_requested", side_effect=switch_gate):
-            with self.assertRaises(HelmError):
+        with mock.patch("bossctl.deliver._mark_requested", side_effect=switch_gate):
+            with self.assertRaises(BossError):
                 deliver.promote(work.load(self.work_id), self.project, True)
         self.assertEqual(self.git("rev-parse", "main"), self.base)
         self.assertEqual(work.load(self.work_id)["promotion"]["state"], "external-requested")
@@ -127,8 +127,8 @@ class PromotionTests(unittest.TestCase):
             self.wgit("add", "-A"); self.wgit("commit", "-qm", "late unreviewed")
             late_sha.append(self.wgit("rev-parse", "HEAD"))
             return armed
-        with mock.patch("helm.deliver._mark_requested", side_effect=mutate_after_arm):
-            with self.assertRaises(HelmError):
+        with mock.patch("bossctl.deliver._mark_requested", side_effect=mutate_after_arm):
+            with self.assertRaises(BossError):
                 deliver.promote(work.load(self.work_id), self.project, True)
         stored = work.load(self.work_id)
         self.assertEqual(stored["status"], "ready")
@@ -148,9 +148,9 @@ class PromotionTests(unittest.TestCase):
             if args[:3] == ["gh", "pr", "merge"]:
                 return subprocess.CompletedProcess(args, 0, "queued", "")
             return real_sh(args, **kwargs)
-        with mock.patch("helm.forge.require_green", return_value=green), \
-             mock.patch("helm.forge.monitor_item", return_value=green), \
-             mock.patch("helm.deliver.sh", side_effect=command):
+        with mock.patch("bossctl.forge.require_green", return_value=green), \
+             mock.patch("bossctl.forge.monitor_item", return_value=green), \
+             mock.patch("bossctl.deliver.sh", side_effect=command):
             result = deliver.promote(work.load(self.work_id), self.project, True)
         stored = work.load(self.work_id)
         self.assertEqual(result["state"], "merge-requested")
@@ -159,10 +159,10 @@ class PromotionTests(unittest.TestCase):
 
     def test_away_and_armed_transaction_block_merge_and_steering(self):
         write_json(self.home / "supervisor.json", {"version": 1, "observations": {}, "away": {"enabled": True}})
-        with self.assertRaises(HelmError): deliver.promote(work.load(self.work_id), self.project, True)
+        with self.assertRaises(BossError): deliver.promote(work.load(self.work_id), self.project, True)
         write_json(self.home / "supervisor.json", {"version": 1, "observations": {}, "away": {"enabled": False}})
         control.cas_update(self.work_id, lambda item: item.update(promotion={"state": "external-requested"}))
-        with self.assertRaises(HelmError): control.request(self.work_id, "steer", "change it")
+        with self.assertRaises(BossError): control.request(self.work_id, "steer", "change it")
         self.assertEqual(self.git("rev-parse", "main"), self.base)
 
 

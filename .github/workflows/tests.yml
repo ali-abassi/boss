@@ -20,4 +20,9 @@ jobs:
       - run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
       - run: python -m pip install -q -r vendor/pi-graph/requirements.txt
       - run: git config --global user.email ci@example.com && git config --global user.name ci
+      - run: bash -n install.sh bin/pi-boss bin/pi-boss-quit
+      - run: bun .pi/extensions/boss.ts
+      - run: bun bossctl/pi_attest.ts
+      - run: python -m compileall -q bossctl tests
       - run: python -m unittest discover -s tests -v
+      - run: git diff --check

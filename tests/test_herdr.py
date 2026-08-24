@@ -1,4 +1,4 @@
-"""Inside Herdr the fleet is visible without a redundant board tab."""
+"""Inside Herdr the ops is visible without a redundant board tab."""
 try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
@@ -6,10 +6,10 @@ except ImportError:
 import hashlib, json, os, subprocess, sys, tempfile, unittest, uuid
 from pathlib import Path
 from unittest import mock
-from tests.fake_helm import fake_sandbox_status
+from tests.fake_bossctl import fake_sandbox_status
 
 REPO = Path(__file__).resolve().parents[1]
-HELM = [sys.executable, str(REPO / "tests" / "fake_helm.py")]
+BOSS = [sys.executable, str(REPO / "tests" / "fake_bossctl.py")]
 
 
 class HerdrTests(unittest.TestCase):
@@ -23,17 +23,17 @@ class HerdrTests(unittest.TestCase):
         (self.proj / "README.md").write_text("x"); g("add", "-A"); g("commit", "-qm", "init")
         self.pi_home = self.home / "pi"; self.pi_home.mkdir(parents=True)
         (self.pi_home / "settings.json").write_text("{}\n")
-        self.env = {**os.environ, "HELM_HOME": str(self.home), "HELM_PIW": str(REPO / "tests" / "fake_piw.py"),
+        self.env = {**os.environ, "BOSS_HOME": str(self.home), "BOSS_PIW": str(REPO / "tests" / "fake_piw.py"),
                     "PI_CODING_AGENT_DIR": str(self.pi_home),
                     "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_HERDR_LOG": str(self.log),
                     "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1", "HERDR_SESSION": "pi-x", "HERDR_PANE_ID": "w1:p1"}
-        sandbox_patch = mock.patch("helm.sandbox.available", side_effect=fake_sandbox_status)
+        sandbox_patch = mock.patch("bossctl.sandbox.available", side_effect=fake_sandbox_status)
         sandbox_patch.start(); self.addCleanup(sandbox_patch.stop)
 
-    def helm(self, *args, check=True):
-        r = subprocess.run(HELM + list(args), env=self.env, text=True, capture_output=True)
+    def bossctl(self, *args, check=True):
+        r = subprocess.run(BOSS + list(args), env=self.env, text=True, capture_output=True)
         if check and r.returncode != 0:
-            self.fail(f"helm {' '.join(args)} failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
+            self.fail(f"bossctl {' '.join(args)} failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return r
 
     def calls(self):
@@ -47,7 +47,7 @@ class HerdrTests(unittest.TestCase):
         profile = self.tmp / "fake-profile.sb"; profile.write_text("(version 1)\n")
         scratch = self.tmp / "fake-scratch"; scratch.mkdir()
         receipt = hashlib.sha256(profile.read_bytes()).hexdigest()
-        runner = str(REPO / "tests" / "fake_firstmate_tool.py")
+        runner = str(REPO / "tests" / "fake_boss_tool.py")
         marker = self.tmp / "must-not-exist"
         refused = subprocess.run(
             [runner, str(profile), receipt, str(scratch), "1", f"touch {marker}"],
@@ -62,17 +62,17 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(timed.returncode, 124, timed.stderr)
 
     def test_up_readies_scheduler_without_empty_herdr_tabs(self):
-        out = self.helm("up", "--workers", "3").stdout
+        out = self.bossctl("up", "--workers", "3").stdout
         self.assertEqual(out, "")
         creates = [c for c in self.calls() if c[:2] == ["tab", "create"]]
         self.assertEqual(creates, [])
         records = json.loads((self.home / "daemon.pid").read_text())
         self.assertEqual(len(records), 3)
-        self.assertTrue(all(record["kind"] == "firstmate-worker" and record.get("start_sha256")
+        self.assertTrue(all(record["kind"] == "boss-worker" and record.get("start_sha256")
                             and record.get("command_sha256") for record in records))
-        self.assertEqual(self.helm("up").stdout, "")                         # idempotent and quiet
-        self.assertIn("crew      ready", self.helm("status").stdout)
-        self.helm("down")
+        self.assertEqual(self.bossctl("up").stdout, "")                         # idempotent and quiet
+        self.assertIn("team      ready", self.bossctl("status").stdout)
+        self.bossctl("down")
         closes = [c for c in self.calls() if c[:2] == ["tab", "close"]]
         self.assertEqual(closes, [])
         self.assertFalse((self.home / "herdr.json").exists())
@@ -80,7 +80,7 @@ class HerdrTests(unittest.TestCase):
     def test_startup_never_closes_a_reused_stale_tab_id(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import cli, herdr
+            from bossctl import cli, herdr
             self.home.mkdir(parents=True, exist_ok=True)
             (self.home / "herdr.json").write_text(json.dumps({"tabs": [
                 {"kind": "worker", "tab_id": "w1:t-reused", "workspace_id": "w1",
@@ -96,10 +96,10 @@ class HerdrTests(unittest.TestCase):
         finally:
             os.environ.clear(); os.environ.update(old)
 
-    def test_each_running_task_gets_a_tab_then_it_closes_and_captain_is_notified(self):
-        self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
-        it = json.loads(self.helm("task", "p", "add a thing", "--json").stdout)
-        self.helm("run-once")
+    def test_each_running_task_gets_a_tab_then_it_closes_and_boss_is_notified(self):
+        self.bossctl("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
+        it = json.loads(self.bossctl("task", "p", "add a thing", "--json").stdout)
+        self.bossctl("run-once")
         calls = self.calls()
         creates = [c for c in calls if c[:2] == ["tab", "create"]]
         self.assertEqual(len(creates), 1)
@@ -111,45 +111,45 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(notes[0][2], "p: ready")
         self.assertEqual(json.loads((self.home / "herdr.json").read_text())["tabs"], [])
 
-    def test_pi_firstmate_outside_herdr_launches_named_session_without_recursion(self):
+    def test_pi_boss_outside_herdr_launches_named_session_without_recursion(self):
         env = {k: v for k, v in self.env.items() if not k.startswith("HERDR_")}
         env["FAKE_HERDR_LOG"] = str(self.log)
-        r = subprocess.run([str(REPO / "bin" / "pi-firstmate")], env=env, text=True, capture_output=True)
+        r = subprocess.run([str(REPO / "bin" / "pi-boss")], env=env, text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.calls()
-        self.assertIn(["--session", "firstmate", "workspace", "list"], self.raw_calls())
+        self.assertIn(["--session", "boss", "workspace", "list"], self.raw_calls())
         run = next(c for c in calls if c[:2] == ["pane", "run"])
-        self.assertIn("pi-firstmate", run[-1])
+        self.assertIn("pi-boss", run[-1])
         focus = next(c for c in calls if c[:2] == ["tab", "focus"])
         self.assertLess(calls.index(focus), calls.index(run), "the no-focus tab must be focused before command delivery")
-        self.assertEqual(calls[-1], ["session", "attach", "firstmate"])
+        self.assertEqual(calls[-1], ["session", "attach", "boss"])
 
     def test_new_workspace_closes_the_default_empty_shell_tab(self):
         env = {k: v for k, v in self.env.items() if not k.startswith("HERDR_")}
         env.update(FAKE_HERDR_LOG=str(self.log), FAKE_HERDR_NEW_WORKSPACE="1")
-        r = subprocess.run([str(REPO / "bin" / "pi-firstmate")], env=env, text=True, capture_output=True)
+        r = subprocess.run([str(REPO / "bin" / "pi-boss")], env=env, text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.calls()
         self.assertTrue(any(c[:2] == ["workspace", "create"] for c in calls))
         self.assertIn(["tab", "close", "w1:t-default"], calls)
 
-    def test_existing_shell_only_firstmate_tab_is_restarted_and_focused(self):
+    def test_existing_shell_only_boss_tab_is_restarted_and_focused(self):
         env = {k: v for k, v in self.env.items() if not k.startswith("HERDR_")}
-        env.update(FAKE_HERDR_LOG=str(self.log), FAKE_HERDR_EXISTING_DEAD_MATE="1")
-        r = subprocess.run([str(REPO / "bin" / "pi-firstmate")], env=env, text=True, capture_output=True)
+        env.update(FAKE_HERDR_LOG=str(self.log), FAKE_HERDR_EXISTING_DEAD_COO="1")
+        r = subprocess.run([str(REPO / "bin" / "pi-boss")], env=env, text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.calls()
-        run = ["pane", "run", "w1:p-mate", str(REPO / "bin" / "pi-firstmate")]
-        focus = ["tab", "focus", "w1:t-mate"]
+        run = ["pane", "run", "w1:p-coo", str(REPO / "bin" / "pi-boss")]
+        focus = ["tab", "focus", "w1:t-coo"]
         self.assertIn(run, calls)
         self.assertLess(calls.index(focus), calls.index(run))
-        self.assertIn(["tab", "focus", "w1:t-mate"], calls)
-        self.assertEqual(calls[-1], ["session", "attach", "firstmate"])
+        self.assertIn(["tab", "focus", "w1:t-coo"], calls)
+        self.assertEqual(calls[-1], ["session", "attach", "boss"])
 
-    def test_agent_tab_is_focused_through_start_then_captain_is_restored(self):
-        old = os.environ.copy(); os.environ.update(self.env, HERDR_TAB_ID="w1:t-captain")
+    def test_agent_tab_is_focused_through_start_then_boss_is_restored(self):
+        old = os.environ.copy(); os.environ.update(self.env, HERDR_TAB_ID="w1:t-boss")
         try:
-            from helm import herdr
+            from bossctl import herdr
             item = {"id": "p-focused", "project": "p", "session": None}
             herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
             calls = self.calls()
@@ -159,7 +159,7 @@ class HerdrTests(unittest.TestCase):
             start = next(c for c in calls if c[:2] == ["agent", "start"])
             wrapper = next(c for c in calls if c[:3] == ["pane", "run", start[start.index("--pane") + 1]]
                            and "pi()" in c[-1])
-            restore = next(c for c in calls if c[:3] == ["tab", "focus", "w1:t-captain"])
+            restore = next(c for c in calls if c[:3] == ["tab", "focus", "w1:t-boss"])
             self.assertLess(calls.index(focus_new), calls.index(start))
             self.assertLess(calls.index(wrapper), calls.index(start))
             self.assertIn(str(REPO / "libexec" / "pi"), wrapper[-1])
@@ -170,9 +170,9 @@ class HerdrTests(unittest.TestCase):
     def test_launch_environment_replaces_inherited_pi_home_without_duplicates(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
+            from bossctl import herdr
             private = str(self.home / "work" / "item" / "private-pi")
-            with mock.patch.object(herdr, "focused_tab", return_value="w1:t-captain"), \
+            with mock.patch.object(herdr, "focused_tab", return_value="w1:t-boss"), \
                  mock.patch.object(herdr, "focus_tab", return_value=True), \
                  mock.patch.object(herdr, "wait_shell", return_value=True):
                 self.assertTrue(herdr.open_tab("private", "", self.proj,
@@ -187,7 +187,7 @@ class HerdrTests(unittest.TestCase):
     def test_real_implementer_identity_reconnects_and_reviewers_are_fresh(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
+            from bossctl import herdr
             item = {"id": "p-item", "project": "p", "session": None}
             first = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
             uuid.UUID(first["agent_session_id"])
@@ -206,7 +206,7 @@ class HerdrTests(unittest.TestCase):
     def test_runtime_attestation_and_hash_only_input_ledger_fail_closed_on_tampering(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
+            from bossctl import herdr
             item = {"id": "attested", "project": "p", "session": None}
             session = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
             with self.assertRaises(SystemExit):
@@ -239,8 +239,8 @@ class HerdrTests(unittest.TestCase):
     def test_controller_owned_anchor_rejects_same_inode_empty_and_valid_prefix_rollback(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
-            from helm.util import write_json
+            from bossctl import herdr
+            from bossctl.util import write_json
             work_id = "anchored-ledger"
             directory = self.home / "work" / work_id; directory.mkdir(parents=True)
             item = {"id": work_id, "project": "p", "revision": 0, "status": "running",
@@ -273,7 +273,7 @@ class HerdrTests(unittest.TestCase):
     def test_runtime_ledger_correlates_queued_steering_with_the_turn_that_settles(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
+            from bossctl import herdr
             from tests._event_signing import sign_chain
             session = herdr.ensure_agent({"id": "queued-steer", "project": "p", "session": None}, self.proj,
                                          "openai-codex/gpt-5.6-sol", "high")
@@ -304,7 +304,7 @@ class HerdrTests(unittest.TestCase):
             os.environ.clear(); os.environ.update(old)
 
     def test_missing_input_evidence_after_prompt_submission_is_unsettled(self):
-        from helm import herdr
+        from bossctl import herdr
         live = {"agent_status": "idle", "state_change_seq": 7, "pane_id": "w1:p2"}
         identity = {"agent_events_path": "/tmp/events", "model": "openai-codex/gpt-5.6-sol",
                     "thinking": "high"}
@@ -327,7 +327,7 @@ class HerdrTests(unittest.TestCase):
     def test_dead_agent_requires_one_use_recovery_authorization_before_checkpoint_fallback(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
+            from bossctl import herdr
             item = {"id": "p-dead", "project": "p", "session": None}
             first = herdr.ensure_agent(item, self.proj, "openai-codex/gpt-5.6-sol", "high")
             item["session"] = first
@@ -346,7 +346,7 @@ class HerdrTests(unittest.TestCase):
     def test_explicit_recovery_supersedes_a_crash_reserved_absent_launch(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr
+            from bossctl import herdr
             work_id = "p-reserved"
             directory = self.home / "work" / work_id; directory.mkdir(parents=True)
             launch_id = str(uuid.uuid4())
@@ -370,9 +370,9 @@ class HerdrTests(unittest.TestCase):
             os.environ.clear(); os.environ.update(old)
 
     def test_live_steering_is_submitted_without_waiting_on_active_turn(self):
-        old = os.environ.copy(); os.environ.update(self.env, HERDR_TAB_ID="w1:t-captain")
+        old = os.environ.copy(); os.environ.update(self.env, HERDR_TAB_ID="w1:t-boss")
         try:
-            from helm import herdr
+            from bossctl import herdr
             session = herdr.ensure_agent({"id": "steer-x", "project": "p", "session": None}, self.proj,
                                          "openai-codex/gpt-5.6-sol", "high")
             target = session["agent_name"]
@@ -385,7 +385,7 @@ class HerdrTests(unittest.TestCase):
             focus_index = max(i for i, call in enumerate(calls[:prompt_index])
                               if call[:3] == ["agent", "focus", target])
             restore_index = max(i for i, call in enumerate(calls)
-                                if call[:3] == ["tab", "focus", "w1:t-captain"])
+                                if call[:3] == ["tab", "focus", "w1:t-boss"])
             self.assertLess(focus_index, prompt_index)
             self.assertGreater(restore_index, prompt_index)
         finally:
@@ -393,17 +393,17 @@ class HerdrTests(unittest.TestCase):
 
     def test_ship_runs_in_real_persistent_agent_and_reviews_bind_exact_sha(self):
         env = {**self.env, "FAKE_HERDR_EXECUTE": "1",
-               "HELM_AVAILABLE_MODELS": "openai-codex/gpt-5.6-sol"}
-        env.pop("HELM_PIW", None)
-        r = subprocess.run(HELM + ["add", str(self.proj), "--id", "persistent", "--test", "true",
+               "BOSS_AVAILABLE_MODELS": "openai-codex/gpt-5.6-sol"}
+        env.pop("BOSS_PIW", None)
+        r = subprocess.run(BOSS + ["add", str(self.proj), "--id", "persistent", "--test", "true",
                                   "--mode", "high-assurance"], env=env, text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        task = subprocess.run(HELM + ["task", "persistent", "change it", "--json"], env=env,
+        task = subprocess.run(BOSS + ["task", "persistent", "change it", "--json"], env=env,
                               text=True, capture_output=True)
         self.assertEqual(task.returncode, 0, task.stderr); item = json.loads(task.stdout)
-        run = subprocess.run(HELM + ["run-once"], env=env, text=True, capture_output=True)
+        run = subprocess.run(BOSS + ["run-once"], env=env, text=True, capture_output=True)
         self.assertEqual(run.returncode, 0, run.stderr)
-        shown = json.loads(subprocess.run(HELM + ["show", item["id"], "--json"], env=env,
+        shown = json.loads(subprocess.run(BOSS + ["show", item["id"], "--json"], env=env,
                                           text=True, capture_output=True, check=True).stdout)
         self.assertEqual(shown["status"], "ready", shown)
         uuid.UUID(shown["session"]["agent_session_id"])
@@ -414,13 +414,13 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(len(starts), 3, "one persistent implementer plus two fresh reviewers")
 
     def test_reviewer_usage_is_cumulative_and_exhaustion_stops_before_next_reviewer(self):
-        self.env.pop("HELM_PIW", None)
-        self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
-        self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "high-assurance")
-        item = json.loads(self.helm("task", "p", "bounded reviews", "--max-tokens", "15", "--json").stdout)
+        self.env.pop("BOSS_PIW", None)
+        self.env["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        self.bossctl("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "high-assurance")
+        item = json.loads(self.bossctl("task", "p", "bounded reviews", "--max-tokens", "15", "--json").stdout)
         self.env["FAKE_HERDR_EXECUTE"] = "1"
-        self.helm("run-once")
-        shown = json.loads(self.helm("show", item["id"], "--json").stdout)
+        self.bossctl("run-once")
+        shown = json.loads(self.bossctl("show", item["id"], "--json").stdout)
         self.assertEqual(shown["status"], "paused", shown)
         self.assertEqual(shown["usage"]["tokens"], 20)
         self.assertEqual(shown["usage"]["implementer_tokens"], 10)
@@ -430,14 +430,14 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(len(starts), 2, "adversarial reviewer must not start after the aggregate cap")
 
     def test_per_node_reviewer_budget_is_receipted_and_stops_later_nodes(self):
-        self.env.pop("HELM_PIW", None)
-        self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
-        self.helm("add", str(self.proj), "--id", "node-cap", "--test", "true", "--mode", "high-assurance")
-        item = json.loads(self.helm("task", "node-cap", "bounded correctness review",
+        self.env.pop("BOSS_PIW", None)
+        self.env["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        self.bossctl("add", str(self.proj), "--id", "node-cap", "--test", "true", "--mode", "high-assurance")
+        item = json.loads(self.bossctl("task", "node-cap", "bounded correctness review",
                                     "--node-max-tokens", "review_correctness=5", "--json").stdout)
         self.env["FAKE_HERDR_EXECUTE"] = "1"
-        self.helm("run-once")
-        shown = json.loads(self.helm("show", item["id"], "--json").stdout)
+        self.bossctl("run-once")
+        shown = json.loads(self.bossctl("show", item["id"], "--json").stdout)
         self.assertEqual(shown["status"], "paused", shown)
         self.assertEqual(shown["node_usage"]["implement"]["tokens"], 10)
         self.assertEqual(shown["node_usage"]["review_correctness"]["tokens"], 10)
@@ -446,15 +446,15 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(len(starts), 2, "adversarial reviewer must not start after the node cap")
 
     def test_verify_node_seconds_cap_times_out_and_never_starts_a_reviewer(self):
-        self.env.pop("HELM_PIW", None)
-        self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
-        self.helm("add", str(self.proj), "--id", "verify-cap", "--test", "sleep 3",
+        self.env.pop("BOSS_PIW", None)
+        self.env["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        self.bossctl("add", str(self.proj), "--id", "verify-cap", "--test", "sleep 3",
                   "--mode", "high-assurance")
-        item = json.loads(self.helm("task", "verify-cap", "bounded verify",
+        item = json.loads(self.bossctl("task", "verify-cap", "bounded verify",
                                     "--node-max-seconds", "verify=1", "--json").stdout)
         self.env["FAKE_HERDR_EXECUTE"] = "1"
-        self.helm("run-once")
-        shown = json.loads(self.helm("show", item["id"], "--json").stdout)
+        self.bossctl("run-once")
+        shown = json.loads(self.bossctl("show", item["id"], "--json").stdout)
         self.assertEqual(shown["status"], "paused", shown)
         self.assertEqual(shown["runs"][-1]["failed_ids"], ["verify"])
         self.assertGreaterEqual(shown["node_usage"]["verify"]["seconds"], 0.9)
@@ -462,15 +462,15 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(len(starts), 1)
 
     def test_elapsed_budget_consumed_by_verification_never_starts_a_reviewer(self):
-        self.env.pop("HELM_PIW", None)
-        self.env["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
-        self.helm("add", str(self.proj), "--id", "timed", "--test", "sleep 5",
+        self.env.pop("BOSS_PIW", None)
+        self.env["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        self.bossctl("add", str(self.proj), "--id", "timed", "--test", "sleep 5",
                   "--mode", "high-assurance")
-        item = json.loads(self.helm("task", "timed", "bounded verification",
+        item = json.loads(self.bossctl("task", "timed", "bounded verification",
                                     "--max-seconds", "3", "--json").stdout)
         self.env["FAKE_HERDR_EXECUTE"] = "1"
-        self.helm("run-once")
-        shown = json.loads(self.helm("show", item["id"], "--json").stdout)
+        self.bossctl("run-once")
+        shown = json.loads(self.bossctl("show", item["id"], "--json").stdout)
         starts = [call for call in self.calls() if call[:2] == ["agent", "start"]]
         self.assertEqual(len(starts), 1, "no reviewer may start after verification consumes the deadline")
         self.assertIn(shown["status"], {"queued", "paused"}, shown)
@@ -485,11 +485,11 @@ class HerdrTests(unittest.TestCase):
 
     def test_successful_verification_that_consumes_deadline_stops_before_reviewer_creation(self):
         old = os.environ.copy(); os.environ.update(self.env)
-        os.environ.pop("HELM_PIW", None)
-        os.environ["HELM_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
+        os.environ.pop("BOSS_PIW", None)
+        os.environ["BOSS_AVAILABLE_MODELS"] = "openai-codex/gpt-5.6-sol"
         try:
-            from helm import work, worktree
-            from helm.util import write_json
+            from bossctl import work, worktree
+            from bossctl.util import write_json
             work_id = "deadline-review"
             project = {"id": "p", "path": str(self.proj), "base": "main", "mode": "high-assurance",
                        "authority": 1, "test_cmd": "true", "protected_paths": [], "gate": "native"}
@@ -502,7 +502,7 @@ class HerdrTests(unittest.TestCase):
             thinking = {phase: "high" for phase in models}
             item = {"id": work_id, "project": "p", "kind": "ship", "text": "bounded", "status": "running",
                     "phase": "implementing", "revision": 0, "created": "2026-01-01T00:00:00Z",
-                    "updated": "2026-01-01T00:00:00Z", "branch": f"firstmate/{work_id}",
+                    "updated": "2026-01-01T00:00:00Z", "branch": f"boss/{work_id}",
                     "worktree": str(wt), "history": [], "runs": [], "reviews": [], "verification": [],
                     "agent_launches": [], "session": None, "checkpoint": None, "changed_scope": [],
                     "controls": {"paused": False, "pending": [], "events": []}, "attempts": 0,
@@ -523,16 +523,16 @@ class HerdrTests(unittest.TestCase):
             def verified(**_kwargs):
                 clock[0] = 1.1
                 return subprocess.CompletedProcess(["verify"], 0, "ok", "")
-            with mock.patch("helm.work.time.monotonic", side_effect=lambda: clock[0]), \
-                 mock.patch("helm.herdr.ensure_agent", return_value=session) as ensure, \
-                 mock.patch("helm.work._model_drift"), \
-                 mock.patch("helm.herdr.progress_marker", return_value="marker"), \
-                 mock.patch("helm.herdr.runtime_activity", return_value={"runtime_input_sequence": 0}), \
-                 mock.patch("helm.herdr.prompt_agent_monitored", return_value=(session, None)), \
-                 mock.patch("helm.herdr.agent_get", return_value=session), \
-                 mock.patch("helm.herdr.usage", return_value={"tokens": 1, "cost": 0.01}), \
-                 mock.patch("helm.herdr.agent_read", return_value="done"), \
-                 mock.patch("helm.sandbox.run_verification", side_effect=verified):
+            with mock.patch("bossctl.work.time.monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch("bossctl.herdr.ensure_agent", return_value=session) as ensure, \
+                 mock.patch("bossctl.work._model_drift"), \
+                 mock.patch("bossctl.herdr.progress_marker", return_value="marker"), \
+                 mock.patch("bossctl.herdr.runtime_activity", return_value={"runtime_input_sequence": 0}), \
+                 mock.patch("bossctl.herdr.prompt_agent_monitored", return_value=(session, None)), \
+                 mock.patch("bossctl.herdr.agent_get", return_value=session), \
+                 mock.patch("bossctl.herdr.usage", return_value={"tokens": 1, "cost": 0.01}), \
+                 mock.patch("bossctl.herdr.agent_read", return_value="done"), \
+                 mock.patch("bossctl.sandbox.run_verification", side_effect=verified):
                 result = work._persistent_execute(item, project, wt, brief, 10, {},
                                                   attempt_started=0.0, deadline=1.0)
             self.assertFalse(result["ok"])
@@ -543,7 +543,7 @@ class HerdrTests(unittest.TestCase):
             os.environ.clear(); os.environ.update(old)
 
     def test_live_pending_or_unknown_session_is_never_closed_by_label_fallback(self):
-        from helm import herdr
+        from bossctl import herdr
         session = {"agent_name": "impl", "agent_session_id": "session-1", "pane_id": "w1:p7",
                    "tab_id": "w1:t7", "workspace_id": "w1", "label": "work p"}
         live = {"state": "live", "agent": {"pane_id": "w1:p7", "tab_id": "w1:t7",
@@ -571,8 +571,8 @@ class HerdrTests(unittest.TestCase):
             close.assert_not_called()
 
     def test_exact_liveness_rejects_reused_pane_or_different_session_uuid(self):
-        from helm import herdr
-        from helm.util import HelmError
+        from bossctl import herdr
+        from bossctl.util import BossError
         identity = {"agent_name": "impl", "agent_session_id": "durable-session",
                     "pane_id": "w1:p7", "workspace_id": "w1", "tab_id": "w1:t7",
                     "resolved_model": "openai-codex/gpt-5.6-sol", "resolved_thinking": "high",
@@ -587,7 +587,7 @@ class HerdrTests(unittest.TestCase):
         omitted = {"state": "live", "agent": {"name": "impl", "pane_id": "w1:p7",
                    "workspace_id": "w1", "tab_id": "w1:t7"}}
         with mock.patch.object(herdr, "_verify_runtime_attestation",
-                               side_effect=HelmError("attested PID is no longer in this pane")):
+                               side_effect=BossError("attested PID is no longer in this pane")):
             result = herdr.exact_agent_liveness(identity, omitted, process_info={})
         self.assertEqual(result["state"], "unknown")
         self.assertIn("attested PID", result["reason"])
@@ -602,7 +602,7 @@ class HerdrTests(unittest.TestCase):
     def test_same_pid_with_different_birth_identity_cannot_be_steered_interrupted_or_closed(self):
         old = os.environ.copy(); os.environ.update(self.env)
         try:
-            from helm import herdr, processes
+            from bossctl import herdr, processes
             session = herdr.ensure_agent({"id": "pid-reuse", "project": "p", "session": None},
                                          self.proj, "openai-codex/gpt-5.6-sol", "high")
             herdr.prompt_agent(session["agent_name"], "materialize durable identity", 30, session)
@@ -627,7 +627,7 @@ class HerdrTests(unittest.TestCase):
             os.environ.clear(); os.environ.update(old)
 
     def test_manual_pause_settles_without_an_unbudgeted_checkpoint_turn(self):
-        from helm import herdr
+        from bossctl import herdr
         identity = {"agent_name": "impl", "agent_session_id": "session-1"}
         with mock.patch.object(herdr, "runtime_activity", return_value={"runtime_input_sequence": 1}), \
              mock.patch.object(herdr, "_runtime_settled", side_effect=[False, True, True]), \
@@ -643,15 +643,15 @@ class HerdrTests(unittest.TestCase):
 
     def test_reviewer_loss_never_becomes_approval_or_delivery(self):
         env = {**self.env, "FAKE_HERDR_EXECUTE": "1", "FAKE_HERDR_REVIEWER_LOSS": "1",
-               "HELM_AVAILABLE_MODELS": "openai-codex/gpt-5.6-sol"}
-        env.pop("HELM_PIW", None)
-        self.assertEqual(subprocess.run(HELM + ["add", str(self.proj), "--id", "loss", "--test", "true",
+               "BOSS_AVAILABLE_MODELS": "openai-codex/gpt-5.6-sol"}
+        env.pop("BOSS_PIW", None)
+        self.assertEqual(subprocess.run(BOSS + ["add", str(self.proj), "--id", "loss", "--test", "true",
                                                 "--mode", "high-assurance"], env=env, text=True, capture_output=True).returncode, 0)
-        task = json.loads(subprocess.run(HELM + ["task", "loss", "change it", "--json"], env=env,
+        task = json.loads(subprocess.run(BOSS + ["task", "loss", "change it", "--json"], env=env,
                                          text=True, capture_output=True, check=True).stdout)
-        run = subprocess.run(HELM + ["run-once"], env=env, text=True, capture_output=True)
+        run = subprocess.run(BOSS + ["run-once"], env=env, text=True, capture_output=True)
         self.assertNotEqual(run.returncode, 0)
-        shown = json.loads(subprocess.run(HELM + ["show", task["id"], "--json"], env=env,
+        shown = json.loads(subprocess.run(BOSS + ["show", task["id"], "--json"], env=env,
                                           text=True, capture_output=True, check=True).stdout)
         self.assertEqual(shown["status"], "paused")
         self.assertEqual(shown["phase"], "recovery-required")
@@ -666,23 +666,23 @@ class HerdrTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ["tab", "close"] and reviewer["tab_id"] in call
                              for call in self.calls()), "unsettled reviewer tab must not be killed automatically")
 
-    def test_ask_notifies_captain(self):
-        self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
-        self.helm("task", "p", "thing [fake:ask]")
-        self.helm("run-once")
+    def test_ask_notifies_boss(self):
+        self.bossctl("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
+        self.bossctl("task", "p", "thing [fake:ask]")
+        self.bossctl("run-once")
         notes = [c for c in self.calls() if c[:2] == ["notification", "show"]]
         self.assertEqual(notes[0][2], "p needs you"); self.assertIn("Which auth provider?", notes[0][4])
 
     def test_herdr_failure_never_fails_the_task(self):
         (self.bin / "herdr").unlink(); (self.bin / "herdr").write_text("#!/bin/sh\nexit 3\n"); (self.bin / "herdr").chmod(0o755)
-        self.helm("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
-        it = json.loads(self.helm("task", "p", "thing", "--json").stdout)
-        self.helm("run-once")
-        self.assertEqual(json.loads(self.helm("show", it["id"], "--json").stdout)["status"], "ready")
+        self.bossctl("add", str(self.proj), "--id", "p", "--test", "true", "--mode", "local-only")
+        it = json.loads(self.bossctl("task", "p", "thing", "--json").stdout)
+        self.bossctl("run-once")
+        self.assertEqual(json.loads(self.bossctl("show", it["id"], "--json").stdout)["status"], "ready")
 
     def test_banner_and_watch_once(self):
-        out = self.helm("watch", "--once").stdout
-        self.assertIn("F I R S T   M A T E", out); self.assertIn("crew      stopped", out); self.assertIn("none yet", out)
+        out = self.bossctl("watch", "--once").stdout
+        self.assertIn("[B] BOSS | OPERATIONS", out); self.assertIn("team      stopped", out); self.assertIn("none yet", out)
 
 
 if __name__ == "__main__":

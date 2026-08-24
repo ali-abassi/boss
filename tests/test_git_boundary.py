@@ -11,16 +11,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helm import scope, work, worktree
-from helm.git_boundary import local_config_value
-from helm.util import HelmError, sh
+from bossctl import scope, work, worktree
+from bossctl.git_boundary import local_config_value
+from bossctl.util import BossError, sh
 
 REPO = Path(__file__).resolve().parents[1]
 
 
 class GitBoundaryTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="firstmate-git-boundary-test-"))
+        self.root = Path(tempfile.mkdtemp(prefix="boss-git-boundary-test-"))
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.raw("init", "-q", "-b", "main")
@@ -96,8 +96,8 @@ class GitBoundaryTests(unittest.TestCase):
                    check=False, env=ambient)
         self.assertEqual(added.returncode, 0, added.stderr)
         committed = sh([
-            "git", "-C", str(self.repo), "-c", "user.name=First Mate Checkpoint",
-            "-c", "user.email=firstmate@local.invalid", "commit", "-m", "checkpoint",
+            "git", "-C", str(self.repo), "-c", "user.name=BOSS Checkpoint",
+            "-c", "user.email=boss@local.invalid", "commit", "-m", "checkpoint",
         ], check=False, env=ambient)
         self.assertEqual(committed.returncode, 0, committed.stderr)
         self.assert_helper_absent()
@@ -109,7 +109,7 @@ class GitBoundaryTests(unittest.TestCase):
             ["git", "-C", str(self.repo), "diff"],
             ["git", "-C", str(self.repo), "add", "filtered.txt"],
         ):
-            with self.assertRaises(HelmError):
+            with self.assertRaises(BossError):
                 sh(args, check=False)
         self.assert_helper_absent()
 
@@ -129,7 +129,7 @@ class GitBoundaryTests(unittest.TestCase):
         self.assert_helper_absent()
 
         self.configure_executable_project_values()
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             sh(["git", "-C", str(self.repo), "merge", "other"], check=False)
         self.assert_helper_absent()
 
@@ -141,7 +141,7 @@ class GitBoundaryTests(unittest.TestCase):
         self.assertEqual(local_config_value(self.repo, "remote.origin.url"),
                          "https://github.com/acme/widget.git")
         self.raw("config", "--add", "remote.origin.url", "https://github.com/acme/other.git")
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             local_config_value(self.repo, "remote.origin.url")
 
     def test_local_remote_executable_config_is_rejected_before_fetch(self):
@@ -153,7 +153,7 @@ class GitBoundaryTests(unittest.TestCase):
             "git", "--git-dir", str(remote), "config", "uploadpack.packObjectsHook",
             str(self.helper),
         ], check=True)
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             sh(["git", "-C", str(self.repo), "fetch", "--no-tags",
                 "--no-write-fetch-head", str(remote),
                 "refs/heads/main:refs/remotes/test/main"],
@@ -162,7 +162,7 @@ class GitBoundaryTests(unittest.TestCase):
 
     def test_every_production_literal_git_or_gh_subprocess_routes_through_boundary(self):
         offenders = []
-        for path in sorted((REPO / "helm").glob("*.py")):
+        for path in sorted((REPO / "bossctl").glob("*.py")):
             tree = ast.parse(path.read_text(), filename=str(path))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
@@ -181,7 +181,7 @@ class GitBoundaryTests(unittest.TestCase):
 
 class ExactPathTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="firstmate-exact-path-test-"))
+        self.root = Path(tempfile.mkdtemp(prefix="boss-exact-path-test-"))
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git("init", "-q", "-b", "main")
@@ -234,7 +234,7 @@ class ExactPathTests(unittest.TestCase):
 
         raw = b"\0".join(os.fsencode(value) for value in names) + b"\0"
         result = subprocess.run([
-            sys.executable, str(REPO / "helm" / "check_protected.py"), "--nul",
+            sys.executable, str(REPO / "bossctl" / "check_protected.py"), "--nul",
             ".github/workflows/*",
         ], input=raw, capture_output=True)
         self.assertEqual(result.returncode, 1)
@@ -244,9 +244,9 @@ class ExactPathTests(unittest.TestCase):
 
     def test_worktree_registry_preserves_newline_in_worktree_path(self):
         destination = self.root / "linked\nworktree"
-        self.git("branch", "firstmate/item")
-        self.git("worktree", "add", "-q", str(destination), "firstmate/item")
-        paths = worktree.branch_worktrees({"path": str(self.repo)}, "firstmate/item")
+        self.git("branch", "boss/item")
+        self.git("worktree", "add", "-q", str(destination), "boss/item")
+        paths = worktree.branch_worktrees({"path": str(self.repo)}, "boss/item")
         self.assertEqual(paths, [destination.resolve()])
 
 

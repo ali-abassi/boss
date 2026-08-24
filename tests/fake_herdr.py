@@ -14,7 +14,7 @@ def process_identity(pid, owner):
     field = lambda name: subprocess.run(
         ["ps", "-p", str(pid), "-o", f"{name}="], text=True, capture_output=True, check=True
     ).stdout.strip()
-    return {"version": 1, "kind": "firstmate-pi-agent", "pid": pid,
+    return {"version": 1, "kind": "boss-pi-agent", "pid": pid,
             "pgid": os.getpgid(pid), "owner": owner,
             "start_sha256": hashlib.sha256(field("lstart").encode()).hexdigest(),
             "command_sha256": hashlib.sha256(field("command").encode()).hexdigest(),
@@ -40,20 +40,20 @@ elif args[:2] == ["agent", "start"]:
             for env_index, value in enumerate(prior):
                 if value == "--env" and env_index + 1 < len(prior):
                     key, _, env_value = prior[env_index + 1].partition("="); pane_env[key] = env_value
-    attestation = pane_env.get("HELM_AGENT_ATTESTATION")
-    events_file = pane_env.get("HELM_AGENT_EVENTS")
+    attestation = pane_env.get("BOSS_AGENT_ATTESTATION")
+    events_file = pane_env.get("BOSS_AGENT_EVENTS")
     if attestation and session_id and session_dir and cwd:
         session_file = session_dir / f"2026-01-01T00-00-00-000Z_{session_id}.jsonl"
         agent_pid = os.getppid()
-        payload = {"schema": 1, "nonce": pane_env.get("HELM_AGENT_NONCE"), "pid": agent_pid,
+        payload = {"schema": 1, "nonce": pane_env.get("BOSS_AGENT_NONCE"), "pid": agent_pid,
                    "process_identity": process_identity(agent_pid, session_id), "cwd": str(Path(cwd).resolve()),
                    "session_id": session_id, "session_dir": str(session_dir.resolve()),
                    "session_file": str(session_file.resolve()), "events_file": str(Path(events_file).resolve()),
                    "event_public_key": PUBLIC_KEY_B64,
                    "model": model, "thinking": thinking,
-                   "sandbox": {"required": pane_env.get("HELM_SANDBOX_REQUIRED") == "1",
-                               "profile_sha256": pane_env.get("HELM_SANDBOX_PROFILE_SHA256"),
-                               "tool_profile_sha256": pane_env.get("HELM_TOOL_SANDBOX_PROFILE_SHA256"),
+                   "sandbox": {"required": pane_env.get("BOSS_SANDBOX_REQUIRED") == "1",
+                               "profile_sha256": pane_env.get("BOSS_SANDBOX_PROFILE_SHA256"),
+                               "tool_profile_sha256": pane_env.get("BOSS_TOOL_SANDBOX_PROFILE_SHA256"),
                                "probe_blocked": True},
                    "herdr": {"session": os.environ.get("HERDR_SESSION"), "workspace_id": "w1",
                              "tab_id": pane.replace(":p", ":t"), "pane_id": pane},
@@ -102,11 +102,11 @@ elif args[:2] in (["agent", "prompt"], ["agent", "wait"]):
             for env_index, value in enumerate(prior):
                 if value == "--env" and env_index + 1 < len(prior):
                     key, _, env_value = prior[env_index + 1].partition("="); pane_env[key] = env_value
-    events_path = Path(pane_env["HELM_AGENT_EVENTS"]) if pane_env.get("HELM_AGENT_EVENTS") else None
+    events_path = Path(pane_env["BOSS_AGENT_EVENTS"]) if pane_env.get("BOSS_AGENT_EVENTS") else None
     if args[:2] == ["agent", "prompt"] and events_path and session_id:
         prior_events = [json.loads(line) for line in events_path.read_text().splitlines() if line]
         sequence = 1 + max([event.get("input_sequence", 0) for event in prior_events] or [0])
-        base_event = {"schema": 1, "nonce": pane_env.get("HELM_AGENT_NONCE"),
+        base_event = {"schema": 1, "nonce": pane_env.get("BOSS_AGENT_NONCE"),
                       "input_sequence": sequence, "session_id": session_id, "at": "2026-01-01T00:00:00Z"}
         # Real Herdr/Pi submits the editor buffer after trimming outer
         # whitespace. Keep the fake faithful so correlation tests catch a
@@ -156,7 +156,7 @@ elif args[:2] in (["agent", "prompt"], ["agent", "wait"]):
 elif args[:2] == ["agent", "read"]:
     print("fake durable agent output")
 elif args[:2] == ["workspace", "list"]:
-    workspaces = [] if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1" else [{"workspace_id": "w1", "label": "First Mate"}]
+    workspaces = [] if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1" else [{"workspace_id": "w1", "label": "BOSS"}]
     print(json.dumps({"result": {"workspaces": workspaces}}))
 elif args[:2] == ["workspace", "create"]:
     print(json.dumps({"result": {"workspace": {"workspace_id": "w1"},
@@ -165,13 +165,13 @@ elif args[:2] == ["workspace", "create"]:
 elif args[:2] == ["tab", "list"]:
     if os.environ.get("FAKE_HERDR_NEW_WORKSPACE") == "1":
         tabs = [{"tab_id": "w1:t-default", "label": "Shell"}]
-    elif os.environ.get("FAKE_HERDR_EXISTING_DEAD_MATE") == "1":
-        tabs = [{"tab_id": "w1:t-mate", "label": "⚓ First Mate"}]
+    elif os.environ.get("FAKE_HERDR_EXISTING_DEAD_COO") == "1":
+        tabs = [{"tab_id": "w1:t-coo", "label": "◆ BOSS"}]
     else:
         tabs = []
     print(json.dumps({"result": {"tabs": tabs}}))
 elif args[:2] == ["pane", "list"]:
-    print(json.dumps({"result": {"panes": [{"pane_id": "w1:p-mate", "tab_id": "w1:t-mate",
+    print(json.dumps({"result": {"panes": [{"pane_id": "w1:p-coo", "tab_id": "w1:t-coo",
                                                "agent_status": "unknown"}]}}))
 elif args[:2] == ["pane", "get"]:
     print(json.dumps({"result": {"pane": {"pane_id": args[2], "agent": "pi", "agent_status": "idle"}}}))

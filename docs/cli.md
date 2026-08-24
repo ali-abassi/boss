@@ -1,40 +1,40 @@
-# Under the hood: `helm`
+# Under the hood: `bossctl`
 
-The first mate drives a small CLI, `helm`, so the captain never has to. Everything below
-is what the agent (or a curious developer) uses; `pi-firstmate` is the only user command.
+The BOSS drives a small CLI, `bossctl`, so the boss never has to. Everything below
+is what the agent (or a curious developer) uses; `pi-boss` is the only user command.
 
 ```
-helm setup [--import-login]        own Pi home + Codex login (pi-firstmate does this on first run)
-helm add PATH [--id ID] [--mode local-only|direct-pr|high-assurance] [--gate native|no-mistakes] [--authority N] [--test CMD] [--protected GLOBS] [--base BRANCH]
-helm set ID [--mode M] [--gate G] [--authority N] [--test CMD]
-helm projects
-helm task PROJECT "request" [--kind ship|scout] [--scope GLOBS] [--model PROVIDER/MODEL] [--thinking high] [--max-tokens N] [--max-cost N] [--max-seconds N]
+bossctl setup [--import-login]        own Pi home + Codex login (pi-boss does this on first run)
+bossctl add PATH [--id ID] [--mode local-only|direct-pr|high-assurance] [--gate native|no-mistakes] [--authority N] [--test CMD] [--protected GLOBS] [--base BRANCH]
+bossctl set ID [--mode M] [--gate G] [--authority N] [--test CMD]
+bossctl projects
+bossctl task PROJECT "request" [--kind ship|scout] [--scope GLOBS] [--model PROVIDER/MODEL] [--thinking high] [--max-tokens N] [--max-cost N] [--max-seconds N]
           [--node-max-tokens NODE=N] [--node-max-cost NODE=N] [--node-max-seconds NODE=N]
-helm work [--all] · helm show ID · helm inspect ID · helm inbox [--hints]
-helm steer ID "guidance" · helm pause ID · helm resume ID · helm interrupt ID · helm recover ID [--request-id KEY]
-helm budget ID [--tokens N] [--cost N] [--seconds N]
+bossctl work [--all] · bossctl show ID · bossctl inspect ID · bossctl inbox [--hints]
+bossctl steer ID "guidance" · bossctl pause ID · bossctl resume ID · bossctl interrupt ID · bossctl recover ID [--request-id KEY]
+bossctl budget ID [--tokens N] [--cost N] [--seconds N]
           [--node-max-tokens NODE=N] [--node-max-cost NODE=N] [--node-max-seconds NODE=N]
-helm scope ID "src/api/**,tests/api/**" · helm wait ID 20m "reason"
-helm respond ID "captain's answer" · helm retry ID · helm cancel ID [--discard]
-helm promote ID --confirm
-helm up [--workers N] · helm down · helm status · helm watch [--once] · helm tail ID
-helm daemon · helm run-once
-helm supervise [--no-herdr] · helm wakes [--claim --consumer ID | --ack IDS | --release IDS]
-helm forge ID | helm forge --all
-helm gate-status ID
-helm gate-reconcile ID
-helm gate-respond ID --action approve|fix|skip [--findings IDS --instructions TEXT]
-helm memory operational list|get KEY|set KEY VALUE|remove KEY --confirm
-helm memory project list PROJECT|set PROJECT KEY VALUE|remove PROJECT KEY --confirm
-helm away-mode on|off|status
-helm dispatch
-helm doctor [--offline] [--probe]
-helm doctor --repair --confirm [--offline] [--auth-source PATH --auth-provider PROVIDER]
+bossctl scope ID "src/api/**,tests/api/**" · bossctl wait ID 20m "reason"
+bossctl respond ID "boss's answer" · bossctl retry ID · bossctl cancel ID [--discard]
+bossctl promote ID --confirm
+bossctl up [--workers N] · bossctl down · bossctl status · bossctl watch [--once] · bossctl tail ID
+bossctl daemon · bossctl run-once
+bossctl supervise [--no-herdr] · bossctl wakes [--claim --consumer ID | --ack IDS | --release IDS]
+bossctl forge ID | bossctl forge --all
+bossctl gate-status ID
+bossctl gate-reconcile ID
+bossctl gate-respond ID --action approve|fix|skip [--findings IDS --instructions TEXT]
+bossctl memory operational list|get KEY|set KEY VALUE|remove KEY --confirm
+bossctl memory project list PROJECT|set PROJECT KEY VALUE|remove PROJECT KEY --confirm
+bossctl away-mode on|off|status
+bossctl dispatch
+bossctl doctor [--offline] [--probe]
+bossctl doctor --repair --confirm [--offline] [--auth-source PATH --auth-provider PROVIDER]
             [--model PHASE=PROVIDER/MODEL] [--test PROJECT=COMMAND] [--fetch PROJECT]
-helm captain [pi|claude|codex]
+bossctl boss [pi|claude|codex]
 ```
 
-State lives in `$HELM_HOME` (default `~/.helm`): `projects.json`, `dispatch.json`, atomic
+State lives in `$BOSS_HOME` (default `~/.boss`): `projects.json`, `dispatch.json`, atomic
 versioned `work/<id>/item.json` records, durable `scope-claims.json`, `supervisor.json`,
 `wakes.json`, optional `memory.json`, persistent `worktrees/`, durable `recovery/worktrees/`
 journals, evidence bundles, and the
@@ -78,23 +78,23 @@ are enforced before, during, and after the node; an already-running provider tur
 threshold before usage is returned. Pause, interrupt, timeout, and budget settlement spend no
 extra checkpoint model turn—the preserved worktree is the checkpoint. Missing or historically
 unattributable node evidence fails closed. The inert deterministic graph seam refuses per-node
-budgets rather than fabricating attribution. `helm budget` changes a limit only on a paused,
+budgets rather than fabricating attribution. `bossctl budget` changes a limit only on a paused,
 needs-you, or failed item; a new node limit cannot be applied retroactively after unattributed
 history, and `resume` still refuses an exhausted limit.
 
 The `--gate no-mistakes` provider is a separate, optional external transaction—not the native
 `high-assurance` graph. It accepts only the pinned v1.57.1 signed macOS release and an already
-initialized exact repository binding. First Mate does not install or repair it. The item must be
-a ship item in non-local mode with authority at least 2, a clean exact-SHA First Mate verification,
-and no configured First Mate item-wide or per-node token/cost/time limit. The request is journaled before one
+initialized exact repository binding. BOSS does not install or repair it. The item must be
+a ship item in non-local mode with authority at least 2, a clean exact-SHA BOSS verification,
+and no configured BOSS item-wide or per-node token/cost/time limit. The request is journaled before one
 `axi run`; uncertain requests are never repeated. `gate-status` reads the exact SQLite receipt,
 `gate-reconcile` durably records current external evidence without issuing another command, and
-`gate-respond` sends one captain decision for the exact observed step. `fix` requires a subset of
+`gate-respond` sends one boss decision for the exact observed step. `fix` requires a subset of
 the displayed finding IDs; `--instructions` is valid only with `fix`. No adapter command uses
 `--yes`. Until a unique exact review/push/open-PR/CI receipt exists, delivery and promotion remain
 blocked. Changed external heads require fresh custody and review rather than being trusted.
 
-`helm doctor` itself is byte-for-byte read-only: it does not initialize Pi, clean PID files,
+`bossctl doctor` itself is byte-for-byte read-only: it does not initialize Pi, clean PID files,
 fetch, prune, or normalize state. Default network probes compare the configured base to the
 exact remote head and check GitHub authentication; `--offline` skips those. `--probe` is the
 only token-spending model probe. `--repair` still performs no mutation without `--confirm`,
@@ -102,7 +102,7 @@ and every confirmed action revalidates its target under lock. Worker shutdown an
 the recorded process start/command identity; bare, legacy, or reused PIDs are not signaled.
 Repairs quarantine or reconcile metadata rather than deleting work or closing a reused tab.
 Mutation-capable choices must be named on the confirmed command: `--auth-source` copies only the
-selected provider record into First Mate's private config; `--model` accepts only an exact model
+selected provider record into BOSS's private config; `--model` accepts only an exact model
 from Pi's offline inventory; `--test` checks shell syntax and records the command without running
 it; and `--fetch` updates only the configured `refs/remotes/origin/<base>` after proving checkout
 HEAD and status stayed unchanged. An orphan worktree is moved intact to controller quarantine

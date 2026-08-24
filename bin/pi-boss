@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# pi-boss — the only command you need.
+#   pi-boss            open the BOSS (workers start by themselves)
+#   pi-boss stop       stop the workers
+#   pi-boss quit       stop workers and close the BOSS Herdr session
+#   pi-boss-quit       same shutdown command, for a direct terminal shortcut
+#   pi-boss status     one-screen ops board
+#   pi-boss setup      connect to your Codex subscription (runs automatically the first time)
+#   pi-boss doctor     read-only health audit (--repair requires --confirm)
+#   pi-boss away on    enter gated unattended mode (off/status also supported)
+#   pi-boss claude     open the BOSS in Claude Code instead of Pi (also: codex)
+bossctl="$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")/bossctl"
+case "${1:-}" in
+  -h|--help|help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
+  stop)   exec "$bossctl" down ;;
+  quit)   exec "$(dirname "$bossctl")/pi-boss-quit" ;;
+  status) exec "$bossctl" watch --once ;;
+  setup)  shift; exec "$bossctl" setup "$@" ;;
+  doctor) shift; exec "$bossctl" doctor "$@" ;;
+  away)   shift; exec "$bossctl" away-mode "$@" ;;
+  "")
+    if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+      exec "$bossctl" boss pi
+    fi
+    exec "$bossctl" launch
+    ;;
+  *)
+    if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+      exec "$bossctl" boss "$@"
+    fi
+    exec "$bossctl" launch --harness "$1"
+    ;;
+esac

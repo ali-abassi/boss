@@ -7,7 +7,7 @@ the Pi extension live upstream.
 
 The portable `steps.yaml` and durable run-bundle kernel is compatible with
 [Agent Workflows v0.2.0](https://github.com/ali-abassi/agent-workflows/tree/v0.2.0),
-commit `d2f84bb740d8e336a198145022a367acdf18824f`. First Mate keeps the fuller Pi Graph
+commit `d2f84bb740d8e336a198145022a367acdf18824f`. BOSS keeps the fuller Pi Graph
 runner because it is a strict functional superset. It ports the v0.2.0 fixes that reject
 missing required input before creating a run directory and print the public `piw resume`
 recovery command. Agent Workflows is not downloaded or silently installed at runtime.

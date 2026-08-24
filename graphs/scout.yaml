@@ -1,10 +1,10 @@
 version: 1
-workflow: helm-scout
+workflow: bossctl-scout
 cwd: @{CWD}
 workers: 1
 input:
   required: true
-  description: helm scout brief (question to investigate)
+  description: bossctl scout brief (question to investigate)
 steps:
   - id: investigate
     needs: []

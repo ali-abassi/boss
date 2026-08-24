@@ -13,8 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import supervisor, processes
-from helm.util import HelmError
+from bossctl import supervisor, processes
+from bossctl.util import BossError
 
 
 def iso(epoch: float) -> str:
@@ -22,17 +22,17 @@ def iso(epoch: float) -> str:
 
 
 def observe_in_child(home: str, item: dict, epoch: float) -> None:
-    os.environ["HELM_HOME"] = home
+    os.environ["BOSS_HOME"] = home
     supervisor.observe(item, at=epoch, probe_agent=False)
 
 
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
-        os.environ["HELM_HOME"] = str(self.home)
+        os.environ["BOSS_HOME"] = str(self.home)
         self.epoch = 2_000_000_000.0
-        for name in ("HELM_SUPERVISOR_STALE_SECONDS", "HELM_SUPERVISOR_QUEUE_STALE_SECONDS",
-                     "HELM_SUPERVISOR_WEDGE_OBSERVATIONS", "HELM_SUPERVISOR_WEDGE_RESURFACE_SECONDS"):
+        for name in ("BOSS_SUPERVISOR_STALE_SECONDS", "BOSS_SUPERVISOR_QUEUE_STALE_SECONDS",
+                     "BOSS_SUPERVISOR_WEDGE_OBSERVATIONS", "BOSS_SUPERVISOR_WEDGE_RESURFACE_SECONDS"):
             os.environ.pop(name, None)
 
     def tearDown(self):
@@ -63,12 +63,12 @@ class SupervisorTests(unittest.TestCase):
         supervisor.observe(item, at=self.epoch, probe_agent=False)
         supervisor.observe(item, at=self.epoch + 1, probe_agent=False)
         self.assertEqual(len(supervisor.pending()), 1)
-        claimed = supervisor.claim("mate-a", at=self.epoch + 2)
+        claimed = supervisor.claim("coo-a", at=self.epoch + 2)
         self.assertEqual(len(claimed), 1)
-        self.assertEqual(supervisor.claim("mate-b", at=self.epoch + 3), [])
-        self.assertEqual(supervisor.release([claimed[0]["id"]], "mate-a"), 1)
-        claimed = supervisor.claim("mate-b", at=self.epoch + 4)
-        self.assertEqual(supervisor.acknowledge([claimed[0]["id"]], "mate-b"), 1)
+        self.assertEqual(supervisor.claim("coo-b", at=self.epoch + 3), [])
+        self.assertEqual(supervisor.release([claimed[0]["id"]], "coo-a"), 1)
+        claimed = supervisor.claim("coo-b", at=self.epoch + 4)
+        self.assertEqual(supervisor.acknowledge([claimed[0]["id"]], "coo-b"), 1)
         self.assertEqual(supervisor.pending(), [])
         # An acknowledged key is still evidence: restart/re-observe must not replay it.
         supervisor.observe(item, at=self.epoch + 5, probe_agent=False)
@@ -77,11 +77,11 @@ class SupervisorTests(unittest.TestCase):
     def test_active_wake_lease_is_not_redelivered_to_same_consumer(self):
         item = self.item(status="ready")
         supervisor.observe(item, at=self.epoch, probe_agent=False)
-        first = supervisor.claim("mate-a", at=self.epoch + 1)
+        first = supervisor.claim("coo-a", at=self.epoch + 1)
         self.assertEqual(len(first), 1)
-        self.assertEqual(supervisor.claim("mate-a", at=self.epoch + 2), [])
-        self.assertEqual(supervisor.claim("mate-b", at=self.epoch + 2), [])
-        expired = supervisor.claim("mate-a", at=self.epoch + supervisor.CLAIM_SECONDS + 2)
+        self.assertEqual(supervisor.claim("coo-a", at=self.epoch + 2), [])
+        self.assertEqual(supervisor.claim("coo-b", at=self.epoch + 2), [])
+        expired = supervisor.claim("coo-a", at=self.epoch + supervisor.CLAIM_SECONDS + 2)
         self.assertEqual([event["id"] for event in expired], [first[0]["id"]])
 
     def test_wake_send_receipt_is_never_automatically_replayed_and_can_be_renewed(self):
@@ -116,8 +116,8 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(item["status"], "queued")
 
     def test_unchanged_stale_evidence_escalates_and_resurfaces_as_wedged(self):
-        os.environ.update(HELM_SUPERVISOR_STALE_SECONDS="5", HELM_SUPERVISOR_WEDGE_OBSERVATIONS="3",
-                          HELM_SUPERVISOR_WEDGE_RESURFACE_SECONDS="5")
+        os.environ.update(BOSS_SUPERVISOR_STALE_SECONDS="5", BOSS_SUPERVISOR_WEDGE_OBSERVATIONS="3",
+                          BOSS_SUPERVISOR_WEDGE_RESURFACE_SECONDS="5")
         item = self.item(age=20)
         states = [supervisor.observe(item, at=self.epoch + n, probe_agent=False)["classification"] for n in range(3)]
         self.assertEqual(states, ["stale", "stale", "wedged"])
@@ -155,14 +155,14 @@ class SupervisorTests(unittest.TestCase):
         session = {"agent_name": "impl-p", "agent_session_id": "durable-real-id", "pane_id": "w1:p1"}
         item = self.item(session=session)
         live = {"state": "live", "agent": {"pane_id": "w1:p1"}}
-        with mock.patch("helm.herdr.agent_liveness", return_value=live), \
-             mock.patch("helm.herdr.exact_agent_liveness", side_effect=lambda _identity, evidence: evidence):
+        with mock.patch("bossctl.herdr.agent_liveness", return_value=live), \
+             mock.patch("bossctl.herdr.exact_agent_liveness", side_effect=lambda _identity, evidence: evidence):
             self.assertEqual(supervisor.observe(item, at=self.epoch)["classification"], "healthy")
-        with mock.patch("helm.herdr.agent_liveness", return_value={"state": "unknown", "reason": "Herdr restarting"}):
+        with mock.patch("bossctl.herdr.agent_liveness", return_value={"state": "unknown", "reason": "Herdr restarting"}):
             self.assertEqual(supervisor.observe(item, at=self.epoch + 1)["classification"], "unknown")
         self.assertEqual(supervisor.pending()[0]["classification"], "unknown")
-        with mock.patch("helm.herdr.agent_liveness", return_value=live), \
-             mock.patch("helm.herdr.exact_agent_liveness", side_effect=lambda _identity, evidence: evidence):
+        with mock.patch("bossctl.herdr.agent_liveness", return_value=live), \
+             mock.patch("bossctl.herdr.exact_agent_liveness", side_effect=lambda _identity, evidence: evidence):
             self.assertEqual(supervisor.observe(item, at=self.epoch + 2)["classification"], "healthy")
         self.assertEqual(item["session"]["agent_session_id"], "durable-real-id")
 
@@ -172,7 +172,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(supervisor.classify(legacy, at=self.epoch)["classification"], "unknown")
         reused = self.item()
         reused["lease"]["process_identity"] = {
-            "version": 1, "kind": "firstmate-worker", "pid": os.getpid(),
+            "version": 1, "kind": "boss-worker", "pid": os.getpid(),
             "pgid": os.getpgid(os.getpid()), "owner": "old",
             "start_sha256": "0" * 64, "command_sha256": "0" * 64,
         }
@@ -183,12 +183,12 @@ class SupervisorTests(unittest.TestCase):
         launch = {"launch_id": "launch-1", "agent_session_id": "launch-1", "role": "implementer",
                   "state": "tab-created", "agent_name": "impl-p", "pane_id": "w1:p7", "workspace_id": "w1"}
         item = self.item(agent_launches=[launch])
-        with mock.patch("helm.herdr.agent_liveness", return_value={"state": "unknown", "reason": "Herdr restarting"}):
+        with mock.patch("bossctl.herdr.agent_liveness", return_value={"state": "unknown", "reason": "Herdr restarting"}):
             self.assertEqual(supervisor.observe(item, at=self.epoch)["classification"], "unknown")
-        with mock.patch("helm.herdr.agent_liveness", return_value={
+        with mock.patch("bossctl.herdr.agent_liveness", return_value={
                 "state": "live", "agent": {"pane_id": "w1:other", "workspace_id": "w1"}}):
             self.assertEqual(supervisor.observe(item, at=self.epoch + 1)["classification"], "unknown")
-        with mock.patch("helm.herdr.agent_liveness", return_value={
+        with mock.patch("bossctl.herdr.agent_liveness", return_value={
                 "state": "live", "agent": {"pane_id": "w1:p7", "workspace_id": "w1"}}):
             observation = supervisor.observe(item, at=self.epoch + 2)
             self.assertEqual(observation["classification"], "unknown")
@@ -197,7 +197,7 @@ class SupervisorTests(unittest.TestCase):
     def test_unknown_heartbeats_do_not_create_duplicate_wakes(self):
         from unittest import mock
         item = self.item(session={"agent_name": "impl-p", "agent_session_id": "real", "pane_id": "w1:p1"})
-        with mock.patch("helm.herdr.agent_liveness", return_value={"state": "unknown", "reason": "transport"}):
+        with mock.patch("bossctl.herdr.agent_liveness", return_value={"state": "unknown", "reason": "transport"}):
             supervisor.observe(item, at=self.epoch)
             item["activity"]["last"] = iso(self.epoch + 1)
             supervisor.observe(item, at=self.epoch + 1)
@@ -206,14 +206,14 @@ class SupervisorTests(unittest.TestCase):
     def test_corrupted_queue_fails_closed_and_is_not_overwritten(self):
         path = self.home / "wakes.json"
         path.write_text("{broken")
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             supervisor.observe(self.item(status="ready"), at=self.epoch, probe_agent=False)
         self.assertEqual(path.read_text(), "{broken")
 
     def test_nested_corrupt_queue_fails_closed_instead_of_crashing_or_rewriting(self):
         path = self.home / "wakes.json"
         path.write_text('{"version":1,"next_id":2,"events":[null]}\n')
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             supervisor.pending()
         self.assertEqual(path.read_text(), '{"version":1,"next_id":2,"events":[null]}\n')
 
@@ -226,13 +226,13 @@ class SupervisorTests(unittest.TestCase):
         }
         path.write_text(json.dumps({"version": 1, "next_id": 7, "events": [valid_event]}) + "\n")
         before = path.read_bytes()
-        with self.assertRaises(HelmError) as caught:
+        with self.assertRaises(BossError) as caught:
             supervisor.pending()
         self.assertIn("next_id", caught.exception.msg)
         self.assertEqual(path.read_bytes(), before)
 
     def test_terminal_observations_do_not_exhaust_long_running_state(self):
-        with mock.patch("helm.supervisor.MAX_RECORDS", 2):
+        with mock.patch("bossctl.supervisor.MAX_RECORDS", 2):
             for index in range(5):
                 supervisor.observe(self.item(status="done", id=f"p-done-{index}"),
                                    at=self.epoch + index, probe_agent=False)
@@ -241,11 +241,11 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(supervisor.pending(), [])
 
     def test_capacity_failure_preserves_the_last_valid_ledgers(self):
-        with mock.patch("helm.supervisor.MAX_RECORDS", 1):
+        with mock.patch("bossctl.supervisor.MAX_RECORDS", 1):
             supervisor.observe(self.item(status="ready", id="p-first"), at=self.epoch, probe_agent=False)
             state_path, queue_path = self.home / "supervisor.json", self.home / "wakes.json"
             before = (state_path.read_bytes(), queue_path.read_bytes())
-            with self.assertRaises(HelmError):
+            with self.assertRaises(BossError):
                 supervisor.observe(self.item(status="failed", id="p-second"),
                                    at=self.epoch + 1, probe_agent=False)
             self.assertEqual((state_path.read_bytes(), queue_path.read_bytes()), before)

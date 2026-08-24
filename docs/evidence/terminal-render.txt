@@ -1,0 +1,83 @@
+BOSS terminal renderer evidence — 2026-08-24
+
+Command:
+  bun -e 'import { renderBanner } from "./.pi/extensions/boss.ts"; …'
+
+=== WIDE / 100 COLUMNS ===
+      ┏━━╮     B O S S
+      ┣━━┫     Y O U R   A I   C O O
+      ┗━━╯     O P E R A T I O N S   D E S K
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ◆  3 projects · team ready · 2 running · 1 queued · 1 need you
+     /ops  ·  /inbox  ·  /wake 20m
+
+=== MEDIUM RUNNING / 60 COLUMNS ===
+ ◆ B O S S · YOUR AI COO
+ 1 project · 1 running
+ /ops  ·  /inbox  ·  /wake 20m
+
+=== MINIMUM / 50 COLUMNS ===
+ BOSS · YOUR AI COO
+ 3 projects · 1 need you
+
+=== PLAIN ASCII / 80 COLUMNS ===
+  [B]      B O S S
+   |       YOUR AI COO
+   +----   OPERATIONS DESK
+  ----------------------------------------------------------------------------
+  > 3 projects | team ready | 2 running | 1 queued | 1 need you
+    /ops | /inbox | /wake 20m
+
+=== DEGRADED / 60 COLUMNS ===
+ [B] BOSS | YOUR AI COO
+ ! team tools missing | re-run install.sh
+ /ops | /inbox | /wake 20m
+
+=== PERSISTENT PLAIN FOOTER ===
+[B] BOSS | team idle | /ops
+
+=== PLAIN WAKE RECEIPT ===
+> in 20m - auth check | queued
+
+=== PLAIN ARBITRARY REPOSITORY TEXT / 80 COLUMNS ===
+  team      stopped
+  projects  0   none yet - say: "add ~/code/my-repo"
+  inbox     1 question
+
+  ? needs-you \u8d85\u9577 \U0001f680 resume - inspect \u754c  - "approve?"
+ascii-only: True
+
+=== MAXIMUM CONTENT / 100 COLUMNS / 12 ITEMS ===
+
+  [B] BOSS | OPERATIONS
+  -------------------------------------
+  team      ready
+  projects  8   project-0 [high-assurance/a3] | project-1 [high-assurance/a3] | project-2 [high-ass
+  inbox     6 questions
+
+  ? needs-you project-0-wi investigate maximum-content request 0 with a deliberately long descripti
+  > running   project-1-wi investigate maximum-content request 1 with a deliberately long descripti
+  ? needs-you project-2-wi investigate maximum-content request 2 with a deliberately long descripti
+  > running   project-3-wi investigate maximum-content request 3 with a deliberately long descripti
+  ? needs-you project-4-wi investigate maximum-content request 4 with a deliberately long descripti
+  > running   project-5-wi investigate maximum-content request 5 with a deliberately long descripti
+  ? needs-you project-6-wi investigate maximum-content request 6 with a deliberately long descripti
+  > running   project-7-wi investigate maximum-content request 7 with a deliberately long descripti
+  ? needs-you project-8-wi investigate maximum-content request 8 with a deliberately long descripti
+  > running   project-9-wi investigate maximum-content request 9 with a deliberately long descripti
+  ? needs-you project-10-w investigate maximum-content request 10 with a deliberately long descript
+  > running   project-11-w investigate maximum-content request 11 with a deliberately long descript
+
+Mechanical receipts:
+  boss.ts: 33 checks passed
+  pi-attest: signed runtime attestation + 19 scope checks passed
+
+The extension self-test covers 120, 80, 72, 71, 60, 52, 51, 50, 32, and 12 columns;
+display-cell width, stable rendering, ASCII-only fallback/receipts/footer, ANSI absence in
+no-color mode, fixed-width progress frames, reduced-motion selection, explicit turn-end
+clearing, non-duplicated status vocabulary, degraded remediation, persistent identity/action,
+controller path, and wake parsing/prompt rules. The board fixture proves all 12 maximum-content
+items survive while every row remains within 99 display cells; fixed fields use cell-aware
+truncation and padding. Focused Python tests also prove continuous `watch` emits no cursor-control
+ANSI under `TERM=dumb`, `BOSS_PLAIN=1`, or `NO_COLOR`, while board, inbox, wake, and error text
+escape arbitrary repository/user Unicode into readable ASCII sequences in plain mode.

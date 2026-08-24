@@ -1,229 +1,203 @@
 <div align="center">
 
-# Run a coding crew from one conversation
+<img src="assets/logo.svg" width="560" alt="BOSS — your AI COO">
 
-**Firstmate Graph gives one persistent Pi agent a Herdr crew across your repositories. Every task follows an explicit workflow; high-assurance work cannot skip implement → test → review. Nothing merges until you say so.**
+<h1>Run your software operation from one thread.</h1>
 
-[![tests](https://github.com/ali-abassi/firstmate-graph/actions/workflows/tests.yml/badge.svg)](https://github.com/ali-abassi/firstmate-graph/actions/workflows/tests.yml)
-[![license](https://img.shields.io/badge/license-MIT-11110f)](LICENSE)
+<p><strong>BOSS is an AI COO for coding work. Set outcomes in one Pi conversation; it coordinates real persistent Pi agents in Herdr, enforces deterministic delivery gates, and brings every consequential decision back to you.</strong></p>
 
-[Quickstart](#quickstart) · [How it works](#how-it-works) · [Commands](#commands) · [Which Firstmate?](#which-firstmate-should-you-use) · [Evidence](#evidence) · [Control-plane docs](docs/control-plane.md)
+[![tests](https://github.com/ali-abassi/boss/actions/workflows/tests.yml/badge.svg)](https://github.com/ali-abassi/boss/actions/workflows/tests.yml)
+[![license](https://img.shields.io/badge/license-MIT-0b0d10)](LICENSE)
+[![platform](https://img.shields.io/badge/managed_workers-macOS-b7f34a)](#install)
 
-<img src="assets/hero.svg" width="100%" alt="One captain conversation flows through Firstmate Graph into persistent Herdr workers. High-assurance work passes implement, test, and exact-SHA review gates before ready work or decisions return to the captain, who keeps merge authority.">
+[Install](#install) · [Operating model](#operating-model) · [Commands](#the-whole-daily-interface) · [Guarantees](#what-code-enforces) · [Firstmate coexistence](#boss-and-firstmate-can-coexist) · [Evidence](#evidence)
 
 </div>
 
-## Why this exists
+<img src="assets/hero.svg" width="100%" alt="Boss sets outcomes in one conversation. The BOSS COO routes isolated work to real Herdr Pi agents, passes delivery through deterministic tests and exact-SHA review, and returns blockers, decisions, and ready work while Boss keeps merge authority.">
 
-One coding agent is easy. Several tasks turn you into the scheduler:
+Most multi-agent setups give you more agents—and more agents to manage. BOSS changes the job.
+You keep one durable conversation and name the outcomes. Your COO handles intake, isolation,
+assignment, live steering, retries, budgets, verification, and status across every registered
+repository. You see the whole operation with `/ops`; you see only decisions with `/inbox`.
 
-- one tab per agent, each with half the context;
-- worktrees, retries, questions, and costs tracked in your head;
-- “done” reports that may not name the tested commit;
-- sessions that disappear while unfinished work is still on disk.
+Nothing merges, gets discarded, or receives a destructive recovery action unless you approve
+that exact item.
 
-Firstmate Graph flips that arrangement. You keep one conversation. The control plane gives each
-task its own persistent worker, worktree, workflow, budget, and evidence trail, then returns only
-ready work, honest failures, or a decision that actually needs you.
-
-## Quickstart
+## Install
 
 > [!IMPORTANT]
-> Managed production workers currently require **macOS** with `/usr/bin/sandbox-exec`,
+> Managed production workers currently require **macOS**,
+> [`/usr/bin/sandbox-exec`](https://keith.github.io/xcode-man-pages/sandbox-exec.1.html),
 > [Herdr](https://herdr.dev), [Pi](https://github.com/earendil-works/pi), Git, Python 3.10+,
-> and a Codex subscription. The CLI and deterministic suite also run on Linux. `gh` is needed
-> only for pull requests.
+> and a Codex subscription. The controller and deterministic test suite also run on Linux.
+> GitHub PR delivery additionally requires `gh`.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ali-abassi/firstmate-graph/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ali-abassi/boss/main/install.sh | bash
 ```
 
-Verified installer receipt on 2026-08-24, on a Mac where Pi and Codex were already connected:
+Open a new terminal, then:
 
-```text
-✓ bundled runner ready
-✓ pi 0.84.2
-✓ Codex login found in your Pi — the first mate will reuse it
-
-next:  pi-firstmate
+```sh
+pi-boss
 ```
 
-Then run `pi-firstmate` and talk normally:
+That command opens—or returns to—the persistent `boss` Herdr session. BOSS starts its quiet
+schedulers itself; real work items appear as watchable Herdr tabs only when there is real work.
+There are no decorative empty worker tabs.
 
-> **You:** add `~/code/api` and `~/code/web`<br>
-> **First mate:** Registered both. Local branches by default; nothing merges without your word.
+A typical exchange looks like this:
+
+> **Boss:** Add `~/code/api` and `~/code/web`.<br>
+> **COO:** Both are registered. I found their test commands; delivery stays local until you ask
+> for a different mode.
 >
-> **You:** fix the flaky login test in api, and find out why the web bundle is 4 MB<br>
-> **First mate:** Two items under way. I’ll report when they land or need a decision.
+> **Boss:** Fix the flaky login test in API and investigate why the web bundle is 4 MB.<br>
+> **COO:** Two independent items are under way. The implementation is isolated from the bundle
+> investigation. I’ll bring back failures, questions, and exact work ready for your decision.
 
-The installer builds a private runtime, puts `pi-firstmate` and `pi-firstmate-quit` on your PATH,
-and reuses an existing Pi Codex login when available. It does not install Herdr or the external
-no-mistakes product, and it never claims either is ready when it cannot prove it.
+The installer creates a private runtime, places `pi-boss`, `pi-boss-quit`, and `bossctl` on your
+PATH, and installs the BOSS skill for Pi, Claude Code, and Codex. It can reuse an existing Pi
+Codex login, but BOSS keeps its own config and runtime state. It does **not** install Herdr or the
+external no-mistakes product, silently update an existing checkout, or claim an integration is
+ready without proof.
 
-## How it works
+## Operating model
 
-1. **You describe the outcome.** The first mate registers projects and turns requests into
-   explicit work items; you do not write orchestration commands.
-2. **Each item gets durable custody.** It keeps one branch, worktree, scope claim, checkpoint,
-   budget, and real Herdr implementer identity through questions, steering, and review feedback.
-3. **Code orders the work.** Bundled [Pi Graph](https://github.com/ali-abassi/pi-graph) workflows
-   run the configured gates in an order the model cannot skip. High-assurance delivery includes
-   implementation, protected-path checks, tests, and two exact-commit reviews.
-4. **A zero-model-turn supervisor watches.** Healthy steady state consumes no agent turns.
-   Durable deduplicated wakes surface `needs-you`, stale, wedged, dead, and unknown states without
-   automatically killing or replacing anything.
-5. **Delivery stays a captain decision.** A branch or PR may become ready, but local merge and
-   GitHub promotion revalidate the exact base, head SHA, reviews, and authority before acting.
+1. **You set the outcome.** The COO registers projects, separates independent requests, and
+   keeps one portfolio-level plan in this conversation.
+2. **Every item gets durable custody.** One branch, worktree, scope claim, checkpoint, budget,
+   and real Pi implementer identity stay attached through questions, steering, retries, and
+   review feedback.
+3. **Production agents run in Herdr.** Every active implementer, scout, and reviewer is a real
+   Pi agent in a watchable Herdr tab. The tab is the live drill-down; `/ops` is the durable
+   cross-project view.
+4. **Code orders the work.** Pi Graph executes configured tests, protected-path checks, review
+   gates, and delivery checks in an order the model cannot skip.
+5. **The decision returns to you.** Ready branches, PRs, blockers, failures, and questions land
+   in one inbox. Promotion still requires your item-specific approval and fresh evidence.
 
-The runner bundles Pi Graph 0.3.0 and ports the two pinned run-bundle compatibility fixes from
-[Agent Workflows v0.2.0](https://github.com/ali-abassi/agent-workflows/tree/v0.2.0). The fuller
-Pi Graph command surface remains available; Agent Workflows is not downloaded at runtime.
+Independent, non-overlapping items can run concurrently up to configured worker capacity.
+Overlapping, repository-global, protected, or unknown scopes serialize instead of racing.
 
-## Commands
+### Delivery modes
 
-The captain-facing surface stays deliberately small:
+| Mode | What runs | Where it stops |
+|---|---|---|
+| `local-only` | Isolated implementation plus the project’s configured verification | Ready local branch |
+| `direct-pr` | Verification plus one fresh correctness review bound to the exact head SHA | Open PR awaiting your decision |
+| `high-assurance` | Protected-path checks, full verification, and fresh correctness + adversarial reviews on the exact final SHA | Reviewed branch or PR awaiting your decision |
+| `scout` | Read-only investigation by a persistent agent | Findings only; no delivery path |
+
+The bundled runner is Pi Graph 0.3.0 with two pinned run-bundle compatibility fixes ported from
+[Agent Workflows v0.2.0](https://github.com/ali-abassi/agent-workflows/tree/v0.2.0). Agent
+Workflows is not downloaded or silently updated at runtime.
+
+## The whole daily interface
 
 | You want to… | Use |
 |---|---|
-| Open or return to the persistent captain session | `pi-firstmate` |
-| See the fleet without entering the session | `pi-firstmate status` |
-| Run a read-only health and recovery audit | `pi-firstmate doctor` |
-| Enter or leave gated unattended supervision | `pi-firstmate away on` / `off` / `status` |
-| Stop background workers but keep the session | `pi-firstmate stop` |
-| Stop the crew and close its Herdr session | `pi-firstmate-quit` |
-| Launch the same first mate through another captain harness | `pi-firstmate claude` or `pi-firstmate codex` |
+| Open or return to your COO | `pi-boss` |
+| Close BOSS and positively verify its Herdr session stopped | `pi-boss-quit` |
+| See the complete portfolio inside Pi | `/ops` |
+| See only questions, failures, and ready work | `/inbox` |
+| Ask the COO to check back in this session | `/wake 20m` |
+| Enter or leave gated unattended supervision | `/away on` · `/away off` · `/away status` |
+| Read status without entering Pi | `pi-boss status` |
+| Run a read-only health/recovery audit | `pi-boss doctor` |
+| Stop schedulers but preserve the BOSS session | `pi-boss stop` |
+| Use Claude Code or Codex as the COO liaison | `pi-boss claude` · `pi-boss codex` |
 
-Inside Pi, `/fleet` shows the board, `/inbox` shows only actionable items, and `/wake 20m`
-schedules a session-local check-in. Ordinary work is requested in plain language.
+You do not need to type internal orchestration commands. Talk to the COO in plain language.
+`bossctl` exists for diagnostics, automation, and people who want to inspect the machinery.
 
-## What the control plane enforces
+## What code enforces
 
-| Boundary | Runtime contract |
+| Boundary | Runtime guarantee |
 |---|---|
-| **Identity** | A live item keeps one real Pi session UUID, Herdr pane, process-birth fingerprint, and signed lifecycle ledger. A label or reused PID is never accepted as identity. |
-| **Workflow** | Every delivery graph integrates the recorded base, checks scope/protected paths, runs the configured test command, rejects test-created mutations, and binds reviews to the final SHA. |
-| **Budgets** | Item-wide and per-node token, cost, and elapsed-time usage is durable and cumulative. Missing attribution or an exhausted limit fails closed; raising a paused limit is explicit. |
-| **Retries** | The same branch, worktree, and checkpoint survive failure. An unchanged repeated failure pauses instead of spinning forever. |
+| **Identity** | A live item keeps one real Pi session UUID, Herdr pane, process-birth fingerprint, and signed lifecycle ledger. A label, tab name, or reused PID is not identity. |
+| **Exact delivery** | Integration records the base, checks scope and protected paths, runs verification, rejects test-created mutations, and binds every review to the final commit SHA. |
+| **Budgets** | Item-wide and per-node token, cost, and elapsed-time usage are durable and cumulative. Missing attribution or an exhausted limit fails closed. Raising a paused limit is explicit. |
+| **Retries** | The same branch, worktree, identity, and checkpoint survive a failure. An unchanged repeated failure pauses instead of spinning. |
 | **Live control** | Steering, pause, resume, interrupt, and recovery are durable idempotent events reconciled against the exact Pi turn ledger. |
-| **Recovery** | Unknown stays unknown. No supervisor or doctor automatically kills, relaunches, prunes, discards, promotes, or merges. Confirmed repair preserves branches, worktrees, session evidence, and recovery holds. |
-| **GitHub** | PR state and checks are bound to repository, PR, base ref/SHA, and exact reviewed head SHA. Pending, failed, green, moved, closed, outage, and rate-limit evidence never collapse into “success.” |
-| **Memory** | Operational memory is narrow, explicit, keyed, and deduplicated. Project knowledge becomes a reviewed `AGENTS.md` work item—not a transcript dump or direct hidden write. |
-| **Away mode** | Entry requires a healthy supervisor/recovery gate and a live worker. Away mode can finish work but cannot merge, discard, hide decisions, or answer an external approval gate. |
+| **Supervision** | Healthy steady state consumes zero model turns. Deduplicated durable wakes surface `needs-you`, stale, wedged, dead, and unknown states without automatic killing or replacement. |
+| **Recovery** | Unknown stays unknown. Doctor never silently kills, relaunches, prunes, discards, promotes, or merges. Its audit is read-only; every repair needs `--repair --confirm`. |
+| **GitHub** | PR checks are bound to repository, PR, base ref/SHA, and exact reviewed head SHA. Pending, failed, moved, closed, outage, rate limit, and uncertainty never collapse into green. |
+| **Memory** | Operational facts are explicit, narrow, keyed, and deduplicated. Project knowledge becomes a normal reviewed project change—not a hidden transcript dump. |
+| **Away mode** | Entry requires healthy supervision and recovery gates. It may finish work, but cannot merge, discard, hide a decision, or answer an external approval gate. |
 
-Delivery is a branch by default. A project may instead use direct PR delivery or native
-`high-assurance`, which adds protected-path enforcement, full verification, and two fresh
-correctness/adversarial reviews bound to the exact final commit.
+## BOSS and Firstmate can coexist
 
-## Which Firstmate should you use?
+BOSS started from the same trustworthy control-plane lineage as
+[Firstmate Graph](https://github.com/ali-abassi/firstmate-graph), then became a separate product.
+It is not a skin sharing live state.
 
-This repository keeps the operating contract of
-[the original Firstmate](https://github.com/kunchenguid/firstmate), but it is not a
-feature-for-feature fork.
-
-| Choose | When it wins | What you trade |
+| Surface | BOSS | Firstmate Graph |
 |---|---|---|
-| **Firstmate Graph (this repo)** | You want **one Pi thread → deterministic workflow → persistent Herdr crew**, with hard budgets, exact-SHA evidence, conservative recovery, and no standing merge authority. | It is early, Herdr/Pi-specific, and managed production is currently macOS-only. |
-| **[Original Firstmate](https://github.com/kunchenguid/firstmate)** | You need a broader agent distro: Claude/Grok/Pi/Codex/OpenCode/Cursor harnesses, tmux/Herdr/Zellij/Orca/cmux backends, local or remote secondmates, dispatch profiles, and Relay/X/Discord/voice operations. | A larger toolchain and operating surface; it is not the narrow Pi Graph control plane built here. |
-| **Plain Pi/Codex sessions** | One small task, one repository, and you are happy to supervise it directly. | You remain the scheduler, retry loop, evidence binder, and recovery system. |
+| Relationship | COO ↔ Boss | First Mate ↔ Captain |
+| Main command | `pi-boss` | `pi-firstmate` |
+| Close command | `pi-boss-quit` | `pi-firstmate-quit` |
+| Portfolio command | `/ops` | `/fleet` |
+| State | `~/.boss` | `~/.helm` |
+| Herdr session | `boss` | `firstmate` |
+| Work branches | `boss/*` | `helm/*` |
 
-The original is broader, more mature, and more deeply exercised across platforms. This repo is
-more opinionated. For the specific job “one thread, agent orchestrates,” that focus is the point;
-it is not a claim that this project is better at every kind of fleet operation.
+The namespace split is deliberate and covered by tests: BOSS does not focus, read, stop, or
+mutate the Firstmate session or state tree.
 
-## Compatibility and boundaries
-
-| Surface | Verified scope |
-|---|---|
-| Captain UX | Persistent Pi session by default; Claude Code and Codex launch routes are available. |
-| Production workers | Real persistent Pi agents in Herdr tabs only; no headless production fallback or fixture identity. |
-| Platforms | CLI and deterministic tests: macOS + Linux. Managed sandboxed workers: macOS only. |
-| Forge | GitHub-first PR lifecycle and promotion. No GitLab adapter without a real registered GitLab project. |
-| External no-mistakes | Optional, pinned, signed-macOS adapter boundary; never installed, initialized, updated, or represented as verified by this repo. |
-| Deliberate non-goals | Extra terminal backends, remote secondmates, Relay/X/Discord/voice, silent self-update, destructive automatic repair, and standing auto-merge. |
-
-If Herdr, the sandbox boundary, an exact identity, a model, a budget receipt, a reviewer, or
-network evidence cannot be proven, production work stops without converting uncertainty into
-success.
+This focused control plane also differs from
+[the original Firstmate](https://github.com/kunchenguid/firstmate), a broader, more mature agent
+distribution with multiple harnesses, terminal backends, remote secondmates, and more operating
+integrations. Choose BOSS for the opinionated job **one owner thread → real Herdr Pi agents →
+deterministic evidence → owner decision**. Choose the original when backend breadth matters more
+than this narrow operating contract.
 
 ## Evidence
 
-The deterministic suite covers the end-to-end one-thread story plus process death at workflow
-phases, Herdr restart, duplicate/racing controls, corrupted state, stale identities and claims,
-dirty trees, base movement, post-review mutation, reviewer loss, exhausted budgets, forge
-outages/rate limits, and restart recovery.
+The default suite makes no model calls and exercises the complete one-thread story, process death
+through every workflow phase, Herdr restart, racing controls, corrupted state, stale identities
+and claims, dirty trees, scope escape, base movement, post-review mutation, reviewer loss,
+exhausted budgets, forge outages/rate limits, and restart recovery.
 
 ```sh
 python3 -m unittest discover -s tests -v
+bun .pi/extensions/boss.ts
+bun bossctl/pi_attest.ts
+python3 -m compileall -q bossctl tests
+git diff --check
 ```
 
-Local verification on 2026-08-24:
+GitHub Actions runs the full deterministic suite on Ubuntu and macOS with Python 3.10 and 3.13.
+The badge at the top is the current default-branch receipt; this README intentionally avoids a
+test-count claim that will go stale.
 
-```text
-Ran 225 tests in 196.909s
+- [COO prompt contract and evaluation set](docs/boss-prompt-contract.md)
+- [Fresh tool-free COO prompt receipt](docs/evidence/boss-prompt-eval.md)
+- [Terminal surface contract](docs/terminal-surface-contract.md)
+- [Independent terminal acceptance review](docs/evidence/terminal-review.md)
+- [Live Herdr, maximum-content, scroll, and coexistence receipts](docs/evidence/herdr-coexistence.md)
+- [Control-plane architecture](docs/control-plane.md)
+- [Complete CLI reference](docs/cli.md)
+- [Control-plane provenance receipts](docs/evidence/interactive-session.md)
 
-OK (skipped=1)
-```
-
-The one skip is the explicitly opt-in real-model test. The default suite makes no model calls.
-CI runs it on Ubuntu and macOS with Python 3.10 and 3.13.
-
-- [`tests/test_one_thread.py`](tests/test_one_thread.py) runs six tasks across three repos with
-  two workers, a real decision pause, one inbox, and no merge before captain approval.
-- [`docs/evidence/interactive-session.md`](docs/evidence/interactive-session.md) records a real
-  interactive failure, honest report, retry, exact ready commit, and captain-approved merge.
-- [`docs/evidence/live-run.md`](docs/evidence/live-run.md) records the opt-in real Pi Graph/model
-  path: 18 seconds, 11,320 tokens, $0.005024 on the dated model shown in the receipt.
-- A clean `python:3.13-slim-bookworm` container with no host mounts ran the published installer
-  and the installed `pi-firstmate --help` successfully; it correctly surfaced the deliberately
-  absent Pi CLI as the next prerequisite.
-- [GitHub Actions](https://github.com/ali-abassi/firstmate-graph/actions/workflows/tests.yml) is the
-  current cross-platform receipt; the badge at the top reflects its latest default-branch run.
-
-These receipts prove the paths they name. They do not make this broadly field-tested software.
-
-## Trust, recovery, and external gates
-
-Managed implementers run behind two pinned macOS sandbox profiles. The outer profile confines
-Pi writes to its worktree and launch state; model-invoked shell commands and final verification
-run inside a second no-network, bounded profile that blocks unrelated home/control-plane reads,
-process signalling, and Git-metadata writes. Each launch must prove a forbidden write is denied
-before its identity is accepted. This is **not** a separate OS account.
-
-`pi-firstmate doctor` is byte-for-byte read-only. A repair plan changes nothing unless both
-`--repair` and `--confirm` are present; it rechecks evidence under lock, quarantines corrupt
-derived state, and retains project work. It never logs in, installs tools, guesses a choice,
-kills an unknown PID, runs broad `git worktree prune`, or deletes unlanded work.
+These receipts prove only the paths they name. BOSS is early and opinionated, not broadly
+field-tested. Its default posture is to stop with work preserved when identity, liveness,
+review, budget, sandbox, or network evidence cannot be proven.
 
 <details>
-<summary><strong>External no-mistakes boundary</strong></summary>
+<summary><strong>Optional external no-mistakes boundary</strong></summary>
 
 The native careful workflow is named `high-assurance`; legacy local `no-mistakes` records read
 back compatibly under that name. It is not the separate no-mistakes product.
 
 The optional adapter pins no-mistakes v1.57.1 at tag SHA
-`a6f64fcdb4e82c0ddbbd9f01ed91e97dd233d42d`. It accepts only the matching signed macOS release
-after architecture, SHA-256, embedded build, Developer ID, hardened-runtime, timestamp, and
-repository/database binding checks. Firstmate Graph never installs, initializes, updates, syncs,
-resets, aborts, or repairs it.
-
-An external delivery succeeds only from one authoritative SQLite receipt matching the exact
-repository, branch, base, head, build, review approval, push target, PR, and persisted CI state.
-An ambiguous run, changed head, moved base, closed PR, missing database evidence, or outage is not
-success. Configured Firstmate Graph token/cost/time budgets reject external execution because the
-pinned external product cannot prove those limits to this controller. Deterministic adapter tests
-use an explicit fake seam; real local integration remains unproven unless the complete attestation
-passes on that machine.
+`a6f64fcdb4e82c0ddbbd9f01ed91e97dd233d42d`. BOSS never installs, initializes, updates, syncs,
+resets, aborts, or repairs it. Availability and evidence fail closed unless the exact signed
+macOS build and authoritative repository-bound receipt pass the complete attestation boundary.
 
 </details>
 
-## Project status
+## License
 
-Early and opinionated. Used daily by one person; not yet battle-tested like the original
-Firstmate. The safety posture prefers an explicit stop and preserved work over a clever recovery
-that cannot prove what it owns.
-
-Read next: [CLI reference](docs/cli.md) · [control-plane architecture](docs/control-plane.md) ·
-[terminal banner contract](docs/terminal-banner-contract.md) ·
-[interactive evidence](docs/evidence/interactive-session.md)
-
-MIT licensed.
+MIT. See [LICENSE](LICENSE).

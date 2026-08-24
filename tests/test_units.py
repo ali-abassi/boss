@@ -1,9 +1,9 @@
-"""Unit tests for the decisions helm makes without a model: dispatch, rendering, authority."""
+"""Unit tests for the decisions bossctl makes without a model: dispatch, rendering, authority."""
 try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, re, shutil, subprocess, sys, tempfile, unittest
+import contextlib, io, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -13,7 +13,7 @@ sys.path.insert(0, str(REPO))
 class Isolated(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
-        os.environ["HELM_HOME"] = str(self.home)
+        os.environ["BOSS_HOME"] = str(self.home)
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -21,7 +21,7 @@ class Isolated(unittest.TestCase):
 
 class DispatchTests(Isolated):
     def test_first_matching_rule_wins_and_merges_models(self):
-        from helm import dispatch
+        from bossctl import dispatch
         proj = {"id": "api", "mode": "no-mistakes"}
         d = dispatch.resolve({"kind": "ship", "labels": ["cheap"]}, proj)
         self.assertEqual(d["rule"], "cheap")
@@ -30,14 +30,14 @@ class DispatchTests(Isolated):
         self.assertEqual(d["models"]["review_correctness"], "openai-codex/gpt-5.6-sol")  # default kept
 
     def test_scout_ignores_mode(self):
-        from helm import dispatch
+        from bossctl import dispatch
         d = dispatch.resolve({"kind": "scout", "labels": []}, {"id": "x", "mode": "direct-pr"})
         self.assertEqual(d["graph"], "scout")
 
     def test_project_regex_and_missing_model_fail_closed(self):
-        from helm import dispatch
-        from helm.util import write_json
-        from helm.paths import dispatch_file
+        from bossctl import dispatch
+        from bossctl.util import write_json
+        from bossctl.paths import dispatch_file
         write_json(dispatch_file(), {"models": {"implement": "a/b"}, "thinking": {},
                                      "rules": [{"name": "only-web", "project": "web-.*"}]})
         with self.assertRaises(SystemExit):                                # no rule for api
@@ -48,11 +48,11 @@ class DispatchTests(Isolated):
 
 class RenderTests(Isolated):
     def test_every_graph_renders_with_no_placeholders_and_shell_intact(self):
-        from helm import graphs, dispatch
+        from bossctl import graphs, dispatch
         cfg = dispatch.load()
         proj = {"id": "p", "path": "/tmp/p", "base": "main", "test_cmd": "npm test", "protected_paths": [".github/*", "a b.txt"]}
         for g in ("local-only", "direct-pr", "high-assurance", "scout"):
-            steps = graphs.render(g, self.home / g, cwd=Path("/tmp/wt"), branch="helm/x", project=proj,
+            steps = graphs.render(g, self.home / g, cwd=Path("/tmp/wt"), branch="bossctl/x", project=proj,
                                   models=cfg["models"], thinking=cfg["thinking"], timeout=42)
             text = steps.read_text()
             self.assertNotIn("@{", text, g)
@@ -65,32 +65,32 @@ class RenderTests(Isolated):
                 self.assertIn("npm test", text)
 
     def test_rendered_graphs_pass_the_bundled_runner_validate(self):
-        from helm import graphs, dispatch
-        os.environ.pop("HELM_PIW", None)
+        from bossctl import graphs, dispatch
+        os.environ.pop("BOSS_PIW", None)
         cfg = dispatch.load()
         repo = self.home / "repo"; repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         proj = {"id": "p", "path": str(repo), "base": "main", "test_cmd": "true", "protected_paths": []}
         for g in ("local-only", "direct-pr", "high-assurance", "scout"):
-            steps = graphs.render(g, self.home / g, cwd=repo, branch="helm/x", project=proj,
+            steps = graphs.render(g, self.home / g, cwd=repo, branch="bossctl/x", project=proj,
                                   models=cfg["models"], thinking=cfg["thinking"], timeout=42)
             r = subprocess.run([graphs.piw_bin(), "validate", str(steps)], text=True, capture_output=True)
             self.assertEqual(r.returncode, 0, f"{g}: {r.stdout}{r.stderr}")
 
     def test_legacy_graph_name_renders_the_canonical_template(self):
-        from helm import graphs, dispatch
+        from bossctl import graphs, dispatch
         cfg = dispatch.load()
         proj = {"id": "p", "path": "/tmp/p", "base": "main", "test_cmd": "true", "protected_paths": []}
-        steps = graphs.render("no-mistakes", self.home / "legacy", cwd=Path("/tmp/wt"), branch="helm/x",
+        steps = graphs.render("no-mistakes", self.home / "legacy", cwd=Path("/tmp/wt"), branch="bossctl/x",
                               project=proj, models=cfg["models"], thinking=cfg["thinking"], timeout=42)
-        self.assertIn("workflow: helm-high-assurance", steps.read_text())
+        self.assertIn("workflow: bossctl-high-assurance", steps.read_text())
 
 
 class GateBoundaryTests(Isolated):
     def test_absent_external_gate_fails_closed_without_installing_or_faking_evidence(self):
         from unittest import mock
-        from helm import gates
-        with mock.patch("helm.no_mistakes.shutil.which", return_value=None):
+        from bossctl import gates
+        with mock.patch("bossctl.no_mistakes.shutil.which", return_value=None):
             evidence = gates.no_mistakes_status(self.home)
         self.assertFalse(evidence["ready"])
         self.assertFalse(evidence["installed"])
@@ -99,9 +99,9 @@ class GateBoundaryTests(Isolated):
 
     def test_unattested_executable_is_not_mistaken_for_the_pinned_product(self):
         from unittest import mock
-        from helm import gates
+        from bossctl import gates
         binary = self.home / "no-mistakes"; binary.write_text("not the release\n"); binary.chmod(0o755)
-        with mock.patch("helm.no_mistakes.shutil.which", return_value=str(binary)):
+        with mock.patch("bossctl.no_mistakes.shutil.which", return_value=str(binary)):
             evidence = gates.no_mistakes_status(self.home)
         self.assertTrue(evidence["installed"])
         self.assertFalse(evidence["binary_provenance_verified"])
@@ -111,7 +111,7 @@ class GateBoundaryTests(Isolated):
 
 class ProtectedPathTests(unittest.TestCase):
     def check(self, files, globs):
-        return subprocess.run([sys.executable, str(REPO / "helm" / "check_protected.py"), *globs],
+        return subprocess.run([sys.executable, str(REPO / "bossctl" / "check_protected.py"), *globs],
                               input="\n".join(files), text=True, capture_output=True).returncode
 
     def test_blocks_protected_and_allows_others(self):
@@ -122,7 +122,7 @@ class ProtectedPathTests(unittest.TestCase):
 
 class WorktreeStatusTests(Isolated):
     def test_unstaged_first_porcelain_record_keeps_its_complete_path(self):
-        from helm import worktree
+        from bossctl import worktree
         repo = self.home / "repo"; repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
@@ -135,15 +135,15 @@ class WorktreeStatusTests(Isolated):
 
     @unittest.skipIf(os.name == "nt", "POSIX Git path identity test")
     def test_scope_preserves_a_literal_backslash_filename(self):
-        from helm import scope
+        from bossctl import scope
         literal = r"src\literal.py"
         self.assertEqual(scope.normalize([literal]), [literal])
         self.assertEqual(scope.escaped([literal], [literal]), [])
         self.assertEqual(scope.escaped([literal], ["src/literal.py"]), ["src/literal.py"])
 
     def test_checkpoint_excludes_managed_dependency_links_without_ambient_git_config(self):
-        from helm import worktree
-        from helm.util import sh
+        from bossctl import worktree
+        from bossctl.util import sh
         repo = self.home / "checkpoint"; repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
@@ -155,7 +155,7 @@ class WorktreeStatusTests(Isolated):
         dependency = self.home / "shared-node-modules"; dependency.mkdir()
         (dependency / "dep.js").write_text("module.exports = 1\n")
         (repo / "node_modules").symlink_to(dependency, target_is_directory=True)
-        (repo / ".helm-ask.json").write_text('{"question":"keep me unstaged"}\n')
+        (repo / ".boss-ask.json").write_text('{"question":"keep me unstaged"}\n')
         (repo / "task.py").write_text("after\n")
         result = sh(["git", "-C", str(repo), "add", "-A", "--",
                      *worktree.checkpoint_pathspecs(repo)], check=False,
@@ -167,10 +167,10 @@ class WorktreeStatusTests(Isolated):
         raw_status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1"],
                                     text=True, capture_output=True, check=True).stdout
         self.assertIn("node_modules", raw_status)
-        self.assertIn(".helm-ask.json", raw_status)
+        self.assertIn(".boss-ask.json", raw_status)
 
     def test_creating_a_sibling_never_prunes_a_retained_item_worktree(self):
-        from helm import worktree
+        from bossctl import worktree
         repo = self.home / "multi"; repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
@@ -182,8 +182,8 @@ class WorktreeStatusTests(Isolated):
         first = worktree.create(project, "p-first")
         second = worktree.create(project, "p-second")
         self.assertTrue(first.is_dir() and second.is_dir())
-        self.assertEqual(worktree.branch_worktrees(project, "firstmate/p-first"), [first.resolve()])
-        self.assertEqual(worktree.branch_worktrees(project, "firstmate/p-second"), [second.resolve()])
+        self.assertEqual(worktree.branch_worktrees(project, "boss/p-first"), [first.resolve()])
+        self.assertEqual(worktree.branch_worktrees(project, "boss/p-second"), [second.resolve()])
 
 
 class DetectTests(unittest.TestCase):
@@ -194,7 +194,7 @@ class DetectTests(unittest.TestCase):
         return d
 
     def test_detects_common_stacks(self):
-        from helm import detect
+        from bossctl import detect
         cases = [
             ({"package.json": '{"scripts": {"test": "vitest"}}'}, "npm test"),
             ({"package.json": '{"scripts": {"test": "vitest"}}', "pnpm-lock.yaml": ""}, "pnpm test"),
@@ -213,48 +213,117 @@ class DetectTests(unittest.TestCase):
 class PiExtensionTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("bun"), "bun not installed")
     def test_extension_self_test_passes(self):
-        r = subprocess.run(["bun", str(REPO / ".pi" / "extensions" / "firstmate.ts")], text=True, capture_output=True)
+        r = subprocess.run(["bun", str(REPO / ".pi" / "extensions" / "boss.ts")], text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("checks passed", r.stdout)
 
     def test_voice_contract_is_in_agents_md_too(self):
         agents = (REPO / "AGENTS.md").read_text()
-        self.assertIn('"captain"', agents)
+        self.assertIn("chief operating officer (COO)", agents)
+        self.assertIn("The user is **Boss**", agents)
+        self.assertIn("Never call yourself Boss", agents)
         self.assertIn("promote", agents)
 
-    def test_captain_prompt_knows_the_actual_control_plane(self):
+    def test_boss_prompt_knows_the_actual_control_plane(self):
         agents = (REPO / "AGENTS.md").read_text()
         for truth in (
-            "firstmate-captain/v2",
+            "boss-coo/v1",
             "real persistent Pi agent",
             "own Herdr tab",
-            "`/fleet` is the canonical portfolio view",
-            "Active Herdr tabs are the drill-down view",
+            "`/ops` is the canonical portfolio view",
+            "Active tabs are watchable",
             "Independent items can run concurrently",
             "`direct-pr` adds one correctness review",
-            "`high-assurance` adds fresh correctness and adversarial reviews",
+            "`high-assurance` adds",
+            "fresh correctness and adversarial reviews",
             "zero model turns in healthy steady state",
-            "Isn't that what `/fleet` does?",
+            "Isn't that what `/ops` does?",
             "Yes, exactly",
         ):
             self.assertIn(truth, agents)
-        self.assertNotIn("I run the crew in the background", agents)
+        self.assertNotIn("I run the team in the background", agents)
 
-    def test_capability_questions_trigger_the_firstmate_skill(self):
+    def test_capability_questions_trigger_the_boss_skill(self):
         skill = (REPO / "SKILL.md").read_text()
-        for trigger in ("what First Mate is or can do", "whether workers use Herdr", "/fleet", "/inbox"):
+        for trigger in ("what BOSS or the COO can do", "whether workers use Herdr", "/ops", "/inbox"):
             self.assertIn(trigger, skill)
         self.assertIn("Do not search unrelated", skill)
 
     def test_prompt_eval_set_covers_twenty_representative_conversations(self):
-        contract = (REPO / "docs" / "captain-prompt-contract.md").read_text()
-        cases = re.findall(r"^\| FM-\d{2} ", contract, re.MULTILINE)
+        contract = (REPO / "docs" / "boss-prompt-contract.md").read_text()
+        cases = re.findall(r"^\| BO-\d{2} ", contract, re.MULTILINE)
         self.assertEqual(len(cases), 20)
+
+
+class BoardRenderTests(Isolated):
+    def test_cell_width_and_truncation_handle_wide_and_combining_text(self):
+        from bossctl import board
+        self.assertEqual(board.cell_width("BOSS"), 4)
+        self.assertEqual(board.cell_width("界e\u0301"), 3)
+        self.assertLessEqual(board.cell_width(board.fit_width("界" * 20, 11)), 11)
+        self.assertEqual(board.cell_width(board.pad_width("界e\u0301", 8)), 8)
+        self.assertEqual(board.pad_width("界" * 20, 7), "界界界 ")
+        escaped = board.ascii_text("界 e\u0301 🚀 — done")
+        self.assertEqual(escaped, r"\u754c e \U0001f680 - done")
+        self.assertTrue(all(ord(char) < 128 for char in escaped))
+
+    def test_maximum_content_and_plain_header_fit_the_requested_width(self):
+        from unittest import mock
+        from bossctl import board
+        items = [{"status": "running" if n % 2 else "needs-you", "project": "超長-project-name",
+                  "text": "🚀 investigate a deliberately long request " * 4,
+                  "ask": {"question": "decision with wide glyphs 界界"}}
+                 for n in range(12)]
+        projects = {f"p{n}": {"id": f"project-{n}-界", "mode": "high-assurance", "authority": 3}
+                    for n in range(8)}
+        with mock.patch("bossctl.board.registry.load", return_value={"projects": projects}), \
+             mock.patch("bossctl.board.work.all_items", return_value=items), \
+             mock.patch("bossctl.supervisor.summary", return_value={"away": False, "pending_wakes": 0}), \
+             mock.patch.dict(os.environ, {"TERM": "dumb", "BOSS_PLAIN": "1"}):
+            for width in (24, 52, 80):
+                rendered = board.header(width) + board.render(123, width)
+                self.assertTrue(all(board.cell_width(line) <= width - 1 for line in rendered.splitlines()), width)
+                self.assertTrue(all(ord(char) < 128 for char in board.header(width)), width)
+            maximum = board.render(123, 100)
+            self.assertEqual(sum("investigate" in line for line in maximum.splitlines()), 12)
+            self.assertTrue(all(board.cell_width(line) <= 99 for line in maximum.splitlines()))
+            self.assertNotIn("超", maximum)
+            self.assertNotIn("🚀", maximum)
+            self.assertTrue(all(ord(char) < 128 for char in maximum))
+
+    def test_continuous_watch_has_no_cursor_controls_in_plain_or_no_color_modes(self):
+        from unittest import mock
+        from bossctl import board
+        for env in ({"TERM": "dumb", "BOSS_PLAIN": "1"}, {"TERM": "xterm-256color", "NO_COLOR": "1"}):
+            stream = io.StringIO()
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch("bossctl.cli.daemon_pid", return_value=None), \
+                 mock.patch("bossctl.board.time.sleep", side_effect=KeyboardInterrupt), \
+                 contextlib.redirect_stdout(stream):
+                with self.assertRaises(KeyboardInterrupt):
+                    board.watch(1, once=False)
+            self.assertNotIn("\x1b", stream.getvalue())
+
+    def test_plain_inbox_escapes_repository_text_to_ascii(self):
+        from unittest import mock
+        from bossctl import cli
+        item = {"id": "demo-20260824-120000-abcd", "status": "needs-you", "project": "超長",
+                "kind": "scout", "attempts": 0, "max_attempts": 3,
+                "text": "🚀 résumé — release", "ask": {"question": "approve 界?"}}
+        stream = io.StringIO()
+        args = type("Args", (), {"json": False, "hints": True})()
+        with mock.patch.dict(os.environ, {"TERM": "dumb", "BOSS_PLAIN": "1"}, clear=True), \
+             mock.patch("bossctl.work.all_items", return_value=[item]), contextlib.redirect_stdout(stream):
+            cli.cmd_inbox(args)
+        rendered = stream.getvalue()
+        self.assertTrue(all(ord(char) < 128 for char in rendered))
+        self.assertIn(r"\u754c", rendered)
+        self.assertIn(r"\U0001f680", rendered)
 
 
 class NodeBudgetTests(Isolated):
     def test_node_budget_schema_and_non_model_metrics_fail_closed(self):
-        from helm import work
+        from bossctl import work
         self.assertEqual(work.validate_node_budgets({"implement": {"tokens": 100, "seconds": 30}}),
                          {"implement": {"tokens": 100, "cost": None, "seconds": 30}})
         with self.assertRaises(SystemExit):
@@ -265,7 +334,7 @@ class NodeBudgetTests(Isolated):
             work.validate_node_budgets({"implement": {"cost": float("nan")}})
 
     def test_session_receipts_are_cumulative_per_node_and_never_double_counted(self):
-        from helm import work
+        from bossctl import work
         usage = {}
         first = {"agent_session_id": "first"}
         work._record_node_session(usage, "implement", first, {}, started=False)
@@ -282,7 +351,7 @@ class NodeBudgetTests(Isolated):
         self.assertIn("implement tokens budget exhausted", "; ".join(work.node_budget_blockers(item)))
 
     def test_invalid_node_usage_measurements_fail_closed(self):
-        from helm import work
+        from bossctl import work
         usage = {"implement": work._new_node_usage()}
         identity = {"agent_session_id": "session-invalid"}
         work._record_node_session(usage, "implement", identity,
@@ -295,8 +364,8 @@ class NodeBudgetTests(Isolated):
 
     def test_malformed_persisted_budget_state_blocks_before_runtime_and_cannot_be_written(self):
         from unittest import mock
-        from helm import work
-        from helm.util import write_json
+        from bossctl import work
+        from bossctl.util import write_json
         base = {"attempts": 1, "runs": [{"attempt": 1}], "session": None, "agent_launches": [],
                 "budgets": {"tokens": 100, "cost": None, "seconds": None},
                 "usage": {"tokens": 0, "cost": 0.0, "seconds": 0.0,
@@ -340,13 +409,13 @@ class NodeBudgetTests(Isolated):
         with self.assertRaises(SystemExit):
             work.control.cas_update(work_id, lambda item: item["controls"].update(paused=True))
         self.assertEqual(item_path.read_bytes(), before)
-        with mock.patch("helm.work._execute") as execute:
+        with mock.patch("bossctl.work._execute") as execute:
             with self.assertRaises(SystemExit):
                 work.execute(persisted)
         execute.assert_not_called()
 
     def test_active_first_turn_waits_for_provider_receipt_but_settled_turn_fails_closed(self):
-        from helm import work
+        from bossctl import work
         budgets = {"tokens": 100, "cost": 1.0}
         self.assertEqual(work._missing_settled_usage(
             budgets, {}, 0, "became unavailable"), [])
@@ -355,7 +424,7 @@ class NodeBudgetTests(Isolated):
             ["tokens usage evidence became unavailable", "cost usage evidence became unavailable"])
 
     def test_cli_node_budget_parser_rejects_duplicates_and_normalizes(self):
-        from helm import cli
+        from bossctl import cli
         self.assertEqual(cli._node_budget_args(["implement=100"], ["review_correctness=0.5"], ["verify=20"]),
                          {"implement": {"tokens": 100, "cost": None, "seconds": None},
                           "review_correctness": {"tokens": None, "cost": 0.5, "seconds": None},
@@ -365,44 +434,44 @@ class NodeBudgetTests(Isolated):
 
 
 class OwnPiHomeTests(Isolated):
-    def test_first_mate_has_its_own_pi_home_and_inherits_nothing(self):
-        src = self.home / "captain-pi"; src.mkdir()
+    def test_coo_has_its_own_pi_home_and_inherits_nothing(self):
+        src = self.home / "boss-pi"; src.mkdir()
         (src / "auth.json").write_text(json.dumps({"openai-codex": {"access": "tok"}, "anthropic": {"x": 1}}))
         (src / "AGENTS.md").write_text("# personal agent"); (src / "extensions").mkdir()
-        os.environ["PI_CODING_AGENT_DIR"] = str(src); os.environ["HELM_IMPORT_PI_DIR"] = str(src)
-        from helm.cli import _isolated_pi_home
+        os.environ["PI_CODING_AGENT_DIR"] = str(src); os.environ["BOSS_IMPORT_PI_DIR"] = str(src)
+        from bossctl.cli import _isolated_pi_home
         dst = _isolated_pi_home()
         self.assertFalse((dst / "AGENTS.md").exists()); self.assertFalse((dst / "extensions").exists())
         self.assertFalse((dst / "auth.json").exists(), "no login is inherited silently")
         settings = json.loads((dst / "settings.json").read_text())
         self.assertEqual((settings["defaultProvider"], settings["defaultModel"]), ("openai-codex", "gpt-5.6-sol"))
-        self.assertNotIn("enabledModels", settings, "no model cage: the captain decides")
+        self.assertNotIn("enabledModels", settings, "no model cage: the boss decides")
         (dst / "settings.json").write_text(json.dumps({"defaultModel": "mine", "defaultProvider": "x"}))
-        _isolated_pi_home()                                   # second run keeps the captain's choice
+        _isolated_pi_home()                                   # second run keeps the boss's choice
         self.assertEqual(json.loads((dst / "settings.json").read_text())["defaultModel"], "mine")
         # --import-login copies only the Codex credential
-        r = subprocess.run([str(REPO / "bin" / "helm"), "setup", "--import-login", "--json"],
+        r = subprocess.run([str(REPO / "bin" / "bossctl"), "setup", "--import-login", "--json"],
                            env={**os.environ}, text=True, capture_output=True)
         auth = json.loads((dst / "auth.json").read_text())
         self.assertEqual(list(auth), ["openai-codex"])
-        del os.environ["PI_CODING_AGENT_DIR"]; del os.environ["HELM_IMPORT_PI_DIR"]
+        del os.environ["PI_CODING_AGENT_DIR"]; del os.environ["BOSS_IMPORT_PI_DIR"]
 
-    def test_every_helm_command_runs_in_the_first_mates_pi_home(self):
-        r = subprocess.run([sys.executable, "-c", "import os,sys; sys.argv=['helm','status','--json']; sys.path.insert(0, sys.argv[0]); "
-                            "from helm import cli; cli.main(['status','--json']); print('DIR='+os.environ['PI_CODING_AGENT_DIR'])"],
-                           cwd=str(REPO), env={**os.environ, "HELM_HOME": str(self.home)}, text=True, capture_output=True)
+    def test_every_bossctl_command_runs_in_the_coos_pi_home(self):
+        r = subprocess.run([sys.executable, "-c", "import os,sys; sys.argv=['bossctl','status','--json']; sys.path.insert(0, sys.argv[0]); "
+                            "from bossctl import cli; cli.main(['status','--json']); print('DIR='+os.environ['PI_CODING_AGENT_DIR'])"],
+                           cwd=str(REPO), env={**os.environ, "BOSS_HOME": str(self.home)}, text=True, capture_output=True)
         self.assertIn(f"DIR={self.home.resolve()}/pi", r.stdout)
 
 
 class DispatchSetTests(Isolated):
-    def test_captain_can_change_a_steps_model(self):
-        r = subprocess.run([str(REPO / "bin" / "helm"), "dispatch", "--set", "implement=openai-codex/gpt-5.6-luna"],
-                           env={**os.environ, "HELM_HOME": str(self.home)}, text=True, capture_output=True)
+    def test_boss_can_change_a_steps_model(self):
+        r = subprocess.run([str(REPO / "bin" / "bossctl"), "dispatch", "--set", "implement=openai-codex/gpt-5.6-luna"],
+                           env={**os.environ, "BOSS_HOME": str(self.home)}, text=True, capture_output=True)
         self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("implement=openai-codex/gpt-5.6-luna", r.stdout)
-        from helm import dispatch
+        from bossctl import dispatch
         self.assertEqual(dispatch.load()["models"]["implement"], "openai-codex/gpt-5.6-luna")
-        r = subprocess.run([str(REPO / "bin" / "helm"), "dispatch", "--set", "bogus=x"],
-                           env={**os.environ, "HELM_HOME": str(self.home)}, text=True, capture_output=True)
+        r = subprocess.run([str(REPO / "bin" / "bossctl"), "dispatch", "--set", "bogus=x"],
+                           env={**os.environ, "BOSS_HOME": str(self.home)}, text=True, capture_output=True)
         self.assertEqual(r.returncode, 1)
 
 
@@ -438,11 +507,11 @@ steps:
         self.assertIn("d2f84bb740d8e336a198145022a367acdf18824f", provenance)
 
     def test_direct_and_symlinked_launcher_use_a_receipt_capable_runtime(self):
-        direct = subprocess.run([str(REPO / "bin" / "helm"), "--version"],
+        direct = subprocess.run([str(REPO / "bin" / "bossctl"), "--version"],
                                 text=True, capture_output=True)
         self.assertEqual(direct.returncode, 0, direct.stderr)
         with tempfile.TemporaryDirectory() as raw:
-            link = Path(raw) / "helm"; link.symlink_to(REPO / "bin" / "helm")
+            link = Path(raw) / "bossctl"; link.symlink_to(REPO / "bin" / "bossctl")
             linked = subprocess.run([str(link), "--version"], text=True, capture_output=True)
             self.assertEqual(linked.returncode, 0, linked.stderr)
             self.assertEqual(linked.stdout, direct.stdout)
@@ -450,11 +519,11 @@ steps:
     def test_launcher_prefers_the_installer_private_runtime(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw); (root / "bin").mkdir(); (root / ".venv" / "bin").mkdir(parents=True)
-            shutil.copy2(REPO / "bin" / "helm", root / "bin" / "helm")
+            shutil.copy2(REPO / "bin" / "bossctl", root / "bin" / "bossctl")
             fake = root / ".venv" / "bin" / "python"
             fake.write_text("#!/bin/sh\n[ \"$1\" = -c ] && exit 0\nprintf 'private-runtime\\n'\n")
             fake.chmod(0o755)
-            result = subprocess.run([str(root / "bin" / "helm"), "--version"],
+            result = subprocess.run([str(root / "bin" / "bossctl"), "--version"],
                                     text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "private-runtime\n")
@@ -465,7 +534,7 @@ steps:
         self.assertIn("vendor/pi-graph/requirements.txt", (REPO / "install.sh").read_text())
         self.assertIn("vendor/pi-graph/requirements.txt",
                       (REPO / ".github" / "workflows" / "tests.yml").read_text())
-        syntax = subprocess.run(["sh", "-n", str(REPO / "bin" / "helm")],
+        syntax = subprocess.run(["sh", "-n", str(REPO / "bin" / "bossctl")],
                                 text=True, capture_output=True)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 

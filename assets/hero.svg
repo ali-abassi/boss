@@ -1,110 +1,69 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
-  <title id="title">Firstmate Graph control plane</title>
-  <desc id="desc">One captain conversation flows through a durable Firstmate Graph control plane into persistent Herdr workers. High-assurance work passes implement, test, and exact-SHA review gates before ready work or decisions return to the captain, who keeps merge authority.</desc>
-  <defs>
-    <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
-      <path d="M0 0L8 4L0 8Z" fill="#58a6ff"/>
-    </marker>
-    <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
-      <path d="M0 0L8 4L0 8Z" fill="#3fb950"/>
-    </marker>
-    <style>
-      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-      .eyebrow { fill: #8b949e; font-size: 13px; font-weight: 700; letter-spacing: 2px; }
-      .label { fill: #f0f6fc; font-size: 18px; font-weight: 700; }
-      .body { fill: #c9d1d9; font-size: 15px; }
-      .small { fill: #8b949e; font-size: 13px; }
-    </style>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">BOSS turns one conversation into an operated software portfolio</title>
+  <desc id="desc">Boss sets outcomes in one conversation. A COO control plane scopes and routes independent work to real persistent Pi agents in Herdr, runs deterministic tests and exact-SHA reviews, and returns only blockers, decisions, and ready work. Boss keeps merge authority.</desc>
+  <rect width="1280" height="640" rx="30" fill="#0b0d10"/>
+  <rect x="1" y="1" width="1278" height="638" rx="29" fill="none" stroke="#30363d" stroke-width="2"/>
 
-  <rect width="1200" height="520" rx="22" fill="#0d1117"/>
-  <rect x="1" y="1" width="1198" height="518" rx="21" fill="none" stroke="#30363d" stroke-width="2"/>
-
-  <!-- Quiet chart lines: nautical without becoming decoration. -->
-  <path d="M0 454 C90 438 150 470 240 454 S390 438 480 454 S630 470 720 454 S870 438 960 454 S1110 470 1200 454" fill="none" stroke="#1f2937" stroke-width="2"/>
-  <path d="M0 476 C90 460 150 492 240 476 S390 460 480 476 S630 492 720 476 S870 460 960 476 S1110 492 1200 476" fill="none" stroke="#161b22" stroke-width="2"/>
-
-  <text x="48" y="48" class="sans eyebrow">ONE THREAD</text>
-  <text x="374" y="48" class="sans eyebrow">DURABLE CONTROL PLANE</text>
-  <text x="840" y="48" class="sans eyebrow">PERSISTENT HERDR CREW</text>
-
-  <!-- Captain / single conversation. -->
-  <circle cx="92" cy="104" r="26" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
-  <path d="M92 86V117M80 101H104M84 117C88 125 96 125 100 117" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linecap="round"/>
-  <text x="132" y="101" class="sans label">Captain</text>
-  <text x="132" y="123" class="sans small">talk normally</text>
-
-  <rect x="48" y="158" width="262" height="92" rx="12" fill="#161b22" stroke="#30363d"/>
-  <text x="68" y="187" class="mono small">YOU ›</text>
-  <text x="68" y="215" class="sans body">fix the API and audit web</text>
-  <text x="68" y="236" class="sans small">one request · two tasks</text>
-
-  <rect x="48" y="308" width="262" height="90" rx="12" fill="#111820" stroke="#d29922" stroke-width="1.5"/>
-  <text x="68" y="337" class="sans eyebrow" fill="#d29922">AUTHORITY STAYS HERE</text>
-  <text x="68" y="365" class="sans label">Merge?</text>
-  <text x="145" y="365" class="mono body" fill="#d29922">captain only</text>
-  <text x="68" y="385" class="sans small">never granted by away mode</text>
-
-  <!-- The captain's outbound line. -->
-  <path d="M310 204H352" fill="none" stroke="#58a6ff" stroke-width="3" marker-end="url(#arrow-blue)"/>
-
-  <!-- Central control plane, shaped like a compact deck rather than a dashboard grid. -->
-  <path d="M374 78H760V388H400L374 360Z" fill="#161b22" stroke="#30363d" stroke-width="2"/>
-  <path d="M374 132H760" stroke="#30363d"/>
-  <text x="402" y="105" class="sans label">⚓  FIRSTMATE GRAPH</text>
-  <text x="402" y="124" class="sans small">high-assurance path · one persistent Pi captain</text>
-
-  <line x1="412" y1="166" x2="412" y2="303" stroke="#30363d" stroke-width="2"/>
-  <circle cx="412" cy="174" r="7" fill="#3fb950"/>
-  <text x="438" y="180" class="mono body">01  IMPLEMENT</text>
-  <text x="438" y="200" class="sans small">same identity</text>
-
-  <circle cx="412" cy="230" r="7" fill="#58a6ff"/>
-  <text x="438" y="236" class="mono body">02  TEST</text>
-  <text x="438" y="256" class="sans small">bounded run</text>
-
-  <circle cx="412" cy="286" r="7" fill="#d29922"/>
-  <text x="438" y="292" class="mono body">03  REVIEW</text>
-  <text x="438" y="312" class="sans small">exact SHA</text>
-
-  <path d="M650 162V302" stroke="#30363d" stroke-dasharray="4 5"/>
-  <text x="676" y="181" class="sans eyebrow">DURABLE</text>
-  <text x="676" y="207" class="sans small">budgets</text>
-  <text x="676" y="231" class="sans small">controls</text>
-  <text x="676" y="255" class="sans small">evidence</text>
-  <text x="676" y="279" class="sans small">recovery</text>
-
-  <rect x="402" y="327" width="330" height="37" rx="8" fill="#0d1117" stroke="#238636"/>
-  <circle cx="421" cy="345.5" r="5" fill="#3fb950"/>
-  <text x="436" y="351" class="mono small" fill="#c9d1d9">supervisor · zero model turns while healthy</text>
-
-  <!-- Work fans into real Herdr agents. -->
-  <path d="M760 204H803V121H832" fill="none" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
-  <path d="M803 204V223H832" fill="none" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
-  <path d="M803 223V325H832" fill="none" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
-
-  <g>
-    <rect x="840" y="80" width="312" height="82" rx="12" fill="#161b22" stroke="#30363d"/>
-    <circle cx="866" cy="106" r="6" fill="#3fb950"/>
-    <text x="884" y="111" class="mono body">worker 1 · api</text>
-    <text x="866" y="138" class="sans small">Herdr tab · persistent identity</text>
+  <!-- Brand lockup. -->
+  <g transform="translate(48 38)" fill="none" stroke="#b7f34a" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 2v62"/>
+    <path d="M14 8h23c13 0 21 7 21 16s-8 16-21 16H14"/>
+    <path d="M14 40h25c14 0 23 7 23 17s-9 17-23 17H14"/>
   </g>
-  <g>
-    <rect x="840" y="182" width="312" height="82" rx="12" fill="#161b22" stroke="#30363d"/>
-    <circle cx="866" cy="208" r="6" fill="#58a6ff"/>
-    <text x="884" y="213" class="mono body">worker 2 · web</text>
-    <text x="866" y="240" class="sans small">own worktree · live steering</text>
-  </g>
-  <g>
-    <rect x="840" y="284" width="312" height="82" rx="12" fill="#161b22" stroke="#30363d"/>
-    <circle cx="866" cy="310" r="6" fill="#d29922"/>
-    <text x="884" y="315" class="mono body">reviewer · fresh</text>
-    <text x="866" y="342" class="sans small">read-only · exact commit</text>
+  <text x="130" y="73" fill="#f2ede3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="34" font-weight="800" letter-spacing="9">BOSS</text>
+  <text x="132" y="101" fill="#9ca3af" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" font-weight="600" letter-spacing="3">YOUR AI COO</text>
+  <text x="1232" y="68" text-anchor="end" fill="#6e7681" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" letter-spacing="2">ONE THREAD · MANY REPOS</text>
+
+  <text x="48" y="165" fill="#f2ede3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="35" font-weight="750">You set the outcome. Your COO runs operations.</text>
+  <text x="48" y="198" fill="#9ca3af" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18">Real agents. Deterministic gates. Every consequential decision comes back to you.</text>
+
+  <!-- Input, COO, and agent lanes. -->
+  <rect x="48" y="252" width="250" height="156" rx="18" fill="#11151a" stroke="#30363d" stroke-width="2"/>
+  <text x="72" y="284" fill="#b7f34a" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="700" letter-spacing="2">BOSS</text>
+  <text x="72" y="319" fill="#f2ede3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="23" font-weight="700">Outcomes + priorities</text>
+  <text x="72" y="351" fill="#9ca3af" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="15">One conversation</text>
+  <text x="72" y="376" fill="#9ca3af" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="15">One decision queue</text>
+
+  <path d="M298 330h62" stroke="#b7f34a" stroke-width="3"/>
+  <path d="M349 321l14 9-14 9" fill="none" stroke="#b7f34a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <rect x="365" y="232" width="290" height="196" rx="22" fill="#171c22" stroke="#b7f34a" stroke-width="2"/>
+  <text x="393" y="269" fill="#b7f34a" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="700" letter-spacing="2">YOUR COO</text>
+  <text x="393" y="307" fill="#f2ede3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="25" font-weight="750">Owns coordination</text>
+  <text x="393" y="345" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">SCOPE   ASSIGN   STEER</text>
+  <text x="393" y="373" fill="#c9d1d9" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">WATCH   VERIFY   REPORT</text>
+  <path d="M393 397h226" stroke="#30363d" stroke-width="2"/>
+
+  <!-- The B-shaped routing spine. -->
+  <path d="M655 282h32c31 0 31-42 67-42h32" fill="none" stroke="#b7f34a" stroke-width="3"/>
+  <path d="M655 330h131" fill="none" stroke="#b7f34a" stroke-width="3"/>
+  <path d="M655 378h32c31 0 31 42 67 42h32" fill="none" stroke="#b7f34a" stroke-width="3"/>
+  <circle cx="786" cy="240" r="5" fill="#b7f34a"/>
+  <circle cx="786" cy="330" r="5" fill="#b7f34a"/>
+  <circle cx="786" cy="420" r="5" fill="#b7f34a"/>
+
+  <text x="808" y="225" fill="#6e7681" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" letter-spacing="2">REAL HERDR PI AGENTS</text>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+    <rect x="804" y="240" width="428" height="58" rx="13" fill="#11151a" stroke="#30363d"/>
+    <text x="828" y="274" fill="#f2ede3" font-size="14" font-weight="700">WORK ITEM 01</text>
+    <text x="1012" y="274" fill="#9ca3af" font-size="13">isolated · persistent</text>
+
+    <rect x="804" y="309" width="428" height="58" rx="13" fill="#11151a" stroke="#30363d"/>
+    <text x="828" y="343" fill="#f2ede3" font-size="14" font-weight="700">WORK ITEM 02</text>
+    <text x="1012" y="343" fill="#9ca3af" font-size="13">bounded · steerable</text>
+
+    <rect x="804" y="378" width="428" height="58" rx="13" fill="#11151a" stroke="#30363d"/>
+    <text x="828" y="412" fill="#f2ede3" font-size="14" font-weight="700">WORK ITEM 03</text>
+    <text x="1012" y="412" fill="#9ca3af" font-size="13">tested · evidence-bound</text>
   </g>
 
-  <!-- Only evidence and decisions travel back. -->
-  <path d="M1128 366V424H191V400" fill="none" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arrow-green)"/>
-  <rect x="486" y="409" width="342" height="34" rx="17" fill="#0d1117" stroke="#238636"/>
-  <text x="657" y="431" class="mono small" fill="#3fb950" text-anchor="middle">ready work · questions · honest failures</text>
+  <!-- Evidence return. -->
+  <path d="M1212 466v44H174v-76" fill="none" stroke="#f2ede3" stroke-width="2" stroke-dasharray="7 7"/>
+  <path d="M166 447l8-14 8 14" fill="none" stroke="#f2ede3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="365" y="474" width="577" height="72" rx="16" fill="#11151a" stroke="#30363d"/>
+  <text x="393" y="502" fill="#6e7681" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" letter-spacing="2">DETERMINISTIC CONTROL PLANE</text>
+  <text x="393" y="529" fill="#f2ede3" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">SCOPE  →  TEST  →  EXACT-SHA REVIEW  →  READY</text>
+
+  <text x="48" y="585" fill="#b7f34a" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" font-weight="700" letter-spacing="2">BLOCKERS · DECISIONS · READY WORK RETURN HERE</text>
+  <text x="1232" y="585" text-anchor="end" fill="#f2ede3" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" font-weight="700" letter-spacing="2">MERGE AUTHORITY: BOSS</text>
 </svg>

@@ -5,7 +5,7 @@ and Herdr implementer identity. Records are atomically replaced under per-item l
 Herdr agent is reattached only after lifecycle and durable session identity validate. Model,
 thinking, token, and cost evidence is attested from the Pi session JSONL when Herdr's generic
 agent record does not carry it; missing or conflicting evidence fails closed. Unknown or dead
-identity never triggers automatic replacement. A one-use captain recovery authorization is
+identity never triggers automatic replacement. A one-use boss recovery authorization is
 bound to the old session or unresolved implementer launch ID, reserved before launch, and
 consumed when the real replacement identity is persisted. A durable launch journal separates
 reservation, tab creation, attestation, and finalization, so a controller crash cannot turn an
@@ -18,7 +18,7 @@ executes the real pinned path through macOS `sandbox-exec`. An implementer outer
 writes only to its owned worktree plus exact per-launch session, attestation, temporary, and
 private Pi-configuration directories. A reviewer cannot write the repository and receives at
 most one exact verdict-file capability. Pi retains provider network access, but every
-model-invoked shell and final verification command is rewritten through `libexec/firstmate-tool`
+model-invoked shell and final verification command is rewritten through `libexec/boss-tool`
 with a second hash-pinned profile. That nested profile denies network, unrelated home/controller
 reads, process signalling, and Git-metadata writes; its environment is scrubbed and its runtime is
 bounded. A unique inherited sandbox fingerprint identifies the complete descendant tree even
@@ -48,7 +48,7 @@ A review input larger than 200,000 bytes fails closed; it is never silently trun
 changed commit, uncommitted file, untracked file, or moved base invalidates approval. Scouts
 are read-only; any mutation fails while preserving the worktree for inspection. Failed,
 interrupted, paused, and blocked items retain all unlanded work. Cleanup that can discard work
-requires item-specific captain authorization.
+requires item-specific boss authorization.
 
 ## Scheduling and controls
 
@@ -83,7 +83,7 @@ per-node envelopes for implementation/scouting, each independent reviewer, and v
 Model nodes use cumulative Pi-session receipts; verification accepts only elapsed-time limits.
 Limits are checked before, during, and after each node. Because providers report usage after a
 turn, one already-running turn can cross a threshold. The controller then settles without
-spending another checkpoint turn and refuses another turn until the captain explicitly raises
+spending another checkpoint turn and refuses another turn until the boss explicitly raises
 the paused item's budget and resumes it. Missing or legacy-unattributable node evidence fails
 closed instead of being recorded as zero. Completed node receipts are durably checkpointed as
 the pipeline advances. Every load and mutation validates finite limits, non-negative usage,
@@ -115,7 +115,7 @@ worktrees/branches/recovery holds. Worker ownership requires a recorded PID, pro
 start fingerprint, and command fingerprint; legacy, unknown, or reused PIDs are never signaled.
 Every repair rechecks its evidence under the relevant lock. It never deletes project work,
 closes a reused live tab, or starts a process. Choices with mutation authority must be named on
-the confirmed command. `--auth-source` copies one selected provider record into First Mate's
+the confirmed command. `--auth-source` copies one selected provider record into BOSS's
 private config without logging in; `--model` accepts only an exact entry in Pi's offline
 inventory; `--test` validates shell syntax and records the command without executing it; and
 `--fetch` fetches only the exact configured origin/base remote ref after proving checkout HEAD
@@ -140,7 +140,7 @@ Global away mode is enabled only after a fresh supervisor scan, a healthy offlin
 at least one positively live worker, an empty decision queue, and no open promotion, PR-delivery,
 cancellation, or external no-mistakes transaction. It suppresses wake delivery,
 not evidence: new decisions remain visible and durable, then flush when away mode is disabled.
-Work may reach merge-ready while away, but promotion always requires item-specific captain
+Work may reach merge-ready while away, but promotion always requires item-specific boss
 confirmation and is refused until away mode is off. Away enablement and promotion share the
 same authority lock, so neither can race past the other's gate.
 
@@ -153,7 +153,7 @@ promotion additionally requires reachable strict branch-protection evidence, a n
 check set, and any required GitHub App binding; missing/wrong-app checks stay pending. Pending,
 failed, green, merged, closed, changed-head, moved-base, rate-limit,
 outage, and malformed evidence remain distinct. Missing or uncertain network evidence is never
-green. The observer only records evidence and wakes the captain; it has no merge authority.
+green. The observer only records evidence and wakes the boss; it has no merge authority.
 
 Promotion is a globally serialized, durable transaction journal. Before it arms, it rechecks
 authority, project binding, gate availability, controls, away state, exact branch/base/head,
@@ -185,11 +185,11 @@ identifier, hardened runtime, signing timestamp, designated requirement, and arc
 Linux and unrecognized builds fail closed. Readiness additionally requires an externally
 initialized, owner-controlled `NM_HOME`, a compatible SQLite schema opened with `mode=ro`,
 `query_only`, and `trusted_schema=OFF`, one exact repository registration, matching origin/default
-branch, and the exact local no-mistakes gate remote. First Mate does not install, initialize,
+branch, and the exact local no-mistakes gate remote. BOSS does not install, initialize,
 update, abort, reset, sync, or repair the external product.
 
 The adapter is an explicit external transaction. Before invoking `no-mistakes axi run --intent`,
-it durably records the exact First Mate project policy, clean worktree fingerprint, reviewed head,
+it durably records the exact BOSS project policy, clean worktree fingerprint, reviewed head,
 base, intent hash, binary attestation, database/repository binding, push-target fingerprint, and
 the complete prior matching run-ID set. `request-started` is durable before process creation.
 Every later state is observation-only: a missing or ambiguous receipt is never replayed. Command
@@ -198,20 +198,20 @@ authoritative run and gate rows from SQLite and accepts delivery only when repo,
 submitted/base/current head, version/build, exact review approval, inactive push binding, target
 kind/fingerprint/ref, open canonical same-repository PR, and persisted CI readiness all agree.
 Base movement and any head mutation remain non-success and require explicit custody handling plus
-fresh First Mate verification.
+fresh BOSS verification.
 
-Approval gates are surfaced to the captain. `gate-respond` journals one decision, pins the exact
+Approval gates are surfaced to the boss. `gate-respond` journals one decision, pins the exact
 step, validates selected finding IDs, and invokes `axi respond` without `--yes`; a crash or
 unchanged gate becomes unknown and cannot be answered automatically again. Open transactions
 block ordinary steering, pause/recovery controls, cancellation, and away mode. Real no-mistakes
 execution is limited to ship items with authority at least 2 and non-local delivery. Any configured
-First Mate token, cost, or time budget rejects the invocation because the pinned external product
+BOSS token, cost, or time budget rejects the invocation because the pinned external product
 cannot provide controller-verifiable enforcement. Tests exercise the transaction with a declared
 fake binary/SQLite seam; absence of a locally attested product remains explicitly unproven.
 
 ## Herdr launcher
 
-`pi-firstmate` is canonical. Outside Herdr it creates or attaches the named `firstmate` session
+`pi-boss` is canonical. Outside Herdr it creates or attaches the named `boss` session
 and launches itself there. Inside Herdr it runs directly, preventing recursion. If Herdr is
 unavailable it exits without touching work; there is no non-persistent production fallback.
 Managed Pi sessions install the nested capability boundaries and signed lifecycle ledger

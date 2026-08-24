@@ -1,16 +1,16 @@
 #!/bin/sh
 set -eu
 
-if [ "${HELM_SANDBOX_REQUIRED:-}" != "1" ] || [ -z "${HELM_SANDBOX_PROFILE:-}" ] || [ -z "${HELM_REAL_PI:-}" ]; then
-  echo "firstmate: managed Pi launch is missing its sandbox capability" >&2
+if [ "${BOSS_SANDBOX_REQUIRED:-}" != "1" ] || [ -z "${BOSS_SANDBOX_PROFILE:-}" ] || [ -z "${BOSS_REAL_PI:-}" ]; then
+  echo "boss: managed Pi launch is missing its sandbox capability" >&2
   exit 126
 fi
-if [ ! -x /usr/bin/sandbox-exec ] || [ ! -x "$HELM_REAL_PI" ] || [ ! -r "$HELM_SANDBOX_PROFILE" ]; then
-  echo "firstmate: managed Pi sandbox prerequisites are unavailable" >&2
+if [ ! -x /usr/bin/sandbox-exec ] || [ ! -x "$BOSS_REAL_PI" ] || [ ! -r "$BOSS_SANDBOX_PROFILE" ]; then
+  echo "boss: managed Pi sandbox prerequisites are unavailable" >&2
   exit 126
 fi
 
-profile=$HELM_SANDBOX_PROFILE
-real_pi=$HELM_REAL_PI
-unset HELM_REAL_PI HELM_SANDBOX_PROFILE
+profile=$BOSS_SANDBOX_PROFILE
+real_pi=$BOSS_REAL_PI
+unset BOSS_REAL_PI BOSS_SANDBOX_PROFILE
 exec /usr/bin/sandbox-exec -f "$profile" "$real_pi" "$@"

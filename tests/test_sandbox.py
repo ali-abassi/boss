@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from helm import sandbox
+from bossctl import sandbox
 
 
 @unittest.skipUnless(os.uname().sysname == "Darwin" and Path("/usr/bin/sandbox-exec").is_file(),
@@ -17,7 +17,7 @@ from helm import sandbox
 class SandboxTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()); self.home = self.root / "home"
-        os.environ["HELM_HOME"] = str(self.home)
+        os.environ["BOSS_HOME"] = str(self.home)
         self.item = self.home / "work" / "p-sandbox"; self.item.mkdir(parents=True)
         self.wt = self.home / "worktrees" / "p" / "p-sandbox"; self.wt.mkdir(parents=True)
         self.pi_home = self.home / "pi"; self.pi_home.mkdir()
@@ -28,8 +28,8 @@ class SandboxTests(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def run_profile(self, record, script, *args):
-        env = {**os.environ, "HELM_SANDBOX_REQUIRED": "1",
-               "HELM_SANDBOX_PROFILE": record["profile"], "HELM_REAL_PI": "/bin/sh"}
+        env = {**os.environ, "BOSS_SANDBOX_REQUIRED": "1",
+               "BOSS_SANDBOX_PROFILE": record["profile"], "BOSS_REAL_PI": "/bin/sh"}
         return subprocess.run([str(self.wrapper), "-c", script, "sh", *map(str, args)],
                               env=env, text=True, capture_output=True)
 
@@ -83,7 +83,7 @@ class SandboxTests(unittest.TestCase):
         payload.write_text(
             "import json, os, signal, socket, subprocess, sys\n"
             "secret, outside, late, port, victim = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])\n"
-            "result = {'env_secret': os.environ.get('FIRSTMATE_TEST_SECRET')}\n"
+            "result = {'env_secret': os.environ.get('BOSS_TEST_SECRET')}\n"
             "try:\n open(outside, 'w').write('escaped')\n result['outside'] = 'wrote'\n"
             "except Exception as e:\n result['outside'] = type(e).__name__\n"
             "try:\n result['secret'] = open(secret).read()\n"
@@ -114,7 +114,7 @@ class SandboxTests(unittest.TestCase):
         payload = self._hostile_payload(secret, outside, late, listener.getsockname()[1], victim.pid)
         command = " ".join(["/usr/bin/python3", str(payload), str(secret), str(outside), str(late),
                             str(listener.getsockname()[1]), str(victim.pid)])
-        env = {**os.environ, "FIRSTMATE_TEST_SECRET": "must-not-cross"}
+        env = {**os.environ, "BOSS_TEST_SECRET": "must-not-cross"}
         try:
             result = subprocess.run([
                 str(Path(record["tool_runner"])), record["tool_profile"], record["tool_profile_sha256"],
@@ -156,7 +156,7 @@ class SandboxTests(unittest.TestCase):
             result = sandbox.run_verification(
                 work_id="p-sandbox", phase="hostile", cwd=self.wt,
                 command=f"/usr/bin/python3 {payload} {outside} {listener.getsockname()[1]}",
-                timeout=10, env={**os.environ, "FIRSTMATE_TEST_SECRET": "must-not-cross"},
+                timeout=10, env={**os.environ, "BOSS_TEST_SECRET": "must-not-cross"},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(outside.exists())
@@ -169,7 +169,7 @@ class SandboxTests(unittest.TestCase):
         payload = self.wt / "detach_payload.py"
         payload.write_text(
             "import os, pathlib, sys, time\n"
-            "for marker in pathlib.Path(os.environ['HOME']).glob('.firstmate-reaper-*'):\n"
+            "for marker in pathlib.Path(os.environ['HOME']).glob('.boss-reaper-*'):\n"
             " try: marker.unlink()\n"
             " except OSError: pass\n"
             "if os.fork(): os._exit(0)\n"

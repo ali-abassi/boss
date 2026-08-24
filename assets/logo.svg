@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="180" viewBox="0 0 720 180" role="img" aria-labelledby="title desc">
+  <title id="title">BOSS</title>
+  <desc id="desc">BOSS logo: a geometric B made from one operating spine and two return loops, beside the words BOSS and Your AI COO.</desc>
+  <rect x="1" y="1" width="718" height="178" rx="34" fill="#0b0d10" stroke="#30363d" stroke-width="2"/>
+  <g transform="translate(36 24)" fill="none" stroke="#b7f34a" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M28 8v124"/>
+    <path d="M28 18h45c26 0 42 13 42 32s-16 32-42 32H28"/>
+    <path d="M28 82h49c28 0 45 13 45 34s-17 34-45 34H28" transform="translate(0 -18)"/>
+  </g>
+  <circle cx="139" cy="74" r="5" fill="#f2ede3"/>
+  <circle cx="146" cy="132" r="5" fill="#f2ede3"/>
+  <text x="206" y="91" fill="#f2ede3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="62" font-weight="800" letter-spacing="14">BOSS</text>
+  <text x="210" y="126" fill="#9ca3af" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" font-weight="600" letter-spacing="4">YOUR AI COO</text>
+  <path d="M560 118h112" stroke="#30363d" stroke-width="2"/>
+  <path d="M647 109l25 9-25 9" fill="none" stroke="#b7f34a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

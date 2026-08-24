@@ -12,15 +12,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helm import dispatch, memory
-from helm.util import HelmError, write_json
+from bossctl import dispatch, memory
+from bossctl.util import BossError, write_json
 
 
 class MemoryTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()); self.home = self.root / "home"
-        os.environ["HELM_HOME"] = str(self.home)
-        os.environ["HELM_PIW"] = str(Path(__file__).resolve().parent / "fake_piw.py")
+        os.environ["BOSS_HOME"] = str(self.home)
+        os.environ["BOSS_PIW"] = str(Path(__file__).resolve().parent / "fake_piw.py")
         self.repo = self.root / "repo"; self.repo.mkdir()
         subprocess.run(["git", "-C", str(self.repo), "init", "-q", "-b", "main"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "t@t"], check=True)
@@ -34,7 +34,7 @@ class MemoryTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
-        os.environ.pop("HELM_PIW", None)
+        os.environ.pop("BOSS_PIW", None)
 
     def test_operational_upsert_is_keyed_and_identical_write_is_noop(self):
         first = memory.set_operational("worker.preference", "Keep retries bounded")
@@ -54,22 +54,22 @@ class MemoryTests(unittest.TestCase):
                            ("chat", "User: do this\nAssistant: done"),
                            ("json", '{"messages":[{"role":"user","content":"dump"}]}'),
                            ("bulk", "x" * 2001)):
-            with self.assertRaises(HelmError): memory.set_operational(key, value)
+            with self.assertRaises(BossError): memory.set_operational(key, value)
         self.assertFalse((self.home / "memory.json").exists())
 
     def test_remove_requires_confirmation(self):
         memory.set_operational("note", "value")
-        with self.assertRaises(HelmError): memory.remove_operational("note", confirm=False)
+        with self.assertRaises(BossError): memory.remove_operational("note", confirm=False)
         self.assertEqual(len(memory.list_operational()), 1)
         memory.remove_operational("note", confirm=True)
         self.assertEqual(memory.list_operational(), [])
 
     def test_entry_bound_fails_before_writing_an_unreadable_ledger(self):
-        with mock.patch("helm.memory.MAX_ENTRIES", 2):
+        with mock.patch("bossctl.memory.MAX_ENTRIES", 2):
             memory.set_operational("one", "first")
             memory.set_operational("two", "second")
             path = self.home / "memory.json"; before = path.read_bytes()
-            with self.assertRaises(HelmError):
+            with self.assertRaises(BossError):
                 memory.set_operational("three", "must not be written")
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual([entry["key"] for entry in memory.list_operational()], ["one", "two"])
@@ -87,11 +87,11 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(before, after)
         duplicate = memory.request_project("p", "set", "testing.rule", "Run the full suite before promotion")
         self.assertTrue(duplicate["deduplicated"])
-        with self.assertRaises(HelmError):
+        with self.assertRaises(BossError):
             memory.request_project("p", "set", "testing.rule", "A conflicting new value")
 
     def test_project_remove_is_also_a_confirmed_reviewed_change(self):
-        with self.assertRaises(HelmError): memory.request_project("p", "remove", "old.rule", confirm=False)
+        with self.assertRaises(BossError): memory.request_project("p", "remove", "old.rule", confirm=False)
         result = memory.request_project("p", "remove", "old.rule", confirm=True)
         self.assertEqual(result["item"]["dispatch"]["graph"], "high-assurance")
         self.assertEqual(result["request"]["operation"], "remove")

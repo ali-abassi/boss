@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">BOSS icon</title>
+  <desc id="desc">A signal-green geometric B built from one operating spine and two return loops on an obsidian field.</desc>
+  <rect width="512" height="512" rx="112" fill="#0b0d10"/>
+  <rect x="2" y="2" width="508" height="508" rx="110" fill="none" stroke="#30363d" stroke-width="4"/>
+  <g transform="translate(112 78)" fill="none" stroke="#b7f34a" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 16v324"/>
+    <path d="M18 40h118c67 0 108 34 108 84s-41 84-108 84H18"/>
+    <path d="M18 208h127c72 0 115 34 115 88s-43 88-115 88H18" transform="translate(0 -44)"/>
+  </g>
+  <circle cx="345" cy="201" r="12" fill="#f2ede3"/>
+  <circle cx="360" cy="348" r="12" fill="#f2ede3"/>
+</svg>

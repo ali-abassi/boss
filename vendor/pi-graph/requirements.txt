@@ -3,6 +3,6 @@
 PyYAML>=6,<7
 ruamel.yaml>=0.18,<0.19
 jsonschema>=4.23,<5
-# First Mate verifies the Ed25519 runtime/event receipts emitted by managed Pi
+# BOSS verifies the Ed25519 runtime/event receipts emitted by managed Pi
 # sessions.  This is a runtime dependency, not an optional test extra.
 cryptography>=42,<51

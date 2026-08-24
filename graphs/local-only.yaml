@@ -1,10 +1,10 @@
 version: 1
-workflow: helm-local-only
+workflow: bossctl-local-only
 cwd: @{CWD}
 workers: 1
 input:
   required: true
-  description: helm brief (task, constraints, failure notes from earlier attempts)
+  description: bossctl brief (task, constraints, failure notes from earlier attempts)
 steps:
   - id: implement
     needs: []
@@ -18,18 +18,18 @@ steps:
       Commit your work with a clear message (git add -A && git commit). Do not
       push. Do not touch these protected paths: @{PROTECTED}.
       If you hit a product decision, a missing credential, or information that
-      is not in the repository, do NOT guess: write a file named .helm-ask.json
+      is not in the repository, do NOT guess: write a file named .boss-ask.json
       in the worktree root containing {"question": "...", "context": "..."}
       and stop. When finished, reply with a short summary of what changed.
 
       {input}
-    gate: test -f "@{CWD}/.helm-ask.json" || { test -z "$(git -C "@{CWD}" status --porcelain --untracked-files=all)" && test "$(git -C "@{CWD}" rev-list --count @{BASE}..HEAD)" != "0"; }
+    gate: test -f "@{CWD}/.boss-ask.json" || { test -z "$(git -C "@{CWD}" status --porcelain --untracked-files=all)" && test "$(git -C "@{CWD}" rev-list --count @{BASE}..HEAD)" != "0"; }
     retries: 1
     retry_on: [model_error]
     timeout: @{TIMEOUT}
   - id: protected
     needs: [implement]
-    cmd: test -f "@{CWD}/.helm-ask.json" && { echo ASKED; exit 1; }; git -C "@{CWD}" diff --no-ext-diff --no-textconv --no-renames --name-only -z @{BASE}...HEAD | python3 "@{HELM_REPO}/helm/check_protected.py" --nul @{PROTECTED_ARGS}
+    cmd: test -f "@{CWD}/.boss-ask.json" && { echo ASKED; exit 1; }; git -C "@{CWD}" diff --no-ext-diff --no-textconv --no-renames --name-only -z @{BASE}...HEAD | python3 "@{BOSS_REPO}/bossctl/check_protected.py" --nul @{PROTECTED_ARGS}
   - id: verify
     needs: [protected]
     cmd: cd "@{CWD}" && @{TEST_CMD}
