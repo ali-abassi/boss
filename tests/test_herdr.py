@@ -681,6 +681,7 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(json.loads(self.bossctl("show", it["id"], "--json").stdout)["status"], "ready")
 
     def test_banner_and_watch_once(self):
+        self.env["BOSS_PLAIN"] = "1"
         out = self.bossctl("watch", "--once").stdout
         self.assertIn("[B] BOSS | OPERATIONS", out); self.assertIn("team      stopped", out); self.assertIn("none yet", out)
 
