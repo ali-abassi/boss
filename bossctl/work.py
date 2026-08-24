@@ -467,6 +467,23 @@ def all_items() -> list[dict]:
     return sorted(out, key=lambda i: i["created"])
 
 
+def print_summary(it: dict, args) -> None:
+    """Compact, tail-friendly item summary for terminal states. Honors --json."""
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({"id": it.get("id"), "status": it.get("status"),
+                           "project": it.get("project"), "summary": True}))
+        return
+    status = it.get("status", "unknown")
+    text = (it.get("text") or "").splitlines()[0] if it.get("text") else ""
+    print(f"{it.get('id', '?')} — status={status}  project={it.get('project', '?')}")
+    if text:
+        print(f"  {text[:120]}")
+    notes = (it.get("failure_notes") or {}).get("notes") if it.get("failure_notes") else None
+    if notes:
+        print(f"  notes: {notes[:200]}")
+
+
 def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | None = None,
            max_attempts: int = 3, declared_scope: list[str] | None = None,
            model: str | None = None, thinking: str | None = None,
@@ -492,6 +509,11 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
         raise BossError(f"resolved model {model} is unavailable; refusing silent substitution")
     if kind == "ship" and project["authority"] < 1:
         raise BossError(f"project '{project_id}' has authority 0 (observe): only scout tasks allowed")
+    if kind == "ship" and not (project.get("test_cmd") or "").strip():
+        raise BossError(
+            f"project '{project_id}' has no test command; ship tasks require one. "
+            f"Set it with `bossctl set {project_id} --test <cmd>` or use kind=scout for inspection."
+        )
     wid = f"{project_id}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
     declared = scope.normalize(declared_scope)
     # `scope.overlap` treats either sensitive operand as globally serializing,
@@ -1781,6 +1803,25 @@ def retry(work_id: str) -> dict:
                         "); raise it explicitly with `bossctl budget` first")
     it["attempts"] = 0
     transition(it, "queued", "manual retry")
+    return it
+
+
+def comment(work_id: str, text: str) -> dict:
+    """Append a durable human note to a work item WITHOUT a state transition or requeue.
+
+    This is the in-band collaboration channel: a question or context the boss wants
+    the next implementer/reviewer to see, visible in `bossctl show` and picked up in
+    the next brief, without forcing `respond` (which requeues) or living only in chat.
+    """
+    it = load(work_id)
+    text = (text or "").strip()
+    if not text:
+        raise BossError("comment text must not be empty")
+    entry = {"at": now(), "from": it["status"], "to": it["status"], "note": f"[comment] {text}"}
+    it.setdefault("history", []).append(entry)
+    it.setdefault("comments", []).append({"at": entry["at"], "text": text})
+    save(it)
+    log(f"{it['id']}: comment added")
     return it
 
 

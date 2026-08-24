@@ -110,7 +110,9 @@ Workflows is not downloaded or silently updated at runtime.
 | Use Claude Code or Codex as the COO liaison | `pi-boss claude` · `pi-boss codex` |
 
 You do not need to type internal orchestration commands. Talk to the COO in plain language.
-`bossctl` exists for diagnostics, automation, and people who want to inspect the machinery.
+`bossctl` exists for diagnostics, automation, and people who want to inspect the machinery. The
+COO inside `pi-boss` will not use that verb unless you ask; ask the COO in natural language and
+it will translate the request into the right `bossctl` invocation.
 
 ## What code enforces
 

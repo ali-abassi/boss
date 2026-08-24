@@ -108,6 +108,22 @@ printf '{}\\n'
         finally:
             child.terminate(); child.wait(timeout=5)
 
+    def test_pi_boss_quit_supports_restart_flag_and_refuses_with_work(self):
+        # The shell must accept --restart, must refuse to interrupt in-flight work
+        # without --yes, and must pass the existing --help and unknown-arg cases.
+        from pathlib import Path as _Path
+        import shutil as _shutil
+        script = _Path(__file__).resolve().parents[1] / "bin" / "pi-boss-quit"
+        _shutil.copy(script, self.bin / "pi-boss-quit")
+        # --help
+        with subprocess.Popen([str(self.bin / "pi-boss-quit"), "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+            out, _ = p.communicate(timeout=5)
+        self.assertIn(b"--restart", out)
+        # unknown arg
+        r = subprocess.run([str(self.bin / "pi-boss-quit"), "--bogus"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown arg", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,12 +10,13 @@ bossctl set ID [--mode M] [--gate G] [--authority N] [--test CMD]
 bossctl projects
 bossctl task PROJECT "request" [--kind ship|scout] [--scope GLOBS] [--model PROVIDER/MODEL] [--thinking high] [--max-tokens N] [--max-cost N] [--max-seconds N]
           [--node-max-tokens NODE=N] [--node-max-cost NODE=N] [--node-max-seconds NODE=N]
-bossctl work [--all] · bossctl show ID · bossctl inspect ID · bossctl inbox [--hints]
+bossctl work [--all] [--summary] · bossctl show ID · bossctl inspect ID · bossctl inbox [--hints]
 bossctl steer ID "guidance" · bossctl pause ID · bossctl resume ID · bossctl interrupt ID · bossctl recover ID [--request-id KEY]
 bossctl budget ID [--tokens N] [--cost N] [--seconds N]
           [--node-max-tokens NODE=N] [--node-max-cost NODE=N] [--node-max-seconds NODE=N]
 bossctl scope ID "src/api/**,tests/api/**" · bossctl wait ID 20m "reason"
 bossctl respond ID "boss's answer" · bossctl retry ID · bossctl cancel ID [--discard]
+bossctl comment ID "note" · bossctl diff ID · bossctl logs ID [--lines N] | bossctl logs --worker [--lines N]
 bossctl promote ID --confirm
 bossctl up [--workers N] · bossctl down · bossctl status · bossctl watch [--once] · bossctl tail ID
 bossctl daemon · bossctl run-once
@@ -33,6 +34,63 @@ bossctl doctor --repair --confirm [--offline] [--auth-source PATH --auth-provide
             [--model PHASE=PROVIDER/MODEL] [--test PROJECT=COMMAND] [--fetch PROJECT]
 bossctl boss [pi|claude|codex]
 ```
+
+Legacy project records may use the on-disk alias `no-mistakes`; `bossctl/modes.py` defines `LEGACY_HIGH_ASSURANCE = "no-mistakes"`, and `normalize()` maps it to `high-assurance`. `bossctl projects --json` may show either string for old records. Both strings mean the same thing: two independent reviews plus the no-mistakes gate.
+
+`bossctl comment ID "…"` appends a durable note to a work item's history WITHOUT a state
+transition or requeue — the in-band channel for a question or context that should reach
+the next implementer/reviewer without living only in chat and without forcing `respond`
+(which requeues). `bossctl diff ID` prints the item's worktree diff against its project's
+base branch. `bossctl logs ID` lists an item's run directories and shows the latest
+transcript (the live Herdr session log when present, else the newest run artifact);
+`bossctl logs --worker` tails the daemon's own log instead. `bossctl work --summary --json`
+returns compact records (id/project/status/kind/phase/attempts/timestamps only) — no
+history, comments, or failure notes — for scripts that only need a cheap overview.
+
+## Model dispatch
+
+`bossctl dispatch` prints the resolved `dispatch.json` (defaults + rules); `bossctl
+dispatch --set PHASE=provider/model` edits one phase's default model in place. Every
+resolved model is validated against the live `pi --list-models` inventory before use
+(`bossctl/dispatch.py:assert_available`) — an unavailable model fails closed rather than
+silently substituting. The default dispatch is intentionally opinionated: every phase
+(`plan`, `implement`, `review_correctness`, `review_adversarial`, `scout`) runs on
+`openai-codex/gpt-5.6-sol` so review always lands on an independent model turn.
+
+To route a phase to a different provider (for example DeepSeek via a `baseten`
+provider already registered in `~/.pi/agent/models.json`), add a rule to
+`~/.boss/dispatch.json`:
+
+```json
+{
+  "rules": [
+    {"name": "scout-deepseek", "kind": "scout",
+     "models": {"scout": "baseten/deepseek-ai/DeepSeek-V4-Pro-0813"},
+     "thinking": {"scout": "high"}},
+    {"name": "default-ship", "kind": "ship"}
+  ]
+}
+```
+
+Rules are matched top to bottom on `kind` (`ship`|`scout`), an optional `project` id
+regex, and required `labels`; the first match wins. A rule only needs to override the
+phases it changes — `resolve()` merges it over the file's `models`/`thinking` defaults,
+which merge over `DEFAULT` in `dispatch.py`. Any phase left without a resolved model or
+an invalid `thinking` level raises `BossError` instead of silently falling back.
+
+### Codex subscription tier — a documented assumption, not a detected one
+
+The default dispatch pins every phase to `openai-codex/gpt-5.6-sol`, meaning every task,
+review, and scout consumes Codex CLI capacity under whatever ChatGPT/Codex subscription
+`bossctl setup --import-login` picked up. **BOSS does not detect or check your Codex plan
+tier** (Free/Plus/Pro/Team/Enterprise) — there is no public API for that, so this is not
+a deferred feature, it is a known, permanent limitation. A `high-assurance` or
+`direct-pr` item that fans out to two review phases plus implementation can burn through
+a lower tier's rate limits faster than a `local-only` item would. If tasks start failing
+with Codex rate-limit errors, either route some phases to a non-Codex provider (see the
+cross-provider example above) or reduce concurrency (`bossctl up --workers N`). There is
+no automatic warning or refusal for this today — `bossctl doctor`'s `binary:pi` /
+`runner:pi-graph` checks confirm the CLI itself works, not that your plan has headroom.
 
 State lives in `$BOSS_HOME` (default `~/.boss`): `projects.json`, `dispatch.json`, atomic
 versioned `work/<id>/item.json` records, durable `scope-claims.json`, `supervisor.json`,

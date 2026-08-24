@@ -27,8 +27,13 @@ class OneThreadTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.procs = []
         self.home = self.tmp / "home"
-        self.env = {**os.environ, "BOSS_HOME": str(self.home),
-                    "BOSS_PIW": str(REPO / "tests" / "fake_piw.py"), "FAKE_PIW_SECONDS": "0.6"}
+        # Never let an isolated test inherit live Herdr coordinates: this test spawns
+        # real `bossctl daemon` background processes (see run_two_daemons_until_drained),
+        # and without stripping HERDR_*, those daemons would run-once against a real,
+        # live Herdr session and open real tabs in the developer's active workspace.
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+        self.env.update(BOSS_HOME=str(self.home),
+                        BOSS_PIW=str(REPO / "tests" / "fake_piw.py"), FAKE_PIW_SECONDS="0.6")
         self.projects = {}
         for name in ("api", "web", "docs"):
             repo = self.tmp / name

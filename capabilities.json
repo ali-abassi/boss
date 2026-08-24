@@ -1,0 +1,55 @@
+{
+  "$schema_note": "Structured companion to SKILL.md for discoverability and audit. SKILL.md is the authoritative prose contract; this file must not contradict it. See tests/test_units.py::PiExtensionTests for the sync check.",
+  "product": "BOSS",
+  "role": "AI COO for coding work across registered repositories, driven through bossctl",
+  "intents": [
+    {"trigger_phrases": ["build X", "fix X", "implement X", "add X to Y"], "maps_to": "bossctl task PROJECT \"request\"", "description": "Queue a ship-kind work item for a registered project."},
+    {"trigger_phrases": ["investigate X", "look into X", "what's going on with X"], "maps_to": "bossctl task PROJECT \"request\" --kind scout", "description": "Queue a read-only scout investigation; never mutates the project."},
+    {"trigger_phrases": ["what needs me", "what's waiting", "any questions"], "maps_to": "bossctl inbox", "description": "Zero-model-turn view of items needing a human: questions, failures, ready branches, open PRs."},
+    {"trigger_phrases": ["what's the status", "show me everything", "how's the team doing"], "maps_to": "bossctl status", "description": "Zero-model-turn portfolio view: workers, projects, queue counts."},
+    {"trigger_phrases": ["merge it", "ship it", "promote it"], "maps_to": "bossctl promote ID --confirm", "description": "Merge a ready/pr-open item. Requires the boss's explicit word in-conversation; never inferred."},
+    {"trigger_phrases": ["here's the answer", "do X instead", "guidance: X"], "maps_to": "bossctl respond ID \"guidance\"", "description": "Answer a question or redirect a failed item; requeues with guidance."},
+    {"trigger_phrases": ["also check Y", "by the way", "keep in mind"], "maps_to": "bossctl comment ID \"note\"", "description": "Attach a durable note to a work item WITHOUT requeuing or changing state. Use for context that should reach the next implementer/reviewer turn without forcing a new turn."},
+    {"trigger_phrases": ["what changed", "show me the diff", "what did it actually do"], "maps_to": "bossctl diff ID", "description": "Print the item's worktree diff against its project's base branch."},
+    {"trigger_phrases": ["show me the logs", "what happened during the run", "why did it fail"], "maps_to": "bossctl logs ID", "description": "List an item's run directories and show the latest transcript/artifact."},
+    {"trigger_phrases": ["register this repo", "add this project"], "maps_to": "bossctl add PATH [--mode M] [--authority N] [--test CMD]", "description": "Register a repository. Auto-detects a test command; refuses ship-kind tasks until one exists."},
+    {"trigger_phrases": ["go away", "I'm stepping out", "unattended for a bit"], "maps_to": "bossctl away-mode on", "description": "Gated unattended supervision. Never grants merge authority; refused if any decision is pending."}
+  ],
+  "commands": [
+    {"command": "bossctl status", "user_phrasing": ["status", "how's everything"], "description": "workers · projects · queue counts"},
+    {"command": "bossctl projects", "user_phrasing": ["list projects", "what repos are registered"], "description": "registered repos (mode, authority)"},
+    {"command": "bossctl add PATH [--mode M] [--authority N] [--test CMD]", "user_phrasing": ["register this repo"], "description": "register a project; refuses ship tasks with no detected/declared test command"},
+    {"command": "bossctl task PROJECT \"request\" [--kind scout] [--labels cheap|hard]", "user_phrasing": ["build/fix/investigate X"], "description": "queue ship or scout work"},
+    {"command": "bossctl inbox", "user_phrasing": ["what needs me"], "description": "questions, failures, ready branches, open PRs"},
+    {"command": "bossctl show ID", "user_phrasing": ["show me item X"], "description": "full state, history, evidence paths"},
+    {"command": "bossctl comment ID \"note\"", "user_phrasing": ["also check Y", "keep in mind"], "description": "append a durable note, no state transition or requeue"},
+    {"command": "bossctl diff ID", "user_phrasing": ["show me the diff"], "description": "worktree diff against the project's base branch"},
+    {"command": "bossctl logs ID [--lines N] | bossctl logs --worker", "user_phrasing": ["show me the logs"], "description": "list an item's runs and show the latest transcript; --worker tails the daemon log"},
+    {"command": "bossctl respond ID \"Boss's answer\"", "user_phrasing": ["here's the answer"], "description": "requeue with guidance"},
+    {"command": "bossctl retry ID", "user_phrasing": ["try again"], "description": "requeue a failed item without new guidance"},
+    {"command": "bossctl promote ID --confirm", "user_phrasing": ["merge it", "ship it"], "description": "merge only on Boss's explicit word"},
+    {"command": "bossctl forge ID", "user_phrasing": ["show me the PR evidence"], "description": "exact-SHA GitHub lifecycle evidence"},
+    {"command": "bossctl doctor [--repair --confirm]", "user_phrasing": ["is everything healthy"], "description": "read-only audit; repair also needs --confirm"},
+    {"command": "bossctl away-mode on|off|status", "user_phrasing": ["go away", "I'm back"], "description": "gated unattended supervision, never merge authority; off re-verifies the enable-time gate evidence"},
+    {"command": "bossctl budget ID --tokens|--cost|--seconds N", "user_phrasing": ["give it more budget"], "description": "explicitly raise a paused cumulative limit"},
+    {"command": "bossctl work [--all] [--summary]", "user_phrasing": ["list all work"], "description": "raw JSON array of items; --summary omits history/comments/logs for large operations"},
+    {"command": "bossctl memory operational \u2026", "user_phrasing": ["remember that X"], "description": "explicit narrow local facts"},
+    {"command": "bossctl memory project set \u2026", "user_phrasing": ["update the project's AGENTS.md"], "description": "reviewed AGENTS.md change, not a direct write"},
+    {"command": "bossctl up | bossctl down", "user_phrasing": ["start the team", "stop everything"], "description": "start or stop queue schedulers"}
+  ],
+  "prerequisites": [
+    {"for": "any ship-kind task", "requires": "project has a non-empty test_cmd (auto-detected on add, or set via bossctl set ID --test)", "failure_if_missing": "bossctl task refuses with 'no test command; ship tasks require one'"},
+    {"for": "bossctl promote", "requires": "item status is ready or pr-open, and the boss's explicit confirmation in this conversation", "failure_if_missing": "promote refuses without --confirm; the COO must never infer confirmation"},
+    {"for": "bossctl away-mode on", "requires": "clean supervision scan, clean doctor summary, at least one positively live worker, no pending decision wakes, no open external transaction", "failure_if_missing": "away-mode on refuses and names the exact blocker"},
+    {"for": "bossctl away-mode off", "requires": "if gate_evidence was recorded at enable time, the doctor summary must still match on return", "failure_if_missing": "away-mode off refuses with 'doctor summary changed while away'; reconcile via bossctl doctor first"},
+    {"for": "bossctl diff ID", "requires": "the item has a worktree (i.e. has been picked up by a runner at least once)", "failure_if_missing": "diff refuses with 'no worktree for ID; item status is <status>'"},
+    {"for": "direct-pr / high-assurance modes", "requires": "authority >= 2 and a real git origin remote for promote/PR delivery", "failure_if_missing": "delivery leaves a branch instead of opening a PR; never crashes on a missing remote"}
+  ],
+  "failure_modes": [
+    {"pattern": "unknown/unproven state (process identity, tab liveness, scope claim, PID reuse)", "behavior": "fails closed to 'unknown', never silently treated as dead or as live"},
+    {"pattern": "resolved model not in the live pi --list-models inventory", "behavior": "bossctl/dispatch.py:assert_available raises instead of silently substituting a different model"},
+    {"pattern": "malformed or missing dispatch rule for a kind/label combination", "behavior": "raises 'no dispatch rule matches' instead of guessing a default"},
+    {"pattern": "budget exhausted or usage unproven", "behavior": "pauses the item; respond/retry refuse until the boss explicitly raises the budget via bossctl budget"},
+    {"pattern": "worktree recovery interrupted mid-transition (crash)", "behavior": "held for recovery, never silently discarded; doctor surfaces it as worktree-recovery:*"}
+  ]
+}

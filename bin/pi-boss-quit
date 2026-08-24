@@ -1,8 +1,41 @@
 #!/usr/bin/env bash
 # Stop the BOSS workers and close its persistent Herdr session.
+#
+#   pi-boss-quit           stop and exit
+#   pi-boss-quit --restart stop, then reopen via `pi-boss` so the new masthead lands
+#   pi-boss-quit --yes     stop even if work is active (default refuses if work is active)
 set -euo pipefail
 
+FORCE=0
+RESTART=0
+for arg in "$@"; do
+  case "$arg" in
+    --force|--yes|-y) FORCE=1 ;;
+    --restart|-r)     RESTART=1 ;;
+    --help|-h)
+      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      printf 'pi-boss-quit: unknown arg %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+
 bindir="$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")"
+
+# Refuse to interrupt in-flight work unless the user explicitly opted in.
+# `bossctl work --all --json` prints a raw JSON array, not an {"items": [...]} envelope.
+# The python helper exits 0 when work IS active (so the `if` fires and we refuse),
+# and exits 1 (falsy) when it is safe to proceed.
+if [ "$FORCE" -eq 0 ] && "$bindir/bossctl" work --all --json 2>/dev/null \
+  | python3 -c 'import json,sys
+items=json.loads(sys.stdin.read())
+active=[i for i in items if i.get("status") in {"running","ready","pr-open"}]
+raise SystemExit(0 if active else 1)'; then
+  printf 'pi-boss-quit: in-flight work is active. Re-run with --yes to stop anyway.\n' >&2
+  exit 1
+fi
+
 if ! "$bindir/bossctl" down --json >/dev/null; then
   printf 'pi-boss-quit: worker shutdown was not positively verified; run pi-boss doctor\n' >&2
   exit 1
@@ -29,3 +62,7 @@ raise SystemExit(0 if matches and matches[0].get("running") is False else 1)' "$
   exit 1
 fi
 printf 'BOSS closed\n'
+
+if [ "$RESTART" -eq 1 ]; then
+  exec "$bindir/pi-boss"
+fi

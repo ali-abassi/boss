@@ -4,6 +4,7 @@ try:
 except ImportError:
     from tests import _gitenv  # noqa: F401
 import contextlib, io, json, os, re, shutil, subprocess, sys, tempfile, unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -44,6 +45,45 @@ class DispatchTests(Isolated):
             dispatch.resolve({"kind": "ship", "labels": []}, {"id": "api", "mode": "local-only"})
         d = dispatch.resolve({"kind": "ship", "labels": []}, {"id": "web-1", "mode": "local-only"})
         self.assertTrue(all(d["models"].values()), "missing phases inherit shipped defaults")
+
+    def test_load_never_leaks_a_mutable_reference_to_the_module_default(self):
+        # Regression: `dispatch.load()` used to return the literal module-level DEFAULT
+        # object when dispatch.json didn't exist yet. `cmd_dispatch --set` then mutated
+        # it in place (`cfg["models"][phase] = model`), corrupting DEFAULT for the rest
+        # of the process — invisible per one-shot CLI call, but real pollution across
+        # test cases/BOSS_HOMEs sharing one long-running process (this discovered it via
+        # `python -m unittest discover`, where it broke an unrelated, later-running test).
+        from bossctl import dispatch
+        original_implement = dispatch.DEFAULT["models"]["implement"]
+        cfg = dispatch.load()  # dispatch.json does not exist yet in this Isolated fixture
+        cfg["models"]["implement"] = "some-other-provider/mutated-model"
+        self.assertEqual(dispatch.DEFAULT["models"]["implement"], original_implement,
+                         "load() leaked a mutable reference to the shared DEFAULT dict")
+        # A second, independent load() call must be unaffected by the first caller's mutation.
+        fresh = dispatch.load()
+        self.assertEqual(fresh["models"]["implement"], original_implement)
+
+    def test_cross_provider_scout_rule_from_docs_example_resolves(self):
+        # This mirrors the exact example in docs/cli.md's "Model dispatch" section:
+        # routing `scout` to a non-Codex provider via a small dispatch.json rule.
+        from bossctl import dispatch
+        from bossctl.util import write_json
+        from bossctl.paths import dispatch_file
+        write_json(dispatch_file(), {
+            "rules": [
+                {"name": "scout-deepseek", "kind": "scout",
+                 "models": {"scout": "baseten/deepseek-ai/DeepSeek-V4-Pro-0813"},
+                 "thinking": {"scout": "high"}},
+                {"name": "default-ship", "kind": "ship"},
+            ]
+        })
+        d = dispatch.resolve({"kind": "scout", "labels": []}, {"id": "api", "mode": "local-only"})
+        self.assertEqual(d["rule"], "scout-deepseek")
+        self.assertEqual(d["models"]["scout"], "baseten/deepseek-ai/DeepSeek-V4-Pro-0813")
+        # Other phases still inherit the shipped Codex default — only `scout` was overridden.
+        self.assertEqual(d["models"]["implement"], "openai-codex/gpt-5.6-sol")
+        ship = dispatch.resolve({"kind": "ship", "labels": []}, {"id": "api", "mode": "local-only"})
+        self.assertEqual(ship["rule"], "default-ship")
 
 
 class RenderTests(Isolated):
@@ -203,8 +243,17 @@ class DetectTests(unittest.TestCase):
             ({"go.mod": ""}, "go test ./..."),
             ({"pyproject.toml": ""}, "python3 -m pytest -q"),
             ({"pyproject.toml": "", "uv.lock": ""}, "uv run pytest -q"),
+            ({"pyproject.toml": "", "poetry.lock": ""}, "poetry run pytest -q"),
+            ({"pyproject.toml": "", "mise.toml": "[env]\n_python = \"3.13\"\n[tasks]\npytest = \"pytest -q\"\n"}, "mise run pytest"),
             ({"Makefile": "build:\n\techo\ntest:\n\tpytest\n"}, "make test"),
+            ({"justfile": "test:\n\tpytest -q\n"}, "just test"),
+            ({"MODULE.bazel": ""}, "bazel test //..."),
+            ({"package.json": '{"scripts": {"test": "vitest"}}',
+              "pnpm-lock.yaml": "", "pnpm-workspace.yaml": ""}, "pnpm test"),
+            ({"package.json": '{"scripts": {"test": "vitest"}}',
+              "bun.lock": ""}, "bun test"),
             ({"README.md": ""}, None),
+            ({"package.json": '{"scripts": {"test": "echo \\"Error: no test specified\\""}}'}, None),
         ]
         for files, want in cases:
             self.assertEqual(detect.test_command(self.repo(files)), want, files)
@@ -243,7 +292,26 @@ class PiExtensionTests(unittest.TestCase):
             self.assertIn(truth, agents)
         self.assertNotIn("I run the team in the background", agents)
 
-    def test_capability_questions_trigger_the_boss_skill(self):
+    def test_list_models_cache_avoids_repeated_subprocess(self):
+        from bossctl import dispatch
+        # If pi is missing, the cache stores None and we don't have to shell out again.
+        with mock.patch("bossctl.dispatch.shutil.which", return_value=None):
+            dispatch._invalidate_list_models_cache()
+            self.assertIsNone(dispatch._list_models())
+            with mock.patch("bossctl.dispatch.subprocess") as sp:
+                self.assertIsNone(dispatch._list_models())
+                sp.run.assert_not_called()
+        # When pi is present we still cache the parse.
+        dispatch._invalidate_list_models_cache()
+        fake = mock.MagicMock()
+        fake.returncode = 0
+        fake.stdout = "openai-codex    gpt-5.6-sol    1.0M    32.8K    no    yes\n"
+        with mock.patch("bossctl.dispatch.shutil.which", return_value="/usr/bin/pi"), \
+             mock.patch("bossctl.dispatch.subprocess.run", return_value=fake) as run:
+            self.assertIn("openai-codex/gpt-5.6-sol", dispatch._list_models() or set())
+            self.assertIn("openai-codex/gpt-5.6-sol", dispatch._list_models() or set())
+            self.assertEqual(run.call_count, 1)
+
         skill = (REPO / "SKILL.md").read_text()
         for trigger in ("what BOSS or the COO can do", "whether workers use Herdr", "/ops", "/inbox"):
             self.assertIn(trigger, skill)
@@ -253,6 +321,73 @@ class PiExtensionTests(unittest.TestCase):
         contract = (REPO / "docs" / "boss-prompt-contract.md").read_text()
         cases = re.findall(r"^\| BO-\d{2} ", contract, re.MULTILINE)
         self.assertEqual(len(cases), 20)
+
+    def test_readme_clarifies_bossctl_is_for_diagnostics_only(self):
+        readme = (REPO / "README.md").read_text()
+        # The contract is: the COO inside pi-boss will not use the `bossctl` verb unless
+        # asked, and the README must spell that out so new users do not see two vocabularies.
+        self.assertIn("will not use that verb unless you ask", readme)
+        self.assertIn("bossctl", readme)
+        self.assertTrue(re.search(r"## What code enforces", readme))
+
+    def test_extensions_doc_covers_every_slash_command(self):
+        doc = (REPO / "docs" / "extensions.md").read_text()
+        for slash in ("/ops", "/inbox", "/away", "/wake"):
+            self.assertIn(slash, doc)
+        self.assertIn("bossctl", doc)
+
+    def test_cli_doc_explains_legacy_mode_alias(self):
+        doc = (REPO / "docs" / "cli.md").read_text()
+        self.assertIn("no-mistakes", doc)
+        self.assertIn("LEGACY_HIGH_ASSURANCE", doc)
+        self.assertIn("high-assurance", doc)
+
+    def test_status_schema_doc_matches_the_real_work_summary_keys(self):
+        # Locks docs/status-schema.md's claimed --summary key list to the actual
+        # _WORK_SUMMARY_KEYS constant in cli.py, so the doc can't silently drift.
+        from bossctl.cli import _WORK_SUMMARY_KEYS
+        doc = (REPO / "docs" / "status-schema.md").read_text()
+        for key in _WORK_SUMMARY_KEYS:
+            self.assertIn(f"`{key}`", doc, f"docs/status-schema.md is missing summary key {key!r}")
+
+    def test_status_schema_doc_matches_the_real_open_statuses(self):
+        from bossctl.work import OPEN
+        doc = (REPO / "docs" / "status-schema.md").read_text()
+        for status in OPEN:
+            self.assertIn(f"`{status}`", doc, f"docs/status-schema.md is missing OPEN status {status!r}")
+
+    def test_doctor_doc_covers_the_severity_vocabulary(self):
+        doc = (REPO / "docs" / "doctor.md").read_text()
+        for severity in ("ok", "warning", "error", "unknown"):
+            self.assertIn(severity, doc)
+        self.assertIn("--repair", doc)
+        self.assertIn("--confirm", doc)
+
+    def test_capabilities_json_is_valid_and_covers_skill_md_commands(self):
+        cap = json.loads((REPO / "capabilities.json").read_text())
+        for key in ("intents", "commands", "prerequisites", "failure_modes"):
+            self.assertIn(key, cap)
+            self.assertTrue(cap[key], f"capabilities.json[{key!r}] must not be empty")
+        # Every top-level bossctl verb mentioned in SKILL.md's command block must have a
+        # matching entry in capabilities.json["commands"] so the two never silently diverge.
+        skill = (REPO / "SKILL.md").read_text()
+        skill_verbs = set(re.findall(r"^bossctl (\S+)", skill, re.MULTILINE))
+        cap_verbs = {c["command"].split()[1] for c in cap["commands"]}
+        missing = skill_verbs - cap_verbs
+        self.assertFalse(missing, f"capabilities.json is missing SKILL.md verbs: {missing}")
+
+    def test_capabilities_json_commands_include_the_new_mission_additions(self):
+        cap = json.loads((REPO / "capabilities.json").read_text())
+        verbs = {c["command"].split()[1] for c in cap["commands"]}
+        for verb in ("comment", "diff", "logs"):
+            self.assertIn(verb, verbs)
+
+    def test_cli_doc_is_honest_about_codex_plan_tier_detection(self):
+        # #18 from the review cannot be implemented (no public API for Codex plan tier);
+        # this locks in that the doc says so explicitly instead of silently dropping it.
+        doc = (REPO / "docs" / "cli.md").read_text()
+        self.assertIn("does not detect or check your Codex plan", doc)
+        self.assertIn("known, permanent limitation", doc)
 
 
 class BoardRenderTests(Isolated):

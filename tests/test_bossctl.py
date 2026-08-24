@@ -18,7 +18,10 @@ class BossctlTests(unittest.TestCase):
         g = lambda *a: subprocess.run(["git", "-C", str(self.proj), *a], check=True, capture_output=True, text=True)
         g("init", "-q", "-b", "main"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
         (self.proj / "README.md").write_text("hi\n"); g("add", "-A"); g("commit", "-qm", "init")
-        self.env = {**os.environ, "BOSS_HOME": str(self.home), "BOSS_PIW": str(REPO / "tests" / "fake_piw.py")}
+        # Never let an isolated test inherit live Herdr coordinates: otherwise
+        # run-once opens and closes real tabs in the developer's active session.
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+        self.env.update(BOSS_HOME=str(self.home), BOSS_PIW=str(REPO / "tests" / "fake_piw.py"))
 
     def bossctl(self, *args, mode="ok", check=True):
         r = subprocess.run(BOSS + list(args), env={**self.env, "FAKE_PIW_MODE": mode}, text=True, capture_output=True)
@@ -326,6 +329,16 @@ class BossctlTests(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout)["test_cmd"], "npm test")
         self.assertIn("detected", r.stderr)
 
+    def test_ship_without_test_command_fails_closed(self):
+        # project has only README; auto-detection yields no test_cmd
+        self.add(mode="local-only", authority=3, test="")
+        refused = self.bossctl("task", "p", "ship without a test command", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("no test command", refused.stderr)
+        # scout is still allowed because it does not need a verification gate
+        scout = self.bossctl("task", "p", "investigate", "--kind", "scout", "--json")
+        self.assertEqual(json.loads(scout.stdout)["kind"], "scout")
+
     def test_explicit_project_id_cannot_escape_state_or_worktree_roots(self):
         result = self.bossctl("add", str(self.proj), "--id", "../../outside", check=False)
         self.assertNotEqual(result.returncode, 0)
@@ -399,6 +412,195 @@ class BossctlTests(unittest.TestCase):
         it = self.show(it["id"])
         self.assertEqual(it["status"], "ready")
         self.assertIn("no origin remote", it["history"][-1]["note"])
+
+    def test_tail_on_terminal_item_prints_summary_and_does_not_block_120s(self):
+        # A terminal item (here, done) must short-circuit `bossctl tail` instead of
+        # waiting 120s for a run that will never start.
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        # Force the item into a terminal state without invoking a runner.
+        import json
+        path = self.home / "work" / it["id"] / "item.json"
+        rec = json.loads(path.read_text())
+        rec["status"] = "done"
+        path.write_text(json.dumps(rec))
+        r = self.bossctl("tail", it["id"])
+        self.assertIn("status=done", r.stdout)
+        self.assertIn(it["id"], r.stdout)
+        # The 120s blocking message must NOT appear.
+        self.assertNotIn("no run started within 120s", r.stdout)
+
+    def test_tail_on_queued_item_reports_status_and_does_not_block(self):
+        # A queued item that never started must NOT block 120s. The runner has not
+        # picked it up yet, so there is nothing to follow; just print status and exit.
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        r = self.bossctl("tail", it["id"])
+        self.assertIn("status=queued", r.stdout)
+        self.assertNotIn("no run started within 120s", r.stdout)
+
+    def test_comment_appends_note_without_state_transition(self):
+        self.add(mode="local-only")
+        it = self.task()
+        before_status = it["status"]
+        r = self.bossctl("comment", it["id"], "please check the caching layer too", "--json")
+        commented = json.loads(r.stdout)
+        self.assertEqual(commented["status"], before_status, "comment must not change status")
+        self.assertIn("please check the caching layer too", commented["comments"][-1]["text"])
+        shown = self.show(it["id"])
+        self.assertIn("please check the caching layer too", shown["comments"][-1]["text"])
+        self.assertTrue(any("[comment]" in h["note"] for h in shown["history"]))
+
+    def test_comment_rejects_empty_text(self):
+        self.add(mode="local-only")
+        it = self.task()
+        r = self.bossctl("comment", it["id"], " ", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("must not be empty", r.stderr)
+
+    def test_diff_shows_worktree_changes_against_base(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        self.bossctl("run-once")
+        r = self.bossctl("diff", it["id"], "--json")
+        payload = json.loads(r.stdout)
+        self.assertEqual(payload["base"], "main")
+        self.assertIn("diff", payload)
+
+    def test_diff_refuses_without_worktree(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()  # queued, no worktree created yet
+        r = self.bossctl("diff", it["id"], check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no worktree", r.stderr)
+
+    def test_logs_lists_runs_after_run_once(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        self.bossctl("run-once")
+        r = self.bossctl("logs", it["id"], "--json")
+        payload = json.loads(r.stdout)
+        self.assertEqual(payload["id"], it["id"])
+        self.assertGreaterEqual(len(payload["runs"]), 1)
+
+    def test_logs_before_first_run_reports_no_runs_yet(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        r = self.bossctl("logs", it["id"])
+        self.assertIn("no runs recorded yet", r.stdout)
+
+    def test_logs_requires_id_or_worker_flag(self):
+        r = self.bossctl("logs", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("needs an item id", r.stderr)
+
+    def test_logs_text_output_shows_latest_run_artifact(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        self.bossctl("run-once")
+        r = self.bossctl("logs", it["id"])
+        self.assertIn("1 run(s)", r.stdout)
+        self.assertIn(it["id"], r.stdout)
+
+    def test_logs_worker_reads_daemon_log(self):
+        self.add(mode="local-only", test="true")
+        self.task()
+        self.bossctl("run-once")  # writes to the shared bossctl.log
+        r = self.bossctl("logs", "--worker", "--json")
+        payload = json.loads(r.stdout)
+        self.assertTrue(payload["path"].endswith("bossctl.log"))
+        self.assertTrue(payload["lines"])
+
+    def test_work_summary_omits_history_and_notes(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        r = self.bossctl("comment", it["id"], "a sensitive internal note")
+        r = self.bossctl("work", "--all", "--summary", "--json")
+        payload = json.loads(r.stdout)
+        self.assertTrue(payload)
+        for entry in payload:
+            self.assertNotIn("history", entry)
+            self.assertNotIn("comments", entry)
+            self.assertIn("status", entry)
+            self.assertIn("id", entry)
+
+    def _fake_herdr_bin_dir(self):
+        """A PATH-isolated fake `herdr` so pi-boss-quit tests never touch a real,
+        possibly-live Herdr session. Mirrors tests/test_shutdown.py's fixture.
+        """
+        fake_dir = self.tmp / "fake-bin"
+        fake_dir.mkdir(exist_ok=True)
+        fake = fake_dir / "herdr"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = \"session stop\" ]; then exit 0; fi\n"
+            "if [ \"$1 $2\" = \"session list\" ]; then\n"
+            "  printf '{\"sessions\":[{\"name\":\"boss\",\"running\":false}]}\\n'\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf '{}\\n'\n"
+        )
+        fake.chmod(0o755)
+        return fake_dir
+
+    def _pi_boss_quit_env(self, *, isolate_herdr: bool):
+        # PATH isolation is mandatory here: a stray real `herdr` binary on PATH would
+        # let this test touch Ali's live Herdr session (see incident: dozens of real
+        # tabs were spawned by an earlier unisolated test run). Never drop this guard.
+        env = dict(self.env)
+        if isolate_herdr:
+            fake_dir = self._fake_herdr_bin_dir()
+            env["PATH"] = str(fake_dir) + os.pathsep + env.get("PATH", "")
+            env["HERDR_BIN"] = str(fake_dir / "herdr")
+        else:
+            # No herdr anywhere reachable: used only for the refusal-path test, which
+            # must exit before ever invoking herdr.
+            env["PATH"] = "/usr/bin:/bin"
+            env.pop("HERDR_BIN", None)
+        return env
+
+    def test_pi_boss_quit_refuses_with_real_active_work(self):
+        # End-to-end: bossctl work --all --json returns a raw JSON array (not an
+        # {"items": [...]} envelope). pi-boss-quit's refusal check must parse that
+        # shape correctly and refuse to interrupt genuinely active work. This path
+        # exits BEFORE any herdr call, so PATH is deliberately herdr-free (belt+braces).
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        path = self.home / "work" / it["id"] / "item.json"
+        rec = json.loads(path.read_text())
+        rec["status"] = "running"
+        path.write_text(json.dumps(rec))
+        script = self.bin_path()
+        r = subprocess.run([str(script)], env=self._pi_boss_quit_env(isolate_herdr=False),
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("in-flight work is active", r.stderr)
+        self.assertIn("--yes", r.stderr)
+
+    def test_pi_boss_quit_proceeds_past_refusal_with_no_active_work(self):
+        # With no active work, the refusal branch must NOT fire; the script proceeds
+        # to the herdr shutdown steps against a PATH-isolated fake herdr only.
+        self.add(mode="local-only", test="true")
+        self.task()  # stays queued; not active
+        script = self.bin_path()
+        r = subprocess.run([str(script)], env=self._pi_boss_quit_env(isolate_herdr=True),
+                           capture_output=True, text=True)
+        self.assertNotIn("in-flight work is active", r.stderr)
+
+    def test_pi_boss_quit_yes_bypasses_refusal(self):
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        path = self.home / "work" / it["id"] / "item.json"
+        rec = json.loads(path.read_text())
+        rec["status"] = "running"
+        path.write_text(json.dumps(rec))
+        script = self.bin_path()
+        r = subprocess.run([str(script), "--yes"], env=self._pi_boss_quit_env(isolate_herdr=True),
+                           capture_output=True, text=True)
+        self.assertNotIn("in-flight work is active", r.stderr)
+
+    def bin_path(self):
+        return REPO / "bin" / "pi-boss-quit"
 
 
 if __name__ == "__main__":

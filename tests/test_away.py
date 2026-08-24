@@ -50,7 +50,9 @@ class AwayTests(unittest.TestCase):
         self.assertEqual(len(supervisor.pending()), 1)
         self.assertEqual(supervisor.claim("pi"), [])
         self.assertEqual(supervisor.away_status()["pending_wakes"], 1)
-        self.assertFalse(supervisor.set_away(False)["enabled"])
+        # Returning must re-verify the doctor summary that was recorded at enable time.
+        with mock.patch("bossctl.doctor.audit", return_value=self.good_report):
+            self.assertFalse(supervisor.set_away(False)["enabled"])
         self.assertEqual(len(supervisor.claim("pi")), 1)
 
     def test_pending_decision_blocks_initial_entry(self):
@@ -61,6 +63,30 @@ class AwayTests(unittest.TestCase):
         supervisor.observe(ready, probe_agent=False)
         with mock.patch("bossctl.supervisor.scan", return_value=[]), mock.patch("bossctl.doctor.audit", return_value=self.good_report):
             with self.assertRaises(BossError): supervisor.set_away(True)
+
+    def test_disable_refuses_if_doctor_summary_drifted_while_away(self):
+        # While away, the world must not silently drift. On /away off, re-run the
+        # doctor summary and compare against what was recorded at enable time.
+        self.assertTrue(self.enable()["enabled"])
+        drifted = {**self.good_report, "summary": {"ok": 8, "errors": 2, "warnings_or_unknown": 5}}
+        with mock.patch("bossctl.doctor.audit", return_value=drifted):
+            with self.assertRaises(BossError) as ctx:
+                supervisor.set_away(False)
+        self.assertIn("doctor summary changed", ctx.exception.msg)
+        # And the durable bit must still report enabled until the user reconciles.
+        self.assertTrue(supervisor.away_status()["enabled"])
+        # With the world restored, off succeeds and records a disabled_at timestamp.
+        with mock.patch("bossctl.doctor.audit", return_value=self.good_report):
+            result = supervisor.set_away(False)
+        self.assertFalse(result["enabled"])
+        self.assertIn("disabled_at", result)
+
+    def test_disable_without_prior_evidence_succeeds(self):
+        # First-time-off: there is no recorded gate_evidence. The re-verify path
+        # must be a no-op, not a false refusal.
+        with mock.patch("bossctl.doctor.audit", return_value=self.good_report):
+            result = supervisor.set_away(False)
+        self.assertFalse(result["enabled"])
 
     def test_open_external_transaction_blocks_away_even_for_terminal_item(self):
         directory = self.home / "work" / "p-merged"; directory.mkdir(parents=True)

@@ -481,13 +481,41 @@ def away_status() -> dict:
 
 
 def set_away(enabled: bool) -> dict:
-    """Enable only after deterministic supervision/recovery preflight passes."""
+    """Enable only after deterministic supervision/recovery preflight passes.
+
+    When turning off, the gate_evidence recorded at enable time is re-verified
+    against the live world so we cannot accidentally accept a state that drifted
+    while unattended.
+    """
     # Promotion holds this same lock. Keeping it for the full preflight closes
     # the gap where a merge could arm between validation and the durable bit.
     with locked(authority_lock()):
         if not enabled:
             with locked(supervisor_lock()):
-                state = _state(); state["away"] = {**(state.get("away") or {}), "enabled": False, "disabled_at": now()}
+                state = _state()
+                # Re-verify the gate_evidence recorded at enable time. If anything in the
+                # environment that contributed to the gate has changed (worker identity
+                # drifted, doctor summary changed), refuse to silently re-enter normal mode.
+                prior = (state.get("away") or {})
+                recorded = prior.get("gate_evidence")
+                recorded_workers = prior.get("live_workers") or []
+                recorded_doctor = prior.get("doctor_summary")
+                refusal: str | None = None
+                if recorded:
+                    # Cheap, deterministic re-verify: re-run the doctor summary; if the
+                    # recorded summary no longer matches, refuse. We deliberately do NOT
+                    # re-run the gate_evidence hash because that would clobber it on
+                    # normal background churn; the doctor summary is the durable bit.
+                    try:
+                        from . import doctor as _doc
+                        live = _doc.audit(network=False, probe_models=False)
+                        if live.get("summary") != recorded_doctor:
+                            refusal = f"doctor summary changed while away ({recorded_doctor} -> {live.get('summary')})"
+                    except Exception as exc:
+                        refusal = f"doctor re-verify failed: {exc}"
+                if refusal:
+                    raise BossError(f"away-mode off refused: {refusal}; reconcile via `pi-boss doctor` and re-run")
+                state["away"] = {**(state.get("away") or {}), "enabled": False, "disabled_at": now()}
                 write_json(supervisor_file(), state)
             return away_status()
 

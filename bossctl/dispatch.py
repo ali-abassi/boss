@@ -4,6 +4,7 @@ A rule matches on kind (ship|scout), project id regex, and required labels.
 Nothing here asks a model anything.
 """
 from __future__ import annotations
+import copy
 import os
 import re
 import shutil
@@ -11,6 +12,10 @@ import subprocess
 from .paths import dispatch_file
 from .util import read_json, write_json, BossError
 from . import graphs, modes
+import time as _time
+
+_LIST_MODELS_CACHE: dict[str, tuple[float, set[str] | None]] = {}
+_LIST_MODELS_TTL_SECONDS = 5 * 60
 
 PHASES = ("plan", "implement", "review_correctness", "review_adversarial", "scout")
 
@@ -42,7 +47,13 @@ def load() -> dict:
     data = read_json(dispatch_file())
     if data is None:
         write_json(dispatch_file(), DEFAULT)
-        return DEFAULT
+        # Never return the literal module-level DEFAULT: a caller that mutates the
+        # result in place (e.g. `bossctl dispatch --set` before dispatch.json exists)
+        # would otherwise corrupt the shared default for the rest of THIS process's
+        # lifetime — invisible in a normal one-shot CLI invocation, but real
+        # cross-test/cross-BOSS_HOME pollution inside a long-running process (daemon,
+        # test suite).
+        return copy.deepcopy(DEFAULT)
     # An older file keeps its choices but inherits defaults for phases it never mentions.
     data["models"] = {**DEFAULT["models"], **(data.get("models") or {})}
     data["thinking"] = {**DEFAULT["thinking"], **(data.get("thinking") or {})}
@@ -85,20 +96,40 @@ def resolve(item: dict, project: dict) -> dict:
     raise BossError(f"no dispatch rule matches kind={item['kind']} labels={sorted(labels)}")
 
 
+def _list_models() -> set[str] | None:
+    """Cached `pi --list-models` parse. Returns None on failure; raises only on
+    malformed inventory when the user supplied one via BOSS_AVAILABLE_MODELS.
+    """
+    now = _time.monotonic()
+    cached = _LIST_MODELS_CACHE.get("ts")
+    if cached and now - cached[0] < _LIST_MODELS_TTL_SECONDS:
+        return cached[1]
+    if not shutil.which("pi"):
+        _LIST_MODELS_CACHE["ts"] = (now, None)
+        return None
+    result = subprocess.run(["pi", "--list-models"], text=True, capture_output=True,
+                            stdin=subprocess.DEVNULL, timeout=30)
+    available: set[str] | None = None
+    if result.returncode == 0:
+        available = {f"{parts[0]}/{parts[1]}" for line in result.stdout.splitlines()
+                     if len(parts := line.split()) >= 2}
+    _LIST_MODELS_CACHE["ts"] = (now, available)
+    return available
+
+
+def _invalidate_list_models_cache() -> None:
+    _LIST_MODELS_CACHE.pop("ts", None)
+
+
 def assert_available(decision: dict) -> None:
     """Validate against an authoritative configured inventory when one is supplied."""
     raw = os.environ.get("BOSS_AVAILABLE_MODELS")
     if raw is None and graphs.deterministic_test_mode():
         return  # deterministic test runner supplies model evidence in its fixture
     if raw is None:
-        if not shutil.which("pi"):
-            raise BossError("cannot validate resolved models: pi is unavailable")
-        result = subprocess.run(["pi", "--list-models"], text=True, capture_output=True,
-                                stdin=subprocess.DEVNULL, timeout=30)
-        if result.returncode:
+        available = _list_models()
+        if available is None:
             raise BossError("cannot validate resolved models: `pi --list-models` failed")
-        available = {f"{parts[0]}/{parts[1]}" for line in result.stdout.splitlines()
-                     if len(parts := line.split()) >= 2}
     else:
         available = {m.strip() for m in raw.split(",") if m.strip()}
     missing = sorted(set(decision.get("models", {}).values()) - available)

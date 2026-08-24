@@ -367,16 +367,32 @@ def cmd_watch(a):
 def cmd_tail(a):
     """Follow a work item's live run log (used by per-task herdr tabs)."""
     d = work.item_dir(a.id)
+    it = work.load(a.id)
+    # Early exit on terminal states: the run is finished, so there is nothing to follow.
+    terminal = {"done", "merged", "cancelled", "failed", "needs-you"}
+    if it.get("status") in terminal:
+        return work.print_summary(it, a)
+    # Queued items have no runner assigned yet; nothing to follow. Print status and exit.
+    if it.get("status") == "queued":
+        return work.print_summary(it, a)
     print(f"{a.id} — waiting for the run to start…")
     deadline = time.time() + 120
     logf = None
     while time.time() < deadline and not logf:
         runs = sorted((d / "runs").glob("*/log.md")) if (d / "runs").exists() else []
         logf = runs[-1] if runs else None
+        # Re-check status: a coordinator could have transitioned the item to terminal
+        # while we waited for the first run; bail out instead of reporting phantom progress.
+        if not logf and time.time() % 5 < 1:
+            it = work.load(a.id)
+            if it.get("status") in (terminal | {"queued"}):
+                return work.print_summary(it, a)
         if not logf:
             time.sleep(1)
     if not logf:
-        print("no run started within 120s"); return
+        it = work.load(a.id)
+        print(f"no run started within 120s for {a.id}; status={it.get('status')}")
+        return
     print(f"following {logf}\n")
     os.execvp("tail", ["tail", "-n", "+1", "-F", str(logf)])
 
@@ -561,12 +577,20 @@ def cmd_scope(a):
     out(it, a.json, f"{a.id}: declared scope {', '.join(paths)}")
 
 
+_WORK_SUMMARY_KEYS = ("id", "project", "status", "kind", "phase", "attempts", "max_attempts", "created", "updated")
+
+
 def cmd_work(a):
     items = work.all_items()
     if not a.all:
         items = [i for i in items if i["status"] in work.OPEN]
     if a.json:
-        return out(control.redact(items), True)
+        payload = control.redact(items)
+        if getattr(a, "summary", False):
+            # Compact view: no history, logs, or failure notes — for large operations
+            # where the full record is hundreds of KB per item.
+            payload = [{k: i.get(k) for k in _WORK_SUMMARY_KEYS} for i in payload]
+        return out(payload, True)
     for i in items:
         extra = i.get("pr_url") or (i.get("ask") or {}).get("question", "")[:60] or ""
         print(f"{i['id']:<44} {i['status']:<10} {i['kind']:<5} a{i['attempts']}/{i['max_attempts']} {extra}")
@@ -614,6 +638,70 @@ def cmd_respond(a):
 def cmd_retry(a):
     it = work.retry(a.id)
     out(it, a.json, f"{it['id']} requeued")
+
+
+def cmd_comment(a):
+    it = work.comment(a.id, " ".join(a.text))
+    out(control.redact(it), a.json, f"{it['id']}: comment recorded")
+
+
+def cmd_diff(a):
+    from . import worktree as _worktree
+    it = work.load(a.id)
+    project = registry.get(it["project"])
+    wt = _worktree.worktree_root() / it["project"] / it["id"]
+    if not wt.is_dir():
+        raise BossError(f"no worktree for {a.id}; item status is {it['status']}")
+    base = project.get("base", "main")
+    from .util import git
+    try:
+        diff = git(wt, "diff", f"{base}...HEAD", "--", check=True)
+    except subprocess.CalledProcessError as exc:
+        raise BossError(f"git diff failed: {exc}")
+    if a.json:
+        return out({"id": a.id, "base": base, "diff": diff}, True)
+    if not diff.strip():
+        print(f"{a.id}: no changes against {base}")
+        return
+    print(diff)
+
+
+def cmd_logs(a):
+    from .paths import log_file
+    if not a.worker and not a.id:
+        raise BossError("logs needs an item id, or --worker for the daemon log")
+    if a.worker:
+        lf = log_file()
+        if not lf.exists():
+            raise BossError(f"no daemon log at {lf}")
+        lines = lf.read_text(errors="replace").splitlines()[-a.lines:]
+        if a.json:
+            return out({"path": str(lf), "lines": lines}, True)
+        print("\n".join(lines))
+        return
+    it = work.load(a.id)
+    d = work.item_dir(a.id)
+    run_dirs = sorted((d / "runs").iterdir()) if (d / "runs").exists() else []
+    run_dirs = [r for r in run_dirs if r.is_dir()]
+    if a.json:
+        return out({"id": a.id, "runs": [str(r) for r in run_dirs]}, True)
+    if not run_dirs:
+        print(f"{a.id}: no runs recorded yet (status={it['status']})")
+        return
+    print(f"{a.id}: {len(run_dirs)} run(s)")
+    for r in run_dirs:
+        print(f"  {r}")
+    latest = run_dirs[-1]
+    # Prefer the live Herdr session transcript when present; otherwise fall back to
+    # the most recently modified artifact in the run (implementer.md, verify.md, etc.).
+    candidates = sorted(latest.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    logf = next((c for c in candidates if c.name == "log.md"), None) or (candidates[0] if candidates else None)
+    if not logf:
+        print(f"\n(no readable transcript in {latest})")
+        return
+    print(f"\n--- last {a.lines} line(s) of {logf} ---")
+    text = logf.read_text(errors="replace").splitlines()
+    print("\n".join(text[-a.lines:]))
 
 
 def cmd_cancel(a):
@@ -824,6 +912,7 @@ def _main(argv=None):
     p.add_argument("--node-max-cost", action="append", default=[], metavar="NODE=LIMIT")
     p.add_argument("--node-max-seconds", action="append", default=[], metavar="NODE=LIMIT")
     p = S("work", cmd_work, "list work items"); p.add_argument("--all", action="store_true")
+    p.add_argument("--summary", action="store_true", help="compact JSON: omit history/logs/failure notes")
     p = S("show", cmd_show, "show one item with history"); p.add_argument("id")
     p = S("inspect", cmd_inspect, "secret-safe live item inspection"); p.add_argument("id"); p.add_argument("--lines", type=int, default=120)
     for action in ("steer", "pause", "resume", "interrupt", "recover"):
@@ -838,6 +927,11 @@ def _main(argv=None):
     p = S("inbox", cmd_inbox, "what needs the boss"); p.add_argument("--hints", action="store_true", help="show the bossctl commands (for the BOSS)")
     p = S("respond", cmd_respond, "answer a question / give guidance, requeue"); p.add_argument("id"); p.add_argument("guidance", nargs="+")
     p = S("retry", cmd_retry, "requeue a failed item"); p.add_argument("id")
+    p = S("comment", cmd_comment, "append a durable note without a state transition"); p.add_argument("id"); p.add_argument("text", nargs="+")
+    p = S("diff", cmd_diff, "show a work item's worktree diff against base"); p.add_argument("id")
+    p = S("logs", cmd_logs, "list/show a work item's run logs, or the daemon log")
+    p.add_argument("id", nargs="?"); p.add_argument("--worker", action="store_true", help="show the daemon log instead of an item's runs")
+    p.add_argument("--lines", type=int, default=60)
     p = S("cancel", cmd_cancel, "cancel an item"); p.add_argument("id"); p.add_argument("--discard", action="store_true")
     p = S("promote", cmd_promote, "merge a ready/pr-open item (boss's word)"); p.add_argument("id"); p.add_argument("--confirm", action="store_true")
     p = S("run-once", cmd_run_once, "claim and execute one queued item"); p.add_argument("--owner", default="cli"); p.add_argument("--timeout", type=int, default=3600)

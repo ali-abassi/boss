@@ -433,6 +433,41 @@ class ControlPlaneTests(unittest.TestCase):
         escalated = rigor.escalate(quick, verification_failed=True)
         self.assertEqual(escalated["level"], "high-risk"); self.assertIn("verification", escalated["rationale"])
 
+    def test_rigor_does_not_escalate_on_compound_false_positives(self):
+        # The old regex matched "delete" inside "deletable", "auth" inside "authoritative",
+        # "concurrent" inside "concurrent", etc. — inflating the high-risk path on benign items.
+        from bossctl import rigor
+        cases = [
+            ("update authoritative docs about authority", "standard"),
+            ("note: productionize the build", "standard"),
+            ("make the deletable helper reusable", "standard"),
+            ("tolerate concurrent edits", "standard"),
+            ("tidy up the authoritative style guide", "standard"),
+        ]
+        for text, expected in cases:
+            r = rigor.route({"kind": "ship", "text": text, "scope": {"paths": ["src/x.py"]}})
+            self.assertEqual(r["level"], expected, f"text={text!r} got {r}")
+
+    def test_rigor_does_escalate_on_real_risk_words_and_inflections(self):
+        from bossctl import rigor
+        cases = [
+            ("change auth permissions in src/auth.py", "high-risk"),
+            ("rotate credentials for staging", "high-risk"),
+            ("apply database migration", "high-risk"),
+            ("delete a file", "high-risk"),
+            ("production deploy today", "high-risk"),
+            ("migrating user records", "high-risk"),
+            ("encrypt session tokens", "high-risk"),
+        ]
+        for text, expected in cases:
+            r = rigor.route({"kind": "ship", "text": text, "scope": {"paths": ["src/x.py"]}})
+            self.assertEqual(r["level"], expected, f"text={text!r} got {r}")
+
+    def test_rigor_rationale_names_the_matched_term(self):
+        from bossctl import rigor
+        r = rigor.route({"kind": "ship", "text": "rotate credentials", "scope": {"paths": ["src/x.py"]}})
+        self.assertIn("credentials", r["rationale"])
+
     def test_retry_signature_ignores_volatile_session_time_and_sha_evidence(self):
         from bossctl.work import _failure_signature
         one = {"failed_ids": ["review_correctness"],
