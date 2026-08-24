@@ -8,6 +8,8 @@ Herdr transcript, input/focus receipt, and scroll offsets remain in `herdr-coexi
 - `screenshots/default-100x30.png` — 100×30 grid, BOSS dark palette
 - `screenshots/minimum-50x12-no-color.png` — 50×12 grid, no color
 - `screenshots/degraded-60x12-plain.png` — 60×12 grid, plain degraded state and remediation
+- `screenshots/terminal-mark-before-after.png` — rejected outlined box mark beside the final
+  solid-spine B lockup
 
 Rebuild on macOS with Pillow already available:
 

@@ -4,29 +4,55 @@ Command:
   bun -e 'import { renderBanner } from "./.pi/extensions/boss.ts"; …'
 
 === WIDE / 100 COLUMNS ===
-      ┏━━╮     B O S S
-      ┣━━┫     Y O U R   A I   C O O
-      ┗━━╯     O P E R A T I O N S   D E S K
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ◆  3 projects · team ready · 2 running · 1 queued · 1 need you
-     /ops  ·  /inbox  ·  /wake 20m
+   ██████╮     B O S S
+   █     │     Y O U R   A I   C O O
+   ██████┤     O P E R A T I O N S   D E S K
+   █     │     3 projects · 2 workers · 1 need you · 2 running · 1 queued
+   ██████╯     /ops  ·  /inbox  ·  /wake 20m
+
+=== NORMAL / 120 COLUMNS ===
+   ██████╮     B O S S
+   █     │     Y O U R   A I   C O O
+   ██████┤     O P E R A T I O N S   D E S K
+   █     │     3 projects · 2 workers · 1 need you · 2 running · 1 queued
+   ██████╯     /ops  ·  /inbox  ·  /wake 20m
+
+=== MAXIMUM MASTHEAD / 80 COLUMNS ===
+   ██████╮     B O S S
+   █     │     Y O U R   A I   C O O
+   ██████┤     O P E R A T I O N S   D E S K
+   █     │     12 projects · 8 workers · 31 need you · away · 24 running
+   ██████╯     /ops  ·  /inbox  ·  /wake 20m
 
 === MEDIUM RUNNING / 60 COLUMNS ===
  ◆ B O S S · YOUR AI COO
  1 project · 1 running
  /ops  ·  /inbox  ·  /wake 20m
 
+=== ACTIVE + NEEDS-YOU / 60 COLUMNS ===
+ ◆ B O S S · YOUR AI COO
+ 12 projects · 24 running · 31 need you
+ /ops  ·  /inbox  ·  /wake 20m
+
 === MINIMUM / 50 COLUMNS ===
  BOSS · YOUR AI COO
- 3 projects · 1 need you
+ 3 projects · 1 need you · /ops
+
+=== NEEDS-YOU MINIMUM / 50 COLUMNS ===
+ BOSS · YOUR AI COO
+ 12 projects · 31 need you · /ops
 
 === PLAIN ASCII / 80 COLUMNS ===
   [B]      B O S S
-   |       YOUR AI COO
-   +----   OPERATIONS DESK
-  ----------------------------------------------------------------------------
-  > 3 projects | team ready | 2 running | 1 queued | 1 need you
-    /ops | /inbox | /wake 20m
+           YOUR AI COO
+           OPERATIONS DESK
+           > 3 projects | 2 workers | 1 need you | 2 running | 1 queued
+           /ops | /inbox | /wake 20m
+
+=== DEGRADED / 80 COLUMNS ===
+  [B] BOSS | YOUR AI COO
+  ! team tools missing | re-run install.sh
+  /ops | /inbox | /wake 20m
 
 === DEGRADED / 60 COLUMNS ===
  [B] BOSS | YOUR AI COO
@@ -69,12 +95,22 @@ ascii-only: True
   > running   project-11-w investigate maximum-content request 11 with a deliberately long descript
 
 Mechanical receipts:
-  boss.ts: 33 checks passed
+  boss.ts: 39 checks passed
+  terminal-mark: 31 checks passed
+  row matrix: 120=5, 100=5, 80=5, 60=3, 50=2, 32=2, 12=2
+  plain normal: bytes=177 non_ascii=0 ansi_sequences=0 rows=5
+  plain degraded: bytes=95 non_ascii=0 ansi_sequences=0 rows=3
+  no-color maximum: bytes=278 ansi_sequences=0 decisive_state="31 need you"
+  installed pi-boss: /Users/aliabassi/boss/bin/pi-boss
+  installed pi-boss-quit: /Users/aliabassi/boss/bin/pi-boss-quit
+  HERDR_ENV during verification: unset; Herdr control commands issued: 0
+  Firstmate launcher targets found: 0
   pi-attest: signed runtime attestation + 19 scope checks passed
 
 The extension self-test covers 120, 80, 72, 71, 60, 52, 51, 50, 32, and 12 columns;
-display-cell width, stable rendering, ASCII-only fallback/receipts/footer, ANSI absence in
-no-color mode, fixed-width progress frames, reduced-motion selection, explicit turn-end
+the five-row solid-spine mark, display-cell width, stable rendering, bounded whole-part status
+summaries, compact ASCII-only fallback/receipts/footer, ANSI absence in no-color mode even when
+truncation occurs, fixed-width progress frames, reduced-motion selection, explicit turn-end
 clearing, non-duplicated status vocabulary, degraded remediation, persistent identity/action,
 controller path, and wake parsing/prompt rules. The board fixture proves all 12 maximum-content
 items survive while every row remains within 99 display cells; fixed fields use cell-aware

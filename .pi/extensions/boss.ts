@@ -22,9 +22,12 @@ const CONTROLLER = process.env.BOSSCTL_BIN || resolve(dirname(fileURLToPath(impo
 
 function gutter(width: number): number { return width >= 70 ? 2 : width >= 32 ? 1 : 0; }
 function inner(width: number): number { return Math.max(1, width - gutter(width) * 2); }
-function fit(lines: string[], width: number): string[] {
+function fit(lines: string[], width: number, plainText = false): string[] {
   const pad = " ".repeat(gutter(width));
-  return lines.map((l) => pad + truncateToWidth(l, inner(width), ""));
+  return lines.map((l) => {
+    const fitted = pad + truncateToWidth(l, inner(width), "");
+    return plainText ? fitted.replace(/\u001b\[[0-9;]*m/g, "") : fitted;
+  });
 }
 function plainStatus(text: string): string { return text.replaceAll(" · ", " | "); }
 export function terminalText(text: string, ascii = false): string {
@@ -41,19 +44,28 @@ export function terminalText(text: string, ascii = false): string {
   }
   return out;
 }
-export function statusLine(s: Status | null): string {
-  if (!s) return "team tools missing · re-run install.sh";
+function statusParts(s: Status): string[] {
   const workers = s.herdr_tabs?.some((t) => t.kind === "worker")
     ? `${s.herdr_tabs!.filter((t) => t.kind === "worker").length} workers`
     : s.workers ? "team ready" : "team stopped";
   const needs = (s.items["needs-you"] || 0) + (s.items["failed"] || 0) + (s.items["ready"] || 0) + (s.items["pr-open"] || 0);
   const running = s.items["running"] || 0, queued = s.items["queued"] || 0;
-  const parts = [`${s.projects} project${s.projects === 1 ? "" : "s"}`, workers];
+  const parts = [`${s.projects} project${s.projects === 1 ? "" : "s"}`, workers, needs ? `${needs} need you` : "inbox clear"];
   if (s.supervisor?.away) parts.push("away");
   if (running) parts.push(`${running} running`);
   if (queued) parts.push(`${queued} queued`);
-  parts.push(needs ? `${needs} need you` : "inbox clear");
+  return parts;
+}
+
+function boundedStatusLine(s: Status, maxWidth: number): string {
+  const parts = statusParts(s);
+  while (parts.length > 3 && visibleWidth(parts.join(" · ")) > maxWidth) parts.pop();
   return parts.join(" · ");
+}
+
+export function statusLine(s: Status | null): string {
+  if (!s) return "team tools missing · re-run install.sh";
+  return statusParts(s).join(" · ");
 }
 
 function compactStatus(s: Status | null, narrow = false): string {
@@ -87,7 +99,6 @@ export function renderBanner(theme: Theme, width: number, status: Status | null,
   const titlePlain = "B O S S";
   const title = noColor ? titlePlain : (theme.bold?.(titlePlain) ?? titlePlain);
   const statePlain = statusLine(status);
-  const state = noColor ? statePlain : theme.fg("muted", statePlain);
   const hintPlain = "/ops  ·  /inbox  ·  /wake 20m";
   const hint = noColor ? hintPlain
     : `${theme.fg("accent", "/ops")}${theme.fg("dim", "  ·  ")}${theme.fg("accent", "/inbox")}${theme.fg("dim", "  ·  ")}${theme.fg("accent", "/wake 20m")}`;
@@ -97,47 +108,45 @@ export function renderBanner(theme: Theme, width: number, status: Status | null,
     const errorPlain = plain ? "! team tools missing | re-run install.sh" : "! team tools missing · re-run install.sh";
     const error = noColor || plain ? errorPlain : theme.fg("warning", errorPlain);
     const action = plain ? "/ops | /inbox | /wake 20m" : hint;
-    return fit(width < 52 ? [role, error] : [role, error, action], width);
+    return fit(width < 52 ? [role, error] : [role, error, action], width, noColor || plain);
   }
   if (plain) {
     const plainState = plainStatus(statePlain);
     const plainHint = "/ops | /inbox | /wake 20m";
-    if (width < 52) return fit(["BOSS | YOUR AI COO", plainStatus(compactStatus(status, true))], width);
-    if (width < 72) return fit(["[B] BOSS | YOUR AI COO", plainStatus(compactStatus(status)), plainHint], width);
-    const divider = "-".repeat(Math.max(12, Math.min(92, inner(width))));
+    if (width < 52) return fit(["BOSS | YOUR AI COO", `${plainStatus(compactStatus(status, true))} | /ops`], width, true);
+    if (width < 72) return fit(["[B] BOSS | YOUR AI COO", plainStatus(compactStatus(status)), plainHint], width, true);
     return fit([
       `[B]      ${titlePlain}`,
-      " |       YOUR AI COO",
-      " +----   OPERATIONS DESK",
-      divider,
-      `> ${plainState}`,
-      `  ${plainHint}`,
-    ], width);
+      "         YOUR AI COO",
+      "         OPERATIONS DESK",
+      `         > ${plainState}`,
+      `         ${plainHint}`,
+    ], width, true);
   }
   if (width < 52) {
     const compactTitle = theme.bold?.("BOSS") ?? "BOSS";
     const role = noColor ? "BOSS · YOUR AI COO" : `${compactTitle}${theme.fg("dim", " · YOUR AI COO")}`;
-    return fit([role, noColor ? compactStatus(status, true) : theme.fg("muted", compactStatus(status, true))], width);
+    const compactState = compactStatus(status, true);
+    const stateAction = noColor ? `${compactState} · /ops`
+      : `${theme.fg("muted", compactState)}${theme.fg("dim", " · ")}${theme.fg("accent", "/ops")}`;
+    return fit([role, stateAction], width, noColor);
   }
   if (width < 72) {
     const role = noColor ? `${MARK} ${titlePlain} · YOUR AI COO`
       : `${theme.fg("warning", MARK)} ${title}${theme.fg("dim", " · YOUR AI COO")}`;
-    return fit([role, noColor ? compactStatus(status) : theme.fg("muted", compactStatus(status)), hint], width);
+    return fit([role, noColor ? compactStatus(status) : theme.fg("muted", compactStatus(status)), hint], width, noColor);
   }
 
   const mark = (text: string) => noColor ? text : theme.fg("warning", text);
-  const dividerWidth = Math.max(12, Math.min(92, inner(width)));
-  const divider = noColor ? "━".repeat(dividerWidth) : theme.fg("borderMuted", "━".repeat(dividerWidth));
   const role = noColor ? "Y O U R   A I   C O O" : theme.fg("dim", "Y O U R   A I   C O O");
   const desk = noColor ? "O P E R A T I O N S   D E S K" : theme.fg("dim", "O P E R A T I O N S   D E S K");
+  const markRows = ["██████╮", "█     │", "██████┤", "█     │", "██████╯"];
+  const wideStatePlain = boundedStatusLine(status, Math.max(1, inner(width) - 13));
+  const wideState = noColor ? wideStatePlain : theme.fg("muted", wideStatePlain);
+  const copyRows = [title, role, desk, wideState, hint];
   return fit([
-    `    ${mark("┏━━╮")}     ${title}`,
-    `    ${mark("┣━━┫")}     ${role}`,
-    `    ${mark("┗━━╯")}     ${desk}`,
-    divider,
-    `${mark("◆")}  ${state}`,
-    `   ${hint}`,
-  ], width);
+    ...markRows.map((row, i) => ` ${mark(row)}     ${copyRows[i]}`),
+  ], width, noColor);
 }
 
 // ------------------------------------------------------------------ wake
@@ -376,8 +385,9 @@ if (process.argv[1]?.endsWith("boss.ts")) {
   const st: Status = { projects: 2, workers: 123, items: { running: 1, "needs-you": 1 } };
   for (const width of [120, 80, 72]) {
     const lines = renderBanner(theme, width, st, false);
-    ok(lines.length === 6 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
-    ok(lines[0].includes("B O S S") && lines[1].includes("A I   C O O") && lines[4].includes("2 projects"), `identity + status at ${width}`);
+    ok(lines.length === 5 && lines.every((l) => visibleWidth(l) <= width), `banner fits ${width}`);
+    ok(lines[0].includes("██████╮") && lines[2].includes("██████┤") && lines[4].includes("██████╯"), `solid-spine B survives at ${width}`);
+    ok(lines[0].includes("B O S S") && lines[1].includes("A I   C O O") && lines[3].includes("2 projects") && lines[4].includes("/ops"), `identity + state + action at ${width}`);
   }
   for (const width of [71, 60, 52]) {
     const lines = renderBanner(theme, width, st, false);
@@ -387,12 +397,15 @@ if (process.argv[1]?.endsWith("boss.ts")) {
     const lines = renderBanner(theme, width, st, false);
     ok(lines.length === 2 && lines.every((l) => visibleWidth(l) <= width), `narrow banner fits ${width}`);
     if (width >= 17) ok(lines[0].includes("BOSS"), `narrow identity survives ${width}`);
+    if (width >= 50) ok(lines[1].includes("/ops"), `minimum primary action survives ${width}`);
   }
   ok(renderBanner(theme, 80, st, false).join("|") === renderBanner(theme, 80, st, false).join("|"), "render is stable");
   const ascii = renderBanner(theme, 80, st, true, true).join("\n");
-  ok([...ascii].every((c) => c.charCodeAt(0) < 128) && ascii.includes("[B]") && ascii.includes("/ops | /inbox"), "plain fallback is ASCII and actionable");
+  ok([...ascii].every((c) => c.charCodeAt(0) < 128) && ascii.split("\n").length === 5 && ascii.includes("[B]") && ascii.includes("/ops | /inbox"), "plain fallback is compact, ASCII, and actionable");
   const ansiTheme: Theme = { fg: (_t, s) => `\u001b[31m${s}\u001b[0m`, bold: (s) => `\u001b[1m${s}\u001b[0m` };
   ok(!renderBanner(ansiTheme, 80, st, true, false).join("\n").includes("\u001b["), "no-color output contains no ANSI");
+  const maximum: Status = { projects: 12, workers: 8, herdr_tabs: Array.from({ length: 8 }, () => ({ kind: "worker" })), items: { running: 24, queued: 17, "needs-you": 31 }, supervisor: { pending_wakes: 9, away: true, healthy: true } };
+  ok(!renderBanner(ansiTheme, 80, maximum, true, false).join("\n").includes("\u001b[") && renderBanner(ansiTheme, 80, maximum, true, false)[3].includes("31 need you") && renderBanner(ansiTheme, 80, maximum, true, false)[3].trimEnd().endsWith("24 running"), "maximum no-color frame strips truncation resets and drops only complete low-priority parts");
   const degraded = renderBanner(theme, 80, null, true, true).join("\n");
   ok(degraded.includes("re-run install.sh") && !degraded.includes("+----"), "degraded error outranks identity art and keeps remediation");
   ok(PROGRESS_FRAMES.every((f) => visibleWidth(f) === visibleWidth(PROGRESS_FRAMES[0])), "progress frames have stable width");
