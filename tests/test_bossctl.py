@@ -553,9 +553,13 @@ class BossctlTests(unittest.TestCase):
             env["PATH"] = str(fake_dir) + os.pathsep + env.get("PATH", "")
             env["HERDR_BIN"] = str(fake_dir / "herdr")
         else:
-            # No herdr anywhere reachable: used only for the refusal-path test, which
-            # must exit before ever invoking herdr.
-            env["PATH"] = "/usr/bin:/bin"
+            # Used only for the refusal-path test, which must exit before ever invoking
+            # herdr. `self.env` already has every HERDR_* var stripped (see setUp), and
+            # `herdr.inside()` short-circuits False on that alone — PATH does not need
+            # restricting too. An earlier version pinned PATH to "/usr/bin:/bin" for extra
+            # defense-in-depth, but that also hides the CI-installed Python 3.10+ runtime
+            # (found elsewhere on PATH on GitHub's macOS runners), making `bossctl` itself
+            # fail its own runtime check before it can even reach the refusal logic.
             env.pop("HERDR_BIN", None)
         return env
 
