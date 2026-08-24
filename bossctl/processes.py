@@ -90,9 +90,18 @@ def probe(record: object, *, expected_kind: str = WORKER_KIND) -> dict:
         pgid = os.getpgid(int(pid))
     except OSError:
         return {"state": "unknown", "pid": pid, "reason": "process group is unavailable"}
-    if (_digest(start) != record.get("start_sha256") or _digest(command) != record.get("command_sha256")
+    # Process birth time is immutable.  A different birth receipt positively
+    # proves that the captured worker is gone even when the kernel has already
+    # recycled its PID.  Command or process-group drift is weaker evidence: the
+    # original process may still exist after changing its title/group, so keep
+    # that case untrusted and never treat it as a stopped identity.
+    if _digest(start) != record.get("start_sha256"):
+        return {"state": "reused", "pid": pid,
+                "reason": "PID now belongs to a different process identity (birth receipt changed)"}
+    if (_digest(command) != record.get("command_sha256")
             or int(record.get("pgid", -1)) != pgid):
-        return {"state": "reused", "pid": pid, "reason": "PID now belongs to a different process identity"}
+        return {"state": "untrusted", "pid": pid,
+                "reason": "captured process command or group identity changed"}
     return {"state": "live", "pid": int(pid), "pgid": pgid, "owner": record.get("owner"),
             "reason": "exact process start, command, and group identity match"}
 

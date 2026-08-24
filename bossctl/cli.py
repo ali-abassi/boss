@@ -136,7 +136,13 @@ def cmd_down(a):
         deadline = time.monotonic() + 10
         pending = list(signalled)
         while pending and time.monotonic() < deadline:
-            pending = [record for record in pending if processes.probe(record).get("state") != "dead"]
+            # These records were positively live immediately before SIGTERM.
+            # `reused` now means the immutable birth receipt changed, which is
+            # proof that our exact worker identity exited; never signal the new
+            # occupant of that PID.  Unknown/untrusted identities stay retained
+            # for doctor instead of being relabelled as success.
+            pending = [record for record in pending
+                       if processes.probe(record).get("state") not in {"dead", "reused"}]
             if pending: time.sleep(0.05)
         stopped = [int(record.get("pid")) for record in signalled if record not in pending]
         remaining.extend(pending)

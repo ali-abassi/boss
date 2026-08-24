@@ -1,4 +1,7 @@
 """The canonical quit command reports success only after exact shutdown proof."""
+import contextlib
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -7,6 +10,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 class ShutdownTests(unittest.TestCase):
@@ -67,6 +72,41 @@ printf '{}\\n'
             self.assertEqual(processes.probe(foreign)["state"], "reused")
         finally:
             child.wait(timeout=5)
+
+    def test_shutdown_accepts_pid_reuse_only_after_signalling_exact_live_identity(self):
+        """A recycled PID proves our worker exited but never authorizes a second signal."""
+        from bossctl import cli
+        record = {"version": 1, "kind": "boss-worker", "pid": 43210, "pgid": 43210,
+                  "owner": "worker-1", "start_sha256": "a" * 64,
+                  "command_sha256": "b" * 64}
+        (self.home / "daemon.pid").write_text(json.dumps([record]) + "\n")
+        observations = iter([
+            {"state": "live", "pid": 43210, "pgid": 43210},
+            {"state": "reused", "pid": 43210,
+             "reason": "PID now belongs to a different process identity (birth receipt changed)"},
+        ])
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, {"BOSS_HOME": str(self.home)}), \
+             mock.patch.object(cli.processes, "probe", side_effect=observations), \
+             mock.patch.object(cli.os, "killpg") as killpg, \
+             contextlib.redirect_stdout(stream):
+            cli.cmd_down(SimpleNamespace(json=True))
+        killpg.assert_called_once_with(43210, cli.signal.SIGTERM)
+        self.assertFalse((self.home / "daemon.pid").exists())
+        self.assertEqual(json.loads(stream.getvalue())["pids"], [43210])
+
+    def test_command_drift_is_not_positive_pid_reuse_evidence(self):
+        from bossctl import processes
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            record = processes.capture(child.pid, "drift-test")
+            self.assertIsNotNone(record)
+            altered = {**record, "command_sha256": "0" * 64}
+            finding = processes.probe(altered)
+            self.assertEqual(finding["state"], "untrusted")
+            self.assertIn("command or group", finding["reason"])
+        finally:
+            child.terminate(); child.wait(timeout=5)
 
 
 if __name__ == "__main__":
