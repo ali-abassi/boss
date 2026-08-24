@@ -61,7 +61,7 @@ class HerdrTests(unittest.TestCase):
         )
         self.assertEqual(timed.returncode, 124, timed.stderr)
 
-    def test_up_runs_workers_in_background_without_empty_herdr_tabs(self):
+    def test_up_readies_scheduler_without_empty_herdr_tabs(self):
         out = self.helm("up", "--workers", "3").stdout
         self.assertEqual(out, "")
         creates = [c for c in self.calls() if c[:2] == ["tab", "create"]]
@@ -71,7 +71,7 @@ class HerdrTests(unittest.TestCase):
         self.assertTrue(all(record["kind"] == "firstmate-worker" and record.get("start_sha256")
                             and record.get("command_sha256") for record in records))
         self.assertEqual(self.helm("up").stdout, "")                         # idempotent and quiet
-        self.assertIn("background", self.helm("status").stdout)
+        self.assertIn("crew      ready", self.helm("status").stdout)
         self.helm("down")
         closes = [c for c in self.calls() if c[:2] == ["tab", "close"]]
         self.assertEqual(closes, [])
@@ -682,7 +682,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_banner_and_watch_once(self):
         out = self.helm("watch", "--once").stdout
-        self.assertIn("F I R S T   M A T E", out); self.assertIn("workers   stopped", out); self.assertIn("none yet", out)
+        self.assertIn("F I R S T   M A T E", out); self.assertIn("crew      stopped", out); self.assertIn("none yet", out)
 
 
 if __name__ == "__main__":

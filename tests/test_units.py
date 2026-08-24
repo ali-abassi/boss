@@ -3,7 +3,7 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, shutil, subprocess, sys, tempfile, unittest
+import json, os, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -221,6 +221,35 @@ class PiExtensionTests(unittest.TestCase):
         agents = (REPO / "AGENTS.md").read_text()
         self.assertIn('"captain"', agents)
         self.assertIn("promote", agents)
+
+    def test_captain_prompt_knows_the_actual_control_plane(self):
+        agents = (REPO / "AGENTS.md").read_text()
+        for truth in (
+            "firstmate-captain/v2",
+            "real persistent Pi agent",
+            "own Herdr tab",
+            "`/fleet` is the canonical portfolio view",
+            "Active Herdr tabs are the drill-down view",
+            "Independent items can run concurrently",
+            "`direct-pr` adds one correctness review",
+            "`high-assurance` adds fresh correctness and adversarial reviews",
+            "zero model turns in healthy steady state",
+            "Isn't that what `/fleet` does?",
+            "Yes, exactly",
+        ):
+            self.assertIn(truth, agents)
+        self.assertNotIn("I run the crew in the background", agents)
+
+    def test_capability_questions_trigger_the_firstmate_skill(self):
+        skill = (REPO / "SKILL.md").read_text()
+        for trigger in ("what First Mate is or can do", "whether workers use Herdr", "/fleet", "/inbox"):
+            self.assertIn(trigger, skill)
+        self.assertIn("Do not search unrelated", skill)
+
+    def test_prompt_eval_set_covers_twenty_representative_conversations(self):
+        contract = (REPO / "docs" / "captain-prompt-contract.md").read_text()
+        cases = re.findall(r"^\| FM-\d{2} ", contract, re.MULTILINE)
+        self.assertEqual(len(cases), 20)
 
 
 class NodeBudgetTests(Isolated):

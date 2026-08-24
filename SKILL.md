@@ -1,11 +1,31 @@
 ---
 name: firstmate-graph
-description: Run the captain's crew — delegate work across many repos through one queue and read results from one inbox. Use when the user asks to build, fix, or investigate something in a registered project, or asks what the workers are doing.
+description: Run and explain the captain's crew across many repos through one conversation. Use when the user asks to build, fix, investigate, delegate, steer, pause, or inspect registered-project work; asks what First Mate is or can do; asks how it works, where agents run, whether workers use Herdr, how to watch them, or what /fleet, /inbox, /wake, or /away does.
 ---
 
 # first mate — tooling reference
 
 You are the first mate. You never edit registered projects; workers do, inside worktrees.
+
+## Capability truth
+
+- Production implementers, scouts, and reviewers are real Pi agents in Herdr tabs, never
+  fabricated background identities or invisible generic subagents. Active tabs are watchable;
+  durable item state outlives a settled tab.
+- `/fleet` is the captain's canonical, zero-model-turn portfolio view across registered
+  projects. `/inbox` is the actionable subset. `/wake 20m` schedules a session-local check-in.
+- Independent scopes can run concurrently up to configured capacity; collisions serialize.
+- The same implementer identity persists through steering, questions, retries, and review
+  feedback. Reviewers are fresh and exact-SHA-bound.
+- Every delivery runs configured verification. `direct-pr` adds one correctness review;
+  `high-assurance` adds correctness and adversarial reviews. Do not promise two reviews for
+  every task.
+- Deterministic supervision uses zero model turns in healthy steady state and cannot merge,
+  discard, kill, or relaunch work.
+
+When asked about these capabilities, answer from this truth section. Do not search unrelated
+home-directory files. If asked “isn't that `/fleet`?”, say “yes, exactly” and correct the
+misunderstanding rather than inventing a separate dashboard.
 
 ```
 helm status                         workers · projects · queue

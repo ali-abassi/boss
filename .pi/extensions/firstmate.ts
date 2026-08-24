@@ -27,7 +27,7 @@ export function statusLine(s: Status | null): string {
   if (!s) return "crew tools missing · re-run install.sh";
   const workers = s.herdr_tabs?.some((t) => t.kind === "worker")
     ? `${s.herdr_tabs!.filter((t) => t.kind === "worker").length} workers`
-    : s.workers ? "workers in background" : "workers stopped";
+    : s.workers ? "crew ready" : "crew stopped";
   const needs = (s.items["needs-you"] || 0) + (s.items["failed"] || 0) + (s.items["ready"] || 0) + (s.items["pr-open"] || 0);
   const running = s.items["running"] || 0, queued = s.items["queued"] || 0;
   const parts = [`${s.projects} project${s.projects === 1 ? "" : "s"}`, workers];
@@ -304,7 +304,8 @@ if (process.argv[1]?.endsWith("firstmate.ts")) {
   ok(renderBanner(theme, 60, st, false).length === 3 && renderBanner(theme, 60, st, false)[2].includes("/fleet"), "medium banner keeps actions");
   ok(renderBanner(theme, 50, st, false)[0].includes("F I R S T") && renderBanner(theme, 50, st, false).length === 2, "narrow banner keeps identity");
   ok(renderBanner(theme, 80, st, false).join("|") === renderBanner(theme, 80, st, false).join("|"), "render is stable");
-  ok(statusLine({ projects: 1, workers: null, items: {} }) === "1 project · workers stopped · inbox clear", "status line when idle");
+  ok(statusLine({ projects: 1, workers: null, items: {} }) === "1 project · crew stopped · inbox clear", "status line when idle");
+  ok(statusLine({ projects: 1, workers: 123, items: {} }) === "1 project · crew ready · inbox clear", "ready schedulers are not mislabeled as hidden agents");
   ok(statusLine(st).includes("1 need you") && statusLine(st).includes("1 running"), "status line counts");
   ok(parseWake("20m") === 1_200_000 && parseWake("1h") === 3_600_000 && parseWake("1h30m") === 5_400_000 && parseWake("45") === 2_700_000, "wake durations parse");
   ok(parseWake("soon") === null && parseWake("0m") === null, "bad wake durations rejected");

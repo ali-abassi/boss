@@ -368,7 +368,7 @@ class HelmTests(unittest.TestCase):
         self.add(mode="local-only")
         it = self.task()
         self.helm("up", "--interval", "1")
-        self.assertIn("in the background", self.helm("status").stdout)
+        self.assertIn("crew      ready", self.helm("status").stdout)
         deadline = time.time() + 30
         while time.time() < deadline and self.show(it["id"])["status"] != "ready":
             time.sleep(0.5)
