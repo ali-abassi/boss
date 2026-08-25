@@ -17,7 +17,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from . import control, dispatch, gates, modes, scope, processes, ids, registry, worktree, work
 from .paths import (GRAPHS, dispatch_file, home, projects_file, supervisor_file,
-                    wakes_file, work_root, worktree_root, supervisor_lock, authority_lock)
+                    wakes_file, planning_file, work_root, worktree_root, supervisor_lock,
+                    planning_lock, authority_lock)
 from .util import BossError, git_config, locked, now, read_json, sh, write_json
 
 VERSION = 1
@@ -509,9 +510,11 @@ def audit(*, network: bool = True, probe_models: bool = False) -> dict:
     add("state:items", "ok" if all(c["status"] != "error" for c in checks if c["id"].startswith("state:item:")) else "error",
         f"{len(raw_items)} readable item(s)")
 
+    from . import planning
     state_specs = [
         ("supervisor", supervisor_file(), {"version": 1, "observations": {}, "away": {"enabled": False}}, True),
         ("wakes", wakes_file(), {"version": 1, "next_id": 1, "events": []}, True),
+        ("planning", planning_file(), planning._default_state(), True),
         ("claims", home() / "scope-claims.json", {"version": 1, "claims": []}, False),
         ("tabs", home() / "herdr.json", {"tabs": []}, True),
     ]
@@ -523,6 +526,7 @@ def audit(*, network: bool = True, probe_models: bool = False) -> dict:
                 from . import supervisor
                 error = (supervisor.validate_state(value) if name == "supervisor"
                          else supervisor.validate_queue(value))
+            elif name == "planning": error = planning.validate_state(value)
             elif name == "claims": error = _claims_schema(value)
             elif name == "tabs": error = _tabs_schema(value)
         parsed[name] = value if not error else default
@@ -542,6 +546,19 @@ def audit(*, network: bool = True, probe_models: bool = False) -> dict:
             add("state:memory", "ok", f"{len(entries)} explicit operational memory entr{'y' if len(entries) == 1 else 'ies'}")
     else:
         add("state:memory", "ok", "not initialized; no operational memory stored")
+    planning_events = ((parsed.get("planning") or {}).get("events", [])
+                       if isinstance(parsed.get("planning"), dict) else [])
+    for event in planning_events:
+        if event.get("state") == "generating":
+            add(f"planning-receipt:{event.get('id')}", "unknown",
+                "planning generation may have begun but no terminal append receipt exists; it will not be replayed automatically",
+                consumer=event.get("claimed_by"), fingerprint=event.get("fingerprint"))
+        elif event.get("reconciled") is True:
+            receipt = event.get("reconciliation_receipt") or {}
+            add(f"planning-reconciliation:{event.get('id')}", "ok",
+                "planning terminal outcome was explicitly confirmed by an operator rather than inferred from model delivery",
+                outcome=receipt.get("confirmed_outcome"), confirmed_at=receipt.get("confirmed_at"),
+                reason=receipt.get("reason"))
     queue_events = ((parsed.get("wakes") or {}).get("events", [])
                     if isinstance(parsed.get("wakes"), dict) else [])
     for event in queue_events:
@@ -1056,11 +1073,14 @@ def repair(*, confirm: bool, network: bool = True, auth_source: str | None = Non
                     else: skipped.append({**action, "skip": "tab liveness is no longer positive"})
             elif name == "quarantine-state":
                 path = Path(str(target)).resolve()
-                allowed = {supervisor_file(), wakes_file(), home() / "herdr.json", home() / "daemon.pid"}
+                from . import planning
+                allowed = {supervisor_file(), wakes_file(), planning_file(), home() / "herdr.json", home() / "daemon.pid"}
                 defaults = {supervisor_file(): {"version": 1, "observations": {}, "away": {"enabled": False}},
                             wakes_file(): {"version": 1, "next_id": 1, "events": []},
+                            planning_file(): planning._default_state(),
                             home() / "herdr.json": {"tabs": []}, home() / "daemon.pid": []}
                 lock_path = (supervisor_lock() if path in {supervisor_file(), wakes_file()} else
+                             planning_lock() if path == planning_file() else
                              home() / "herdr.lock" if path == home() / "herdr.json" else
                              home() / "daemon.lock")
                 with locked(lock_path):

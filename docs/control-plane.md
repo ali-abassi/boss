@@ -107,6 +107,28 @@ The same exact identity check gates prompt submission, steering, cooperative int
 closure. If the name, pane, UUID, process-birth fingerprint, or durable session evidence no longer agrees, the
 operation fails as unknown and retains recovery custody rather than acting on a replacement tab.
 
+### Advisory planning pulse
+
+Planning is an opt-in derived surface, not a supervisor event and not an authority path. Missing
+`planning.json` means disabled; status reads do not initialize it. When enabled—or on an explicit
+one-shot request—the extension waits for Pi to be idle, away mode to be off, and normal durable
+wakes to clear. Deterministic code then captures canonical item, latest-run, and pending-wake
+projections twice until stable, redacts and bounds them, and fingerprints only semantic fields.
+Timestamps, revisions, leases, sessions, and delivery bookkeeping do not create false changes.
+
+A changed fingerprint creates one frozen planning receipt. An unchanged fingerprint creates no
+model call and doubles the cadence up to six hours. The receipt is claimed and marked
+`generating` before one isolated no-tools model completion. Strict JSON and source-ID validation
+reject unsupported claims. The resulting custom transcript entry is labeled
+`ADVISORY — NO ACTION TAKEN`; it is not a conversation message and is not added to later model
+context. Planning can mutate only its own ledger and transcript entry—never items, runs, wakes,
+projects, worktrees, claims, memory, delivery, or recovery state.
+
+Pending/claimed receipts may be safely released or cancelled. A crash after generation begins is
+uncertain and is never replayed automatically; doctor surfaces it for explicit reconciliation.
+The deterministic recap is rebuildable from the retained snapshot, cites `item:`, `run:`, and
+`event:` sources, and is historical evidence only. Canonical current state always wins.
+
 Doctor audits tools, worker PIDs, tabs, leases, claims, session identities, JSON state,
 worktrees, auth, models, test commands, clone freshness, graphs, and the optional gate boundary.
 It is read-only unless both `--repair` and `--confirm` are present. Repair backs up corrupt

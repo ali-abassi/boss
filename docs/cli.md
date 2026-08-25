@@ -28,6 +28,7 @@ bossctl gate-respond ID --action approve|fix|skip [--findings IDS --instructions
 bossctl memory operational list|get KEY|set KEY VALUE|remove KEY --confirm
 bossctl memory project list PROJECT|set PROJECT KEY VALUE|remove PROJECT KEY --confirm
 bossctl away-mode on|off|status
+bossctl planning status|on|off|tick|now|show|claim|begin|complete|reject|defer|release|reconcile
 bossctl dispatch
 bossctl doctor [--offline] [--probe]
 bossctl doctor --repair --confirm [--offline] [--auth-source PATH --auth-provider PROVIDER]
@@ -94,11 +95,17 @@ no automatic warning or refusal for this today — `bossctl doctor`'s `binary:pi
 
 State lives in `$BOSS_HOME` (default `~/.boss`): `projects.json`, `dispatch.json`, atomic
 versioned `work/<id>/item.json` records, durable `scope-claims.json`, `supervisor.json`,
-`wakes.json`, optional `memory.json`, persistent `worktrees/`, durable `recovery/worktrees/`
-journals, evidence bundles, and the
+`wakes.json`, optional `planning.json`, optional `memory.json`, persistent `worktrees/`, durable
+`recovery/worktrees/` journals, evidence bundles, and the
 isolated `pi/` login. Fresh directories are created `0700` and state/lock/log files `0600`;
 existing permissive paths are reported for explicit confirmed repair rather than silently
-chmodded. Unknown, overlapping glob, global, and sensitive claims serialize;
+chmodded. `bossctl planning` is an internal receipt API for the Pi extension. Missing state is disabled
+and read-only status creates nothing. `tick` or one-shot `now` captures bounded frozen evidence;
+`claim`/`begin` make generation crash-safe; `complete` requires exact provider, model, response
+SHA-256, and token usage; uncertain `generating` receipts require explicit confirmed
+`reconcile`. The planning ledger is separate from supervisor wakes and carries no work authority.
+
+Unknown, overlapping glob, global, and sensitive claims serialize;
 mechanically disjoint path prefixes may run concurrently. Scope escape pauses the item for
 approval. A stale claim remains blocking until confirmed reconciliation turns it into a
 recovery hold; PID death is never permission to forget unlanded work.

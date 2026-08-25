@@ -165,8 +165,9 @@ def cmd_status(a):
     pid = daemon_pid()
     from .util import read_json
     tabs = read_json(home() / "herdr.json", {"tabs": []})["tabs"]
+    from . import planning
     data = {"workers": pid, "herdr_tabs": tabs, "projects": len(registry.load()["projects"]), "items": counts,
-            "supervisor": supervisor.summary()}
+            "supervisor": supervisor.summary(), "planning": planning.summary()}
     if a.json:
         return out(data, True)
     print(board.render(pid))
@@ -853,6 +854,55 @@ def cmd_away_mode(a):
         f" · {result.get('pending_wakes', 0)} durable wake(s) preserved")
 
 
+def cmd_planning(a):
+    """Internal deterministic ledger surface used by the Pi planning extension."""
+    from . import planning
+    action = a.action
+    if action == "status":
+        result = planning.summary()
+    elif action == "on":
+        result = planning.enable()
+    elif action == "off":
+        result = planning.disable(reason=a.reason or "planning disabled")
+    elif action in {"tick", "now"}:
+        result = planning.tick(force=a.force or action == "now")
+    elif action == "show":
+        if not a.event: raise BossError("planning show requires EVENT")
+        result = planning.show(a.event)
+    elif action == "claim":
+        result = planning.claim(a.consumer, event_id=a.event)
+    elif action == "begin":
+        if not a.event: raise BossError("planning begin requires EVENT")
+        result = planning.begin(a.event, a.consumer)
+    elif action == "complete":
+        if not a.event: raise BossError("planning complete requires EVENT")
+        if not (a.provider and a.model and a.response_sha256 and a.usage):
+            raise BossError("planning complete requires --provider, --model, --response-sha256, and --usage JSON")
+        try:
+            usage = json.loads(a.usage)
+        except json.JSONDecodeError as exc:
+            raise BossError(f"planning completion usage is invalid JSON: {exc.msg}")
+        result = planning.complete(a.event, a.consumer, provider=a.provider, model=a.model,
+                                   response_sha256=a.response_sha256, usage=usage)
+    elif action == "reject":
+        if not a.event: raise BossError("planning reject requires EVENT")
+        result = planning.reject(a.event, a.consumer, a.reason or "proposal generation rejected")
+    elif action == "defer":
+        if not a.event: raise BossError("planning defer requires EVENT")
+        result = planning.defer(a.event, a.consumer, a.reason or "deferred")
+    elif action == "release":
+        if not a.event: raise BossError("planning release requires EVENT")
+        result = planning.release(a.event, a.consumer)
+    elif action == "reconcile":
+        if not a.event: raise BossError("planning reconcile requires EVENT")
+        result = planning.reconcile(a.event, a.outcome, confirm=a.confirm,
+                                    reason=a.reason or "explicit operator reconciliation")
+    else:  # argparse prevents this; keep the mutation boundary fail-closed.
+        raise BossError("unknown planning action")
+    text = json.dumps(control.redact(result), sort_keys=True) if result is not None else "no planning event available"
+    out(control.redact(result), a.json, text)
+
+
 def cmd_dispatch(a):
     cfg = dispatch.load()
     if a.set:
@@ -961,6 +1011,15 @@ def _main(argv=None):
     p.add_argument("args", nargs="*"); p.add_argument("--confirm", action="store_true")
     p = S("away-mode", cmd_away_mode, "gated unattended supervision without merge authority")
     p.add_argument("state", choices=("on", "off", "status"), default="status", nargs="?")
+    p = S("planning", cmd_planning, "advisory planning snapshot and delivery ledger")
+    p.add_argument("action", choices=("status", "on", "off", "tick", "now", "show", "claim", "begin",
+                                      "complete", "reject", "defer", "release", "reconcile"))
+    p.add_argument("event", nargs="?"); p.add_argument("--consumer", default="cli")
+    p.add_argument("--reason"); p.add_argument("--force", action="store_true")
+    p.add_argument("--provider"); p.add_argument("--model"); p.add_argument("--response-sha256")
+    p.add_argument("--usage", help="strict completion usage JSON")
+    p.add_argument("--outcome", choices=("delivered", "rejected"), default="rejected")
+    p.add_argument("--confirm", action="store_true")
     p = S("dispatch", cmd_dispatch, "show dispatch table"); p.add_argument("--set", action="append", metavar="PHASE=provider/model", help="change a step's default model")
     p = S("setup", cmd_setup, "connect the BOSS to the Codex subscription (own config, own login)")
     p.add_argument("--import-login", action="store_true", help="(default behaviour) reuse the Codex login from your Pi")

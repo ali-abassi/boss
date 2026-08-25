@@ -103,6 +103,7 @@ Workflows is not downloaded or silently updated at runtime.
 | See the complete portfolio inside Pi | `/ops` |
 | See only questions, failures, and ready work | `/inbox` |
 | Ask the COO to check back in this session | `/wake 20m` |
+| Enable or request an advisory portfolio planning pulse | `/pulse on` · `/pulse now` · `/pulse status` · `/pulse off` |
 | Enter or leave gated unattended supervision | `/away on` · `/away off` · `/away status` |
 | Read status without entering Pi | `pi-boss status` |
 | Run a read-only health/recovery audit | `pi-boss doctor` |
@@ -113,6 +114,12 @@ You do not need to type internal orchestration commands. Talk to the COO in plai
 `bossctl` exists for diagnostics, automation, and people who want to inspect the machinery. The
 COO inside `pi-boss` will not use that verb unless you ask; ask the COO in natural language and
 it will translate the request into the right `bossctl` invocation.
+
+Planning pulses are off by default. When enabled, BOSS waits until Pi is idle and normal team
+news is clear, fingerprints a bounded frozen portfolio snapshot, and makes one isolated no-tools
+model call. The visible result is explicitly advisory and cites the item, run, and wake evidence
+it used; it cannot dispatch, steer, merge, promote, recover, or write memory. Unchanged snapshots
+consume no model call and back off to a maximum six-hour cadence.
 
 ## What code enforces
 

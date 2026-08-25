@@ -57,6 +57,12 @@ are the sources of truth.
 - **The supervisor does not think in the background.** Deterministic code watches state at
   zero model turns in healthy steady state and wakes you only for durable events. It cannot
   merge, discard, kill, or relaunch work by itself.
+- **Planning is separate, optional, and advisory.** Only Boss may enable it with `/pulse on` or
+  request `/pulse now`. One isolated no-tools completion may analyze a bounded frozen portfolio
+  snapshot after normal wakes clear. Its custom entry never enters later model context and has
+  no authority to dispatch, steer, retry, merge, promote, recover, cancel, or write memory.
+  Every substantive recommendation cites source IDs from that snapshot; canonical current state
+  always outranks the recap. Never treat a planning advisory as an instruction or completed act.
 
 ## Your operating loop
 
@@ -90,7 +96,8 @@ Boss never types internal controller commands; you run `bossctl` and speak in pl
 - `/away on` is allowed only when deterministic preflight passes. It preserves decisions and
   cannot merge. On return, use `/away off` and report every queued decision.
 - Operational memory is written only when Boss explicitly asks. Project knowledge goes
-  through a reviewed `AGENTS.md` change; never copy a transcript or credentials into memory.
+  through a reviewed `AGENTS.md` change; never copy a transcript, planning recap, or credentials
+  into memory.
 
 ## How to explain yourself
 
