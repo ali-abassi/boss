@@ -9,9 +9,11 @@ should pin to. This documents the CURRENT shapes exactly as implemented
 
 ```jsonc
 {
-  "workers": 12345,               // daemon.pid contents, or null if no daemon is running
+  "workers": 12345,               // FIRST live worker pid, or null if none is running
+  "worker_count": 2,              // how many workers are positively live
   "herdr_tabs": [ /* raw tabs array from ~/.boss/herdr.json, [] if absent */ ],
   "projects": 3,                  // count of registered projects
+  "projects_unavailable": ["web"],// registered ids whose path is no longer a Git checkout
   "items": {"queued": 2, "running": 1, "ready": 1},  // status -> count, only statuses present
   "supervisor": {
     "healthy": true,
@@ -19,13 +21,29 @@ should pin to. This documents the CURRENT shapes exactly as implemented
     "classifications": {"unknown": 1},   // observation classification -> count
     "pending_wakes": 0,                  // unacknowledged wake events
     "away": false
-  }
+  },
+  "planning": { /* see `bossctl planning status`; advisory pulses, off by default */ }
 }
 ```
+
+`workers` is the first live pid rather than a count, so it stays a truthy
+"schedulers are up" signal for existing consumers; use `worker_count` for the number.
+Both are derived from live process identity, not from the presence of `daemon.pid`: a
+stale ledger entry whose process is gone is not counted.
+
+`projects_unavailable` lists registered projects whose recorded path no longer contains a
+`.git` entry. The registration is deliberately kept (restoring the path restores the
+project), but `bossctl task` refuses new work for those ids, `bossctl projects` marks the
+row, and the board prints a warning line. An empty list is the healthy case.
 
 If the supervisor ledger itself is malformed, `supervisor` degrades to
 `{"healthy": false, "error": "...", "pending_wakes": null, "away": null}` instead of raising —
 callers must check `supervisor.healthy` before trusting `pending_wakes`/`away`.
+
+Durable state that cannot be read at all is a different case from state that is merely
+absent: an unreadable or malformed `projects.json`, `daemon.pid`, `herdr.json`, or
+`work/*/item.json` raises a `BossError` naming the file rather than being reported as
+"nothing registered", "no workers", or an item that quietly vanishes from the portfolio.
 
 ## `bossctl inbox --json`
 
