@@ -3,17 +3,26 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from .util import git
+from .util import BossError, git
+
+
+def _text(path: Path) -> str:
+    """Repository metadata that cannot be read is an error to report, not "no tests"."""
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BossError(f"cannot read {path} while detecting the test command: {exc}") from None
 
 
 def test_command(repo: Path) -> str | None:
     pkg = repo / "package.json"
     if pkg.exists():
         try:
-            scripts = json.loads(pkg.read_text()).get("scripts", {})
-        except json.JSONDecodeError:
-            scripts = {}
-        test_script = scripts.get("test")
+            manifest = json.loads(_text(pkg))
+        except json.JSONDecodeError as exc:
+            raise BossError(f"{pkg} is not valid JSON ({exc}); fix it or pass --test explicitly") from None
+        scripts = manifest.get("scripts") if isinstance(manifest, dict) else None
+        test_script = (scripts or {}).get("test") if isinstance(scripts, dict) else None
         # A placeholder "no test specified" must not count as a real test gate.
         if test_script and "no test specified" not in test_script:
             for lock, tool in (("pnpm-lock.yaml", "pnpm"),
@@ -26,7 +35,7 @@ def test_command(repo: Path) -> str | None:
             return "npm test"
     # justfile: a real `test` recipe is enough; absent recipe is a no-op.
     just = repo / "justfile"
-    if just.exists() and re.search(r"^test:", just.read_text(), re.M):
+    if just.exists() and re.search(r"^test:", _text(just), re.M):
         return "just test"
     if (repo / "Cargo.toml").exists():
         return "cargo test"
@@ -40,7 +49,7 @@ def test_command(repo: Path) -> str | None:
             return "uv run pytest -q"
         if (repo / "poetry.lock").exists():
             return "poetry run pytest -q"
-        if (repo / "mise.toml").exists() and re.search(r"^\[tasks\]\s*\n.*pytest", (repo / "mise.toml").read_text(), re.M | re.S):
+        if (repo / "mise.toml").exists() and re.search(r"^\[tasks\]\s*\n.*pytest", _text(repo / "mise.toml"), re.M | re.S):
             return "mise run pytest"
         if (repo / ".venv" / "bin" / "python").exists():
             return ".venv/bin/python -m pytest -q"
@@ -50,7 +59,7 @@ def test_command(repo: Path) -> str | None:
     if (repo / "mix.exs").exists():
         return "mix test"
     mk = repo / "Makefile"
-    if mk.exists() and re.search(r"^test:", mk.read_text(), re.M):
+    if mk.exists() and re.search(r"^test:", _text(mk), re.M):
         return "make test"
     return None
 

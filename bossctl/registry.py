@@ -15,19 +15,44 @@ AUTHORITY = {
     2: "open-pr      — may push a branch and open a PR",
     3: "merge        — `bossctl promote --confirm` may merge/fast-forward",
 }
-MIN_AUTHORITY = {"scout": 0, "build": 1, "open-pr": 2, "merge": 3}
 
 
-def load() -> dict:
-    data = read_json(projects_file(), {"projects": {}})
-    for project in data.get("projects", {}).values():
+def available(project: dict) -> bool:
+    """A registered repository is usable only while its path is still a Git checkout."""
+    path = Path(str(project.get("path") or ""))
+    return bool(project.get("path")) and path.is_dir() and (path / ".git").exists()
+
+
+def load(*, check_paths: bool = False) -> dict:
+    """The registry. `check_paths` stats each project to derive `available`.
+
+    The stat is opt-in because `load` runs inside the daemon poll, the 2s board
+    redraw, and per-candidate queue claiming: a project on an unresponsive network
+    mount must not be able to block those. Callers that render or gate on
+    availability ask for it; `require_available` derives it for one project instead.
+    """
+    try:
+        data = read_json(projects_file(), {"projects": {}})
+    except (OSError, ValueError) as exc:
+        raise BossError(f"project registry is unreadable: {projects_file()} ({exc}); "
+                        "run `pi-boss doctor --repair --confirm`") from None
+    if not isinstance(data, dict) or not isinstance(data.get("projects", {}), dict):
+        raise BossError(f"project registry is malformed: {projects_file()}; run `pi-boss doctor --repair --confirm`")
+    data.setdefault("projects", {})
+    if not all(isinstance(value, dict) for value in data["projects"].values()):
+        raise BossError(f"project registry has a malformed entry: {projects_file()}; run `pi-boss doctor --repair --confirm`")
+    for project in data["projects"].values():
         project["mode"] = modes.normalize(project.get("mode"))
         project.setdefault("gate", "native")
+        if check_paths:
+            project["available"] = available(project)
     return data
 
 
 def save(data: dict) -> None:
-    write_json(projects_file(), data)
+    # `available` is derived from the filesystem on every load; never persist it.
+    write_json(projects_file(), {**data, "projects": {
+        key: {k: v for k, v in value.items() if k != "available"} for key, value in data["projects"].items()}})
 
 
 def get(project_id: str) -> dict:
@@ -38,6 +63,14 @@ def get(project_id: str) -> dict:
     if p.get("id") != project_id:
         raise BossError("project identity does not match its registry key")
     return p
+
+
+def require_available(project: dict) -> dict:
+    """Refuse new work for a project whose checkout is gone; the registration is kept."""
+    if not project.get("available", available(project)):
+        raise BossError(f"project '{project['id']}' is registered at {project.get('path')} but that path is "
+                        "no longer a Git checkout; restore it or re-register with `bossctl add`")
+    return project
 
 
 def add(path: str, project_id: str | None, mode: str, authority: int, test_cmd: str | None,

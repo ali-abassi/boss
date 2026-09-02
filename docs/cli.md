@@ -36,6 +36,47 @@ bossctl doctor --repair --confirm [--offline] [--auth-source PATH --auth-provide
 bossctl boss [pi|claude|codex]
 ```
 
+## Leaving away mode
+
+`bossctl away-mode on` records the doctor summary it gated on. `off` re-runs that audit and
+compares: away mode exists so work progresses unattended, so the ok/warning counts move on
+every finished item, and count churn alone must not lock the boss out of normal mode. Only
+an increase in the doctor's `errors` refuses, and the refusal names both summaries. An audit
+that cannot itself complete is reported (`away-mode off refused: doctor re-verify failed: …`)
+rather than crashing, and the durable away bit stays on until the boss reconciles.
+
+## Reading the board and the inbox
+
+`bossctl watch [--once]` (what `/ops` runs) and `bossctl inbox` (what `/inbox` runs) both
+label every row with the item id, the age since its last state change, and — on the board —
+the attempt count, so a row can be named in a follow-up command and a wedged item does not
+look identical to a healthy one. The board shows the most recent `board.MAX_BOARD_ROWS`
+open items and says how many older ones it did not print.
+
+## Registered paths that disappear
+
+A project's path is checked on every `registry.load()`. If it no longer contains a `.git`
+entry, the project is reported as unavailable rather than silently failing later inside a
+worktree operation:
+
+- `bossctl projects` marks the row `!! path missing: not a Git checkout`
+- `bossctl status --json` lists the id in `projects_unavailable`, and the board prints a
+  warning line
+- `bossctl task PROJECT …` refuses to queue new work for it
+
+The registration itself is kept, so restoring the checkout (or re-cloning it to the same
+path) makes the project usable again with no re-registration. Use `bossctl add` with a new
+path if the repository moved permanently. The derived `available` flag is never written
+back into `projects.json`.
+
+## Unreadable state is an error, not an empty result
+
+`projects.json`, `daemon.pid`, `herdr.json`, and each `work/*/item.json` fail closed: a
+file that exists but cannot be read or parsed raises an error naming the file and pointing
+at `pi-boss doctor`. A missing file still means what it should ("no projects yet", "no
+workers running"). This is why a corrupt item cannot disappear from `/ops`, and why
+`pi-boss-quit` refuses to tear down a session whose work list it could not read.
+
 Legacy project records may use the on-disk alias `no-mistakes`; `bossctl/modes.py` defines `LEGACY_HIGH_ASSURANCE = "no-mistakes"`, and `normalize()` maps it to `high-assurance`. `bossctl projects --json` may show either string for old records. Both strings mean the same thing: two independent reviews plus the no-mistakes gate.
 
 `bossctl comment ID "…"` appends a durable note to a work item's history WITHOUT a state

@@ -22,7 +22,9 @@ assignment, live steering, retries, budgets, verification, and status across eve
 repository. You see the whole operation with `/ops`; you see only decisions with `/inbox`.
 
 Nothing merges, gets discarded, or receives a destructive recovery action unless you approve
-that exact item.
+that exact item. State that cannot be read is reported as an error naming the file, never
+as an empty portfolio: an unreadable work item, project registry, or worker ledger stops
+the command instead of quietly reading as "nothing to do".
 
 ## Install
 
@@ -107,6 +109,7 @@ Workflows is not downloaded or silently updated at runtime.
 | Enter or leave gated unattended supervision | `/away on` · `/away off` · `/away status` |
 | Read status without entering Pi | `pi-boss status` |
 | Run a read-only health/recovery audit | `pi-boss doctor` |
+| Check the tree and the live control plane in one shot | `./check.sh` |
 | Stop schedulers but preserve the BOSS session | `pi-boss stop` |
 | Use Claude Code or Codex as the COO liaison | `pi-boss claude` · `pi-boss codex` |
 
@@ -134,7 +137,7 @@ consume no model call and back off to a maximum six-hour cadence.
 | **Recovery** | Unknown stays unknown. Doctor never silently kills, relaunches, prunes, discards, promotes, or merges. Its audit is read-only; every repair needs `--repair --confirm`. |
 | **GitHub** | PR checks are bound to repository, PR, base ref/SHA, and exact reviewed head SHA. Pending, failed, moved, closed, outage, rate limit, and uncertainty never collapse into green. |
 | **Memory** | Operational facts are explicit, narrow, keyed, and deduplicated. Project knowledge becomes a normal reviewed project change—not a hidden transcript dump. |
-| **Away mode** | Entry requires healthy supervision and recovery gates. It may finish work, but cannot merge, discard, hide a decision, or answer an external approval gate. |
+| **Away mode** | Entry requires healthy supervision and recovery gates. It may finish work, but cannot merge, discard, hide a decision, or answer an external approval gate. Leaving re-runs the audit it gated on and refuses only on new errors, never on the count churn that normal progress produces. |
 
 ## BOSS and Firstmate can coexist
 
@@ -168,6 +171,17 @@ The default suite makes no model calls and exercises the complete one-thread sto
 through every workflow phase, Herdr restart, racing controls, corrupted state, stale identities
 and claims, dirty trees, scope escape, base movement, post-review mutation, reviewer loss,
 exhausted budgets, forge outages/rate limits, and restart recovery.
+
+```sh
+./check.sh          # every gate below, then a read-only live report
+./check.sh --fast   # same, minus the slow suite
+```
+
+`check.sh` runs the same gates CI runs and then describes the live control plane without
+changing it (it starts, stops, repairs and promotes nothing, and spends no tokens): live workers, open items, decisions waiting, registered projects, any
+registered path that is no longer a Git checkout, supervisor health, and away state. A
+gate that cannot run on your machine prints `SKIPPED` and is never counted as green. Run
+the gates individually if you prefer:
 
 ```sh
 python3 -m unittest discover -s tests -v

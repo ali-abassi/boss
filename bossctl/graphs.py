@@ -67,7 +67,11 @@ def render(graph: str, dest_dir: Path, *, cwd: Path, branch: str, project: dict,
 
 
 def validate(steps: Path) -> None:
-    r = subprocess.run([piw_bin(), "validate", str(steps)], text=True, capture_output=True)
+    try:
+        r = subprocess.run([piw_bin(), "validate", str(steps)], text=True, capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise BossError("piw validate did not finish within 120s") from None
     if r.returncode != 0:
         raise BossError(f"piw validate failed:\n{r.stdout}{r.stderr}")
 

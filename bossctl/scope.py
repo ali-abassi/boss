@@ -63,13 +63,6 @@ def overlap(a: list[str], b: list[str]) -> bool:
     return any(patterns_overlap(x, y) for x in a for y in b)
 
 
-def _alive(pid) -> bool:
-    try:
-        os.kill(int(pid), 0); return True
-    except (OSError, TypeError, ValueError):
-        return False
-
-
 def claim(project: str, work_id: str, paths: list[str], owner: str, pid: int | None = None,
           process_identity: dict | None = None, *, replace_token: str | None = None) -> str | None:
     """Acquire a scope and return its unguessable ownership token.
@@ -143,7 +136,13 @@ def hold(work_id: str, claim_token: str | None, reason: str) -> bool:
 
 
 def escaped(declared: list[str], changed: list[str]) -> list[str]:
+    """Changed paths outside the declared claim.
+
+    Only a truly global declaration (`*`, `unknown`, ...) has nothing to escape from. A
+    declaration that merely names a sensitive file (a lockfile, a workflow) is global for
+    *serialization* (see `is_global`/`overlap`) but still bounds what the agent may touch.
+    """
     declared = normalize(declared)
-    if is_global(declared):
+    if any(p in _GLOBAL for p in declared):
         return []
     return sorted(p for p in changed if not any(fnmatch.fnmatch(p, pattern) for pattern in declared))

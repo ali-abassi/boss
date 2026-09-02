@@ -13,7 +13,7 @@ for arg in "$@"; do
     --force|--yes|-y) FORCE=1 ;;
     --restart|-r)     RESTART=1 ;;
     --help|-h)
-      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
       exit 0
       ;;
     *)
@@ -23,17 +23,29 @@ done
 
 bindir="$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")"
 
-# Refuse to interrupt in-flight work unless the user explicitly opted in.
+# Refuse to interrupt in-flight work unless the user explicitly opted in. The guard
+# fails closed: if the controller cannot list work, or the list cannot be parsed, we
+# do not know that nothing is running, so we refuse rather than tear down blind.
 # `bossctl work --all --json` prints a raw JSON array, not an {"items": [...]} envelope.
-# The python helper exits 0 when work IS active (so the `if` fires and we refuse),
-# and exits 1 (falsy) when it is safe to proceed.
-if [ "$FORCE" -eq 0 ] && "$bindir/bossctl" work --all --json 2>/dev/null \
-  | python3 -c 'import json,sys
-items=json.loads(sys.stdin.read())
-active=[i for i in items if i.get("status") in {"running","ready","pr-open"}]
-raise SystemExit(0 if active else 1)'; then
-  printf 'pi-boss-quit: in-flight work is active. Re-run with --yes to stop anyway.\n' >&2
-  exit 1
+if [ "$FORCE" -eq 0 ]; then
+  if ! items="$("$bindir/bossctl" work --all --json)"; then
+    printf 'pi-boss-quit: could not verify in-flight work (bossctl failed); run pi-boss doctor, or re-run with --yes\n' >&2
+    exit 1
+  fi
+  # 0 = no active work, 1 = active work, 2 = unparseable (treated as active).
+  verdict=0
+  printf '%s' "$items" | python3 -c 'import json,sys
+try:
+    items = json.loads(sys.stdin.read())
+    active = [i for i in items if i.get("status") in {"running", "ready", "pr-open"}]
+except Exception:
+    raise SystemExit(2)
+raise SystemExit(1 if active else 0)' || verdict=$?
+  case "$verdict" in
+    0) ;;
+    1) printf 'pi-boss-quit: in-flight work is active. Re-run with --yes to stop anyway.\n' >&2; exit 1 ;;
+    *) printf 'pi-boss-quit: could not parse the work list; refusing to stop blind (re-run with --yes)\n' >&2; exit 1 ;;
+  esac
 fi
 
 if ! "$bindir/bossctl" down --json >/dev/null; then

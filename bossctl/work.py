@@ -415,7 +415,11 @@ def _hydrate(it: dict) -> dict:
 
 def load(work_id: str) -> dict:
     work_id = ids.work(work_id)
-    it = read_json(item_path(work_id))
+    try:
+        it = read_json(item_path(work_id))
+    except (OSError, ValueError) as exc:
+        raise BossError(f"work item state is unreadable: {item_path(work_id)} ({exc}); "
+                        "run `pi-boss doctor --repair --confirm`") from None
     if not it:
         raise BossError(f"unknown work item '{work_id}'")
     if it.get("id") != work_id:
@@ -456,10 +460,21 @@ def transition(it: dict, status: str, note: str = "") -> None:
 
 
 def all_items() -> list[dict]:
+    """Every durable work item. An unreadable item record fails closed by name.
+
+    One corrupt `item.json` used to raise a bare `JSONDecodeError` out of every caller
+    -- `/ops`, the inbox, the supervisor, the shutdown guard -- as a raw traceback that
+    named no file. The caller now gets a `BossError` naming the exact item and the
+    command that repairs it.
+    """
     out = []
     if work_root().is_dir():
         for d in sorted(work_root().iterdir()):
-            it = read_json(d / "item.json")
+            try:
+                it = read_json(d / "item.json")
+            except (OSError, ValueError) as exc:
+                raise BossError(f"work item state is unreadable: {d / 'item.json'} ({exc}); "
+                                "run `pi-boss doctor --repair --confirm`") from None
             if it:
                 if not ids.WORK_PATTERN.fullmatch(d.name) or d.name != it.get("id"):
                     continue
@@ -490,7 +505,7 @@ def create(project_id: str, text: str, kind: str = "ship", labels: list[str] | N
            max_tokens: int | None = None, max_cost: float | None = None, max_seconds: int | None = None,
            node_budgets: dict | None = None,
            memory_request: dict | None = None) -> dict:
-    project = registry.get(project_id)
+    project = registry.require_available(registry.get(project_id))
     gates.require_execution(project.get("gate", "native"), project["path"])
     if kind not in ("ship", "scout"):
         raise BossError("kind must be ship or scout")
@@ -580,16 +595,6 @@ def brief_text(it: dict, project: dict) -> str:
         for n in it["failure_notes"][-2:]:
             lines += [f"### attempt {n['attempt']}", "", "```", n["notes"], "```", ""]
     return "\n".join(lines)
-
-
-def _pid_alive(pid) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
 
 
 def budget_blockers(it: dict) -> list[str]:
@@ -815,8 +820,11 @@ def claim_next(owner: str) -> dict | None:
                                 current["phase"] = "recovery-required"
                                 current.setdefault("controls", {})["paused"] = True
                             control.cas_update(it["id"], preserve)
-                        except BaseException:
-                            pass
+                        except BaseException as pin_error:
+                            # The claim is held under the new token but the item still
+                            # records the old one; doctor must see why they diverged.
+                            log(f"{it['id']}: recovery lease pin failed; claim held for doctor: "
+                                f"{getattr(pin_error, 'msg', None) or pin_error!r}")
                     else:
                         scope.release(it["id"], claim_token)
                     raise
@@ -867,12 +875,14 @@ def execute(it: dict, timeout: int = 3600) -> dict:
         return _execute(it, timeout)
     except herdr.UnsettledAgentError as e:
         try: _harvest_usage(it["id"], time.monotonic() - started)
-        except BaseException: pass
+        except BaseException as usage_error:
+            log(f"{it['id']}: usage receipt unavailable after unsettled agent: {usage_error!r}")
         retain_recovery(str(e), "The agent did not prove it stopped. Inspect the live Herdr tab before recovery.")
         raise
     except BaseException as e:          # includes BossError (a SystemExit) and KeyboardInterrupt
         try: _harvest_usage(it["id"], time.monotonic() - started)
-        except BaseException: pass
+        except BaseException as usage_error:
+            log(f"{it['id']}: usage receipt unavailable after crashed attempt: {usage_error!r}")
         if recovery_attempt:
             retain_recovery(str(getattr(e, "msg", None) or e),
                             "Recovery did not complete. Inspect the preserved agent/worktree evidence before trying again.")

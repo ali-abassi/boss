@@ -2,7 +2,7 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, shlex, subprocess, tempfile, time, unittest
+import json, os, re, shlex, shutil, subprocess, tempfile, time, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -602,6 +602,65 @@ class BossctlTests(unittest.TestCase):
         r = subprocess.run([str(script), "--yes"], env=self._pi_boss_quit_env(isolate_herdr=True),
                            capture_output=True, text=True)
         self.assertNotIn("in-flight work is active", r.stderr)
+
+    def test_pi_boss_quit_refuses_when_the_work_list_cannot_be_read(self):
+        # The guard must fail closed. A corrupt item.json makes `bossctl work` exit
+        # non-zero; previously that read as "no active work" and tore the session
+        # down blind, because the check lived inside an `if ... | python3` pipeline.
+        self.add(mode="local-only", test="true")
+        it = self.task()
+        (self.home / "work" / it["id"] / "item.json").write_text("{truncated")
+        r = subprocess.run([str(self.bin_path())], env=self._pi_boss_quit_env(isolate_herdr=True),
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("could not verify in-flight work", r.stderr)
+        self.assertNotIn("BOSS closed", r.stdout)
+
+    def test_pi_boss_quit_refuses_when_the_work_list_is_unparseable(self):
+        # Same rule one layer out: the controller exits 0 but its output is not the
+        # JSON array the guard expects. Unknown is not permission to stop.
+        bin_dir = self.tmp / "unparseable-bin"; bin_dir.mkdir(exist_ok=True)
+        shutil.copy(self.bin_path(), bin_dir / "pi-boss-quit")
+        controller = bin_dir / "bossctl"
+        controller.write_text("#!/bin/sh\nprintf 'not json\\n'\nexit 0\n")
+        controller.chmod(0o755)
+        herdr = bin_dir / "herdr"
+        herdr.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+        herdr.chmod(0o755)
+        r = subprocess.run([str(bin_dir / "pi-boss-quit")],
+                           env={**self.env, "HERDR_BIN": str(herdr),
+                                "PATH": str(bin_dir) + os.pathsep + self.env.get("PATH", "")},
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("refusing to stop blind", r.stderr)
+        self.assertNotIn("BOSS closed", r.stdout)
+
+    def test_inbox_rows_name_the_item_and_its_age(self):
+        # Every inbox line must be addressable (id) and show how long it has waited.
+        self.add(mode="local-only", test="true")
+        it = self.task("investigate the flaky login test")
+        path = self.home / "work" / it["id"] / "item.json"
+        rec = json.loads(path.read_text())
+        rec["status"] = "needs-you"
+        rec["ask"] = {"question": "Which login flow do you mean?"}
+        path.write_text(json.dumps(rec))
+        out = self.bossctl("inbox").stdout
+        self.assertIn(it["id"], out)
+        self.assertIn("Which login flow do you mean?", out)
+        # The separator is ASCII-escaped under TERM=dumb / BOSS_PLAIN=1, so match
+        # only what is stable: the id and the age.
+        self.assertRegex(out, rf"\({re.escape(it['id'])}.*\d+[smhd]\)")
+
+    def test_projects_and_status_surface_a_missing_project_path(self):
+        self.add(mode="local-only", test="true")
+        shutil.rmtree(self.proj)
+        listing = self.bossctl("projects").stdout
+        self.assertIn("path missing", listing)
+        status = json.loads(self.bossctl("status", "--json").stdout)
+        self.assertEqual(status["projects_unavailable"], ["p"])
+        refused = self.bossctl("task", "p", "do something", check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("no longer a Git checkout", refused.stderr)
 
     def bin_path(self):
         return REPO / "bin" / "pi-boss-quit"
