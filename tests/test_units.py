@@ -833,5 +833,30 @@ class BoardMetaTests(Isolated):
         self.assertEqual(board.first_line("  real title \nsecond"), "real title")
 
 
+class CheckScriptTests(unittest.TestCase):
+    """./check.sh must stay honest: never green on a skip, never touch live Herdr."""
+
+    def test_help_is_syntactically_valid_and_documents_the_flags(self):
+        script = REPO / "check.sh"
+        self.assertTrue(os.access(script, os.X_OK), "check.sh must be executable")
+        syntax = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        helped = subprocess.run([str(script), "--help"], text=True, capture_output=True)
+        self.assertEqual(helped.returncode, 0, helped.stderr)
+        self.assertIn("--fast", helped.stdout)
+        rejected = subprocess.run([str(script), "--nope"], text=True, capture_output=True)
+        self.assertEqual(rejected.returncode, 2)
+
+    def test_gates_strip_herdr_coordinates_and_skips_are_never_reported_as_passes(self):
+        # The suite starts real Herdr agents when it can see a live session; check.sh
+        # must strip those coordinates from every gate it runs (see the incident note
+        # in the script header). bash 3.2 is the macOS system shell: no mapfile.
+        body = (REPO / "check.sh").read_text()
+        self.assertIn("env -u HERDR_ENV -u HERDR_SESSION -u HERDR_WORKSPACE_ID -u HERDR_BIN", body)
+        self.assertNotIn("mapfile -t", body, "mapfile does not exist in bash 3.2")
+        self.assertIn("SKIPPED", body)
+        self.assertIn("not proven, just not run", body)
+
+
 if __name__ == "__main__":
     unittest.main()
