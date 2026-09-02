@@ -674,5 +674,164 @@ steps:
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
 
+class FailClosedStateTests(Isolated):
+    """Unreadable durable state is an error to report, never a default that reads as success."""
+
+    def test_corrupt_item_never_disappears_from_the_portfolio(self):
+        from bossctl import work
+        from bossctl.util import BossError
+        good = self.home / "work" / "p-20260101-000000-aaaa"
+        good.mkdir(parents=True)
+        (good / "item.json").write_text(json.dumps(
+            {"id": "p-20260101-000000-aaaa", "project": "p", "status": "queued", "text": "fine",
+             "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z"}))
+        self.assertEqual([i["id"] for i in work.all_items()], ["p-20260101-000000-aaaa"])
+        broken = self.home / "work" / "p-20260101-000001-bbbb"
+        broken.mkdir(parents=True)
+        (broken / "item.json").write_text("{not json")
+        with self.assertRaises(BossError) as ctx:
+            work.all_items()
+        self.assertIn("p-20260101-000001-bbbb", ctx.exception.msg)
+        self.assertIn("doctor", ctx.exception.msg)
+        with self.assertRaises(BossError):
+            work.load("p-20260101-000001-bbbb")
+
+    def test_corrupt_project_registry_is_never_read_as_no_projects(self):
+        from bossctl import registry
+        from bossctl.util import BossError
+        from bossctl.paths import projects_file
+        projects_file().parent.mkdir(parents=True, exist_ok=True)
+        projects_file().write_text("{\"projects\": [1, 2]}")
+        with self.assertRaises(BossError) as ctx:
+            registry.load()
+        self.assertIn("malformed", ctx.exception.msg)
+        projects_file().write_text("{oops")
+        with self.assertRaises(BossError):
+            registry.load()
+
+    def test_corrupt_worker_ledger_is_never_read_as_no_workers(self):
+        # Reading a damaged daemon.pid as "nothing running" would let `up` start a
+        # second team against one queue and let `down` claim an unsignalled stop.
+        from bossctl import cli
+        from bossctl.util import BossError
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "daemon.pid").write_text("[{tru")
+        with self.assertRaises(BossError) as ctx:
+            cli.daemon_pids()
+        self.assertIn("worker ledger", ctx.exception.msg)
+        (self.home / "daemon.pid").write_text("")
+        self.assertEqual(cli.daemon_pids(), [], "an empty ledger really does mean no workers")
+
+    def test_malformed_package_json_refuses_instead_of_reporting_no_tests(self):
+        from bossctl import detect
+        from bossctl.util import BossError
+        repo = self.home / "broken"; repo.mkdir(parents=True)
+        (repo / "package.json").write_text('{"scripts": {"test": ')
+        with self.assertRaises(BossError) as ctx:
+            detect.test_command(repo)
+        self.assertIn("not valid JSON", ctx.exception.msg)
+        # A manifest with no test script is still an honest "nothing detected".
+        (repo / "package.json").write_text('{"name": "x"}')
+        self.assertIsNone(detect.test_command(repo))
+
+
+class ScopeEscapeTests(unittest.TestCase):
+    def test_declaring_a_sensitive_path_does_not_disable_the_escape_check(self):
+        # Regression: SENSITIVE membership made is_global() true, and escaped()
+        # short-circuited on is_global(), so declaring a lockfile returned "nothing
+        # escaped" for every other path the agent touched.
+        from bossctl import scope
+        declared = ["package-lock.json"]
+        self.assertTrue(scope.is_global(declared), "still serializes against everything")
+        self.assertEqual(scope.escaped(declared, ["package-lock.json"]), [])
+        self.assertEqual(scope.escaped(declared, ["src/secret.py", "package-lock.json"]),
+                         ["src/secret.py"])
+        # A genuinely global declaration still has nothing to escape from.
+        for glob in ("*", "**", "unknown"):
+            self.assertEqual(scope.escaped([glob], ["anything/at/all.py"]), [])
+
+
+class LogRotationTests(Isolated):
+    def test_log_rotates_once_and_reports_an_unwritable_trail(self):
+        from bossctl import util
+        from bossctl.paths import log_file
+        util.log("first line", console=False)
+        log_file().write_bytes(b"x" * (util.MAX_LOG_BYTES + 1))
+        util.log("after rotation", console=False)
+        rotated = log_file().with_name(log_file().name + ".1")
+        self.assertTrue(rotated.exists(), "the oversized log is preserved as one generation")
+        self.assertIn("after rotation", log_file().read_text())
+        self.assertLess(log_file().stat().st_size, util.MAX_LOG_BYTES)
+
+
+class TabRegistryTests(Isolated):
+    def test_remembered_tabs_are_bounded_and_malformed_state_fails_closed(self):
+        from bossctl import herdr
+        from bossctl.util import BossError
+        for n in range(herdr.MAX_REMEMBERED_TABS + 25):
+            herdr.remember("worker", {"tab_id": f"t{n}"})
+        tabs = herdr.remembered_tabs()
+        self.assertEqual(len(tabs), herdr.MAX_REMEMBERED_TABS)
+        self.assertEqual(tabs[-1]["tab_id"], f"t{herdr.MAX_REMEMBERED_TABS + 24}", "newest kept")
+        (self.home / "herdr.json").write_text('["not", "a", "registry"]')
+        with self.assertRaises(BossError):
+            herdr.remembered_tabs()
+
+
+class DeadProjectPathTests(Isolated):
+    def test_a_registered_path_that_is_no_longer_a_checkout_is_visible_and_refuses_work(self):
+        from bossctl import registry, work
+        from bossctl.util import BossError, write_json
+        from bossctl.paths import projects_file
+        gone = self.home / "was-a-repo"
+        write_json(projects_file(), {"projects": {"p": {
+            "id": "p", "path": str(gone), "mode": "local-only", "authority": 1,
+            "base": "main", "test_cmd": "true", "protected_paths": [], "gate": "native"}}})
+        loaded = registry.load()["projects"]["p"]
+        self.assertFalse(loaded["available"])
+        with self.assertRaises(BossError) as ctx:
+            work.create("p", "do something", "ship", [], 3, None, None, None, None, None, None, None)
+        self.assertIn("no longer a Git checkout", ctx.exception.msg)
+        # The registration survives: restoring the checkout restores the project.
+        gone.mkdir(parents=True); (gone / ".git").mkdir()
+        self.assertTrue(registry.load()["projects"]["p"]["available"])
+        # The derived flag is never written back into the durable registry.
+        registry.set_fields("p", authority=2)
+        self.assertNotIn("available", json.loads(projects_file().read_text())["projects"]["p"])
+
+
+class BoardMetaTests(Isolated):
+    def test_rows_carry_id_age_and_attempts_and_say_what_was_not_shown(self):
+        from bossctl import board
+        items = [{"id": f"p-2026-{n:04d}", "status": "running", "project": "p",
+                  "text": "make the thing work", "attempts": 1, "max_attempts": 3,
+                  "updated": "2026-01-01T00:00:00Z", "created": "2026-01-01T00:00:00Z"}
+                 for n in range(board.MAX_BOARD_ROWS + 3)]
+        with mock.patch("bossctl.board.registry.load", return_value={"projects": {}}), \
+             mock.patch("bossctl.board.work.all_items", return_value=items), \
+             mock.patch("bossctl.supervisor.summary", return_value={"away": False, "pending_wakes": 0}):
+            rendered = board.render([4242], 200)
+        self.assertIn("1 worker", rendered)
+        self.assertIn(f"p-2026-{board.MAX_BOARD_ROWS + 2:04d}", rendered, "newest row is addressable by id")
+        self.assertIn("a1/3", rendered, "attempt count is visible")
+        self.assertIn("3 older open items not shown", rendered)
+
+    def test_age_is_compact_and_unparseable_stamps_stay_unknown(self):
+        import datetime as dt
+        from bossctl import board
+        now = dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc)
+        self.assertEqual(board.age("2026-01-02T00:00:00Z", now=now), "0s")
+        self.assertEqual(board.age("2026-01-01T23:58:00Z", now=now), "2m")
+        self.assertEqual(board.age("2026-01-01T21:00:00Z", now=now), "3h")
+        self.assertEqual(board.age("2025-12-30T00:00:00Z", now=now), "3d")
+        self.assertEqual(board.age(None), "?")
+        self.assertEqual(board.age("not a timestamp"), "?")
+
+    def test_whitespace_only_item_text_never_raises_on_the_board(self):
+        from bossctl import board
+        self.assertEqual(board.first_line("   \n\n"), "(untitled)")
+        self.assertEqual(board.first_line("  real title \nsecond"), "real title")
+
+
 if __name__ == "__main__":
     unittest.main()
