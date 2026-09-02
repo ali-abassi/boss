@@ -107,12 +107,15 @@ def _list_models() -> set[str] | None:
     if not shutil.which("pi"):
         _LIST_MODELS_CACHE["ts"] = (now, None)
         return None
-    result = subprocess.run(["pi", "--list-models"], text=True, capture_output=True,
-                            stdin=subprocess.DEVNULL, timeout=30)
-    available: set[str] | None = None
-    if result.returncode == 0:
-        available = {f"{parts[0]}/{parts[1]}" for line in result.stdout.splitlines()
-                     if len(parts := line.split()) >= 2}
+    try:
+        result = subprocess.run(["pi", "--list-models"], text=True, capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None                     # a transient failure is never cached as "no models"
+    available = {f"{parts[0]}/{parts[1]}" for line in result.stdout.splitlines()
+                 if len(parts := line.split()) >= 2}
     _LIST_MODELS_CACHE["ts"] = (now, available)
     return available
 

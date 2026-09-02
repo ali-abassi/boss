@@ -1224,8 +1224,11 @@ def repair(*, confirm: bool, network: bool = True, auth_source: str | None = Non
         try:
             from . import supervisor
             supervisor.scan(probe_agents=False)
-        except (Exception, BossError):
-            pass
+        except (Exception, BossError) as exc:
+            # Repair still succeeded; a failed rebuild of derived observations is
+            # reported, never hidden behind a clean-looking receipt.
+            skipped.append({"action": "rebuild-observations",
+                            "skip": f"supervisor scan failed after repair: {getattr(exc, 'msg', None) or exc!r}"})
     return {"confirmed": True, "destructive": False, "applied": applied, "skipped": skipped,
             "post_audit": audit(network=network)}
 

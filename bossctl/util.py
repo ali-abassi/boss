@@ -155,18 +155,38 @@ def git_config(repo: Path | str, key: str) -> str:
     return local_config_value(repo, key)
 
 
+MAX_LOG_BYTES = 8 * 1024 * 1024   # rotate bossctl.log -> bossctl.log.1 past this size
+_LOG_FAILURE_REPORTED = False
+
+
+def _rotate_log(path: Path) -> None:
+    try:
+        if path.stat().st_size < MAX_LOG_BYTES:
+            return
+    except FileNotFoundError:
+        return
+    # One generation is enough: the durable audit trail lives in item history and
+    # the wake/planning ledgers; this file is the operator's tail.
+    os.replace(path, path.with_name(path.name + ".1"))
+
+
 def log(msg: str, *, console: bool = True) -> None:
+    global _LOG_FAILURE_REPORTED
     from .paths import log_file
     line = f"{now()} {msg}"
     try:
         private_mkdir(log_file().parent)
+        _rotate_log(log_file())
         flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
                  | getattr(os, "O_NOFOLLOW", 0))
         fd = os.open(log_file(), flags, 0o600)
         with os.fdopen(fd, "a") as fh:
             fh.write(line + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        # The console line still goes out; say once that the durable copy did not.
+        if not _LOG_FAILURE_REPORTED:
+            _LOG_FAILURE_REPORTED = True
+            print(f"bossctl: log file unavailable ({exc}); continuing without a durable log", file=sys.stderr)
     if console:
         print(line, file=sys.stderr)
 

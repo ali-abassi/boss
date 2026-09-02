@@ -81,6 +81,24 @@ class AwayTests(unittest.TestCase):
         self.assertFalse(result["enabled"])
         self.assertIn("disabled_at", result)
 
+    def test_disable_tolerates_routine_progress_while_away(self):
+        # Away mode exists so work progresses unattended: finished items change the
+        # doctor's ok/warning counts every time. Only new errors may lock the boss
+        # out of normal mode; count churn alone must never do so.
+        self.assertTrue(self.enable()["enabled"])
+        progressed = {**self.good_report, "summary": {"ok": 14, "errors": 0, "warnings_or_unknown": 3}}
+        with mock.patch("bossctl.doctor.audit", return_value=progressed):
+            result = supervisor.set_away(False)
+        self.assertFalse(result["enabled"])
+
+    def test_disable_reports_doctor_refusal_instead_of_crashing(self):
+        self.assertTrue(self.enable()["enabled"])
+        with mock.patch("bossctl.doctor.audit", side_effect=BossError("state home vanished")):
+            with self.assertRaises(BossError) as ctx:
+                supervisor.set_away(False)
+        self.assertIn("doctor re-verify failed: state home vanished", ctx.exception.msg)
+        self.assertTrue(supervisor.away_status()["enabled"])
+
     def test_disable_without_prior_evidence_succeeds(self):
         # First-time-off: there is no recorded gate_evidence. The re-verify path
         # must be a no-op, not a false refusal.

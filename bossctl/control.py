@@ -202,17 +202,6 @@ def complete_delivery(work_id: str, event_id: str, owner: str, input_sequence: i
     return cas_update(work_id, mutate)
 
 
-def abandon_delivery(work_id: str, event_id: str, owner: str) -> dict:
-    """Release only an unacknowledged reservation; accepted Pi input is reconciled on retry."""
-    def mutate(item):
-        event = next((value for value in item.setdefault("controls", {}).get("events", [])
-                      if value.get("id") == event_id), None)
-        if event and event.get("state") == "delivering" and event.get("delivery_owner") == owner:
-            event.update(state="pending", delivery_released_at=now())
-            event.pop("delivery_owner", None); event.pop("delivery_until_epoch", None)
-    return cas_update(work_id, mutate)
-
-
 def _allow(record: dict, keys: tuple[str, ...]) -> dict:
     return {key: record[key] for key in keys if key in record}
 

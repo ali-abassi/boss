@@ -39,12 +39,24 @@ def _pid_file(): return home() / "daemon.pid"
 def _pid_lock(): return home() / "daemon.lock"
 
 def _daemon_records_unlocked() -> list[object]:
+    """Worker identity records. Missing means no workers; unreadable never does.
+
+    Reading a damaged ledger as "no workers" would let `up` start a second team
+    against the same queue and let `down` report workers stopped that are not.
+    """
     try:
         raw = _pid_file().read_text().strip()
-        value = json.loads(raw)
-        return value if isinstance(value, list) else [value]
-    except (OSError, ValueError, json.JSONDecodeError):
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        raise BossError(f"worker ledger is unreadable: {_pid_file()} ({exc}); run `pi-boss doctor`") from None
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise BossError(f"worker ledger is malformed: {_pid_file()} ({exc}); run `pi-boss doctor`") from None
+    return value if isinstance(value, list) else [value]
 
 
 def _daemon_pids_unlocked() -> list[int]:
@@ -162,15 +174,17 @@ def cmd_status(a):
     counts = {}
     for i in items:
         counts[i["status"]] = counts.get(i["status"], 0) + 1
-    pid = daemon_pid()
-    from .util import read_json
-    tabs = read_json(home() / "herdr.json", {"tabs": []})["tabs"]
+    pids = daemon_pids()
+    tabs = herdr.remembered_tabs()
     from . import planning
-    data = {"workers": pid, "herdr_tabs": tabs, "projects": len(registry.load()["projects"]), "items": counts,
-            "supervisor": supervisor.summary(), "planning": planning.summary()}
+    projects = registry.load()["projects"]
+    data = {"workers": pids[0] if pids else None, "worker_count": len(pids), "herdr_tabs": tabs,
+            "projects": len(projects),
+            "projects_unavailable": sorted(p["id"] for p in projects.values() if not p.get("available", True)),
+            "items": counts, "supervisor": supervisor.summary(), "planning": planning.summary()}
     if a.json:
         return out(data, True)
-    print(board.render(pid))
+    print(board.render(pids))
 
 
 HARNESS = {
@@ -195,7 +209,12 @@ def _isolated_pi_home() -> Path:
     dst = pi_home()
     private_mkdir(dst)
     settings = dst / "settings.json"
-    current = json.loads(settings.read_text()) if settings.exists() else {}
+    try:
+        current = json.loads(settings.read_text()) if settings.exists() else {}
+    except (OSError, ValueError) as exc:
+        raise BossError(f"BOSS's Pi settings are unreadable: {settings} ({exc}); fix or move the file aside") from None
+    if not isinstance(current, dict):
+        raise BossError(f"BOSS's Pi settings are malformed: {settings}; fix or move the file aside")
     if "defaultModel" not in current:                      # seed once; the boss's later choices stick
         current.update(PI_HOME_SETTINGS)
         write_json(settings, current)
@@ -207,11 +226,18 @@ def _isolated_pi_home() -> Path:
     return dst
 
 
+TOOL_TIMEOUT = 30   # seconds a single Pi/Herdr control call may take on the launch path
+
+
 def codex_ready() -> bool:
     if not shutil.which("pi"):
         return False
-    r = subprocess.run(["pi", "auth", "check", "--provider", "openai-codex"], text=True, capture_output=True,
-                       env={**os.environ, "PI_CODING_AGENT_DIR": str(_isolated_pi_home())}, stdin=subprocess.DEVNULL)
+    try:
+        r = subprocess.run(["pi", "auth", "check", "--provider", "openai-codex"], text=True, capture_output=True,
+                           env={**os.environ, "PI_CODING_AGENT_DIR": str(_isolated_pi_home())},
+                           stdin=subprocess.DEVNULL, timeout=TOOL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise BossError(f"`pi auth check` did not answer within {TOOL_TIMEOUT}s; run `pi-boss doctor`") from None
     return r.stdout.strip() == "ready"
 
 
@@ -228,9 +254,15 @@ def cmd_setup(a):
             creds = None
         if creds:
             auth = dst / "auth.json"
-            current = json.loads(auth.read_text()) if auth.exists() else {}
+            try:
+                current = json.loads(auth.read_text()) if auth.exists() else {}
+            except (OSError, ValueError) as exc:
+                raise BossError(f"BOSS's auth.json is unreadable: {auth} ({exc}); move it aside and retry") from None
+            if not isinstance(current, dict):
+                raise BossError(f"BOSS's auth.json is malformed: {auth}; move it aside and retry")
             current["openai-codex"] = creds
-            auth.write_text(json.dumps(current, indent=2) + "\n"); auth.chmod(0o600)
+            with locked(dst / "auth.lock"):
+                write_json(auth, current)          # private temp file + atomic replace, never a truncate-then-chmod
             print(f"  ◆ reusing your Codex login from {src.parent}", file=sys.stderr)
         elif a.import_login:
             raise BossError(f"no openai-codex login found in {src}")
@@ -257,13 +289,18 @@ def cmd_launch(a):
         raise BossError("Herdr is required for persistent BOSS sessions; no non-persistent worker fallback is fabricated")
     session = a.session
     def call(*args):
-        return subprocess.run([binary, "--session", session, *args], text=True, capture_output=True, stdin=subprocess.DEVNULL)
+        try:
+            return subprocess.run([binary, "--session", session, *args], text=True, capture_output=True,
+                                  stdin=subprocess.DEVNULL, timeout=TOOL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise BossError(f"Herdr did not answer `{' '.join(args[:2])}` within {TOOL_TIMEOUT}s; "
+                            "check `herdr session list` and run `pi-boss doctor`") from None
     probe = call("workspace", "list")
     if probe.returncode and "server_not_running" in (probe.stderr or probe.stdout):
         home().mkdir(parents=True, exist_ok=True, mode=0o700)
-        logf = open(home() / "herdr-server.log", "ab")
-        subprocess.Popen([binary, "--session", session, "server"], stdin=subprocess.DEVNULL,
-                         stdout=logf, stderr=logf, start_new_session=True)
+        with open(home() / "herdr-server.log", "ab") as logf:
+            subprocess.Popen([binary, "--session", session, "server"], stdin=subprocess.DEVNULL,
+                             stdout=logf, stderr=logf, start_new_session=True)
         deadline = time.time() + 10
         while time.time() < deadline:
             time.sleep(0.1); probe = call("workspace", "list")
@@ -411,7 +448,8 @@ def cmd_projects(a):
     items = work.all_items()
     for p in ps.values():
         open_ = [i for i in items if i["project"] == p["id"] and i["status"] in work.OPEN]
-        print(f"{p['id']:<20} {p['mode']:<12} auth {p['authority']}  open {len(open_):<3} {p['path']}")
+        missing = "" if p.get("available", True) else "  !! path missing: not a Git checkout"
+        print(f"{p['id']:<20} {p['mode']:<12} auth {p['authority']}  open {len(open_):<3} {p['path']}{missing}")
 
 
 def _node_budget_args(token_specs=None, cost_specs=None, second_specs=None) -> dict:
@@ -617,17 +655,20 @@ def cmd_inbox(a):
     if not items:
         emit("nothing needs you")
     for i in items:
-        title = i["text"].splitlines()[0][:60]
+        title = board.first_line(i["text"])[:60]
+        # The item id and its age are what make a line actionable: the COO needs the id
+        # for respond/retry/promote, and Boss needs to see how long it has been waiting.
+        tag = f"{i['id']} · {board.age(i.get('updated') or i.get('created'))}"
         if i["status"] == "needs-you":
-            emit(f"[question]  {i['project']}: {title}\n            {(i.get('ask') or {}).get('question')}")
+            emit(f"[question]  {i['project']}: {title}  ({tag})\n            {(i.get('ask') or {}).get('question')}")
             if a.hints: emit(f"            → bossctl respond {i['id']} \"…\"")
         elif i["status"] == "failed":
             last = (i["failure_notes"] or [{}])[-1].get("notes", "")[:300].replace("\n", " ")
-            emit(f"[failed]    {i['project']}: {title}\n            {last}")
+            emit(f"[failed]    {i['project']}: {title}  ({tag})\n            {last}")
             if a.hints: emit(f"            → bossctl respond {i['id']} \"guidance\"  |  bossctl retry {i['id']}")
         else:
             what = i.get("pr_url") or f"branch {i['branch']}"
-            emit(f"[{i['status']}]{' ' * max(1, 11 - len(i['status']) - 2)}{i['project']}: {title}\n            {what} — say \"merge it\" to promote")
+            emit(f"[{i['status']}]{' ' * max(1, 11 - len(i['status']) - 2)}{i['project']}: {title}  ({tag})\n            {what} — say \"merge it\" to promote")
             if a.hints: emit(f"            → bossctl promote {i['id']} --confirm")
 
 

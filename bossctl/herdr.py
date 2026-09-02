@@ -234,8 +234,17 @@ def session_evidence(agent: dict) -> dict:
     try:
         with path.open() as handle:
             for line in handle:
+                if not line.strip():
+                    continue
                 try: event = json.loads(line)
-                except (json.JSONDecodeError, UnicodeError): continue
+                except (json.JSONDecodeError, UnicodeError):
+                    # Pi appends whole lines. A torn tail without its newline is a
+                    # write in progress and is simply not evidence yet; a complete
+                    # line that does not parse makes the totals unknowable, and
+                    # unknown usage must never read as under budget.
+                    if line.endswith("\n"):
+                        invalid_tokens = invalid_cost = True
+                    continue
                 if event.get("type") == "session" and event.get("id"):
                     evidence["agent_session_id"] = event["id"]
                 elif event.get("type") == "model_change":
@@ -535,18 +544,25 @@ def _durable_runtime_anchor(agent: dict) -> tuple[int, str | None]:
     session_id = agent.get("agent_session_id")
     launch_id = agent.get("launch_id")
     if work_id:
+        from . import ids
+        from .util import BossError
+        item_path = home() / "work" / ids.work(str(work_id)) / "item.json"
         try:
-            from . import ids
-            item = read_json(home() / "work" / ids.work(str(work_id)) / "item.json") or {}
-            session = item.get("session") or {}
-            if session.get("agent_session_id") == session_id:
-                candidates.append(session)
-            launch = next((entry for entry in item.get("agent_launches") or []
-                           if ((launch_id and entry.get("launch_id") == launch_id)
-                               or (not launch_id and entry.get("agent_session_id") == session_id))), None)
-            if launch: candidates.append(launch)
-        except (OSError, ValueError, TypeError):
-            pass
+            item = read_json(item_path) or {}
+        except (OSError, ValueError) as exc:
+            # An unreadable controller record must not silently disable the
+            # rollback check and leave the agent-supplied ledger as the only anchor.
+            raise BossError(f"controller-owned item state is unreadable: {item_path} ({exc})") from None
+        if not isinstance(item, dict):
+            raise BossError(f"controller-owned item state is malformed: {item_path}")
+        session = item.get("session") or {}
+        if isinstance(session, dict) and session.get("agent_session_id") == session_id:
+            candidates.append(session)
+        launch = next((entry for entry in item.get("agent_launches") or []
+                       if isinstance(entry, dict)
+                       and ((launch_id and entry.get("launch_id") == launch_id)
+                            or (not launch_id and entry.get("agent_session_id") == session_id))), None)
+        if launch: candidates.append(launch)
     strongest = (0, None)
     by_sequence: dict[int, str] = {}
     for record in candidates:
@@ -1275,7 +1291,10 @@ def wait_agent_monitored(target: str, timeout: int, monitor,
         time.sleep(0.2)
     try: stdout, stderr = proc.communicate(timeout=30)
     except subprocess.TimeoutExpired:
-        proc.terminate(); stdout, stderr = proc.communicate(timeout=5)
+        proc.terminate()
+        try: stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill(); stdout, stderr = proc.communicate()
     if finding or timed_out:
         finding = finding or {"control": "timeout", "reason": "Herdr turn reached its bounded wait"}
         try:
@@ -1445,16 +1464,36 @@ def notify(title: str, body: str = "") -> None:
 def _state_path() -> Path: return home() / "herdr.json"
 
 
+# Tabs whose close never proved out accumulate; doctor reports them, but the
+# registry itself must stay readable long before its schema bound trips.
+MAX_REMEMBERED_TABS = 500
+
+
+def _tab_state() -> dict:
+    st = read_json(_state_path(), {"tabs": []})
+    if not isinstance(st, dict) or not isinstance(st.get("tabs", []), list):
+        from .util import BossError
+        raise BossError(f"Herdr tab registry is malformed: {_state_path()}; run `pi-boss doctor`")
+    st.setdefault("tabs", [])
+    return st
+
+
+def remembered_tabs() -> list[dict]:
+    """Read-only view of the durable tab registry (status/board)."""
+    return list(_tab_state()["tabs"])
+
+
 def remember(kind: str, rec: dict) -> None:
     with locked(home() / "herdr.lock"):
-        st = read_json(_state_path(), {"tabs": []})
+        st = _tab_state()
         st["tabs"].append({"kind": kind, "herdr_session": os.environ.get("HERDR_SESSION"), **rec})
+        st["tabs"] = st["tabs"][-MAX_REMEMBERED_TABS:]
         write_json(_state_path(), st)
 
 
 def forget(tab_id: str) -> None:
     with locked(home() / "herdr.lock"):
-        st = read_json(_state_path(), {"tabs": []})
+        st = _tab_state()
         st["tabs"] = [t for t in st["tabs"] if t.get("tab_id") != tab_id]
         write_json(_state_path(), st)
 
