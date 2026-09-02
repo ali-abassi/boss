@@ -32,7 +32,10 @@ Both are derived from live process identity, not from the presence of `daemon.pi
 stale ledger entry whose process is gone is not counted.
 
 `projects_unavailable` lists registered projects whose recorded path no longer contains a
-`.git` entry. The registration is deliberately kept (restoring the path restores the
+`.git` entry. The underlying per-project `available` flag is derived by
+`registry.load(check_paths=True)`, which only the rendering/gating callers ask for
+(`status`, `projects`, the board); the daemon poll and queue claiming load the registry
+without stating any path, so a project on an unresponsive mount cannot block them. The registration is deliberately kept (restoring the path restores the
 project), but `bossctl task` refuses new work for those ids, `bossctl projects` marks the
 row, and the board prints a warning line. An empty list is the healthy case.
 

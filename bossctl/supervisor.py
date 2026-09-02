@@ -493,9 +493,8 @@ def set_away(enabled: bool) -> dict:
         if not enabled:
             with locked(supervisor_lock()):
                 state = _state()
-                # Re-verify the gate_evidence recorded at enable time. If anything in the
-                # environment that contributed to the gate has changed (worker identity
-                # drifted, doctor summary changed), refuse to silently re-enter normal mode.
+                # Re-verify the doctor audit recorded at enable time before re-entering
+                # normal mode. Only a rise in doctor `errors` refuses; see below.
                 prior = (state.get("away") or {})
                 recorded = prior.get("gate_evidence")
                 recorded_doctor = prior.get("doctor_summary") or {}
@@ -512,7 +511,7 @@ def set_away(enabled: bool) -> dict:
                         live_summary = live.get("summary") or {}
                         recorded_errors = int(recorded_doctor.get("errors") or 0)
                         if int(live_summary.get("errors") or 0) > recorded_errors:
-                            refusal = (f"doctor summary changed while away and is no longer healthy "
+                            refusal = (f"new doctor errors appeared while away "
                                        f"({recorded_doctor} -> {live_summary})")
                     except (Exception, BossError) as exc:
                         refusal = f"doctor re-verify failed: {getattr(exc, 'msg', None) or exc}"

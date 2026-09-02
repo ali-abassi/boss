@@ -4,10 +4,13 @@
 #   ./check.sh              every deterministic gate, then a read-only live report
 #   ./check.sh --fast       skip the full Python suite (the slow one, ~10 min)
 #
-# Part 1 runs exactly what CI runs, so a green scorecard here means a green
-# badge there. Part 2 reports the live control plane READ-ONLY: it never starts,
-# stops, repairs, or writes anything under ~/.boss, and never spends a model
-# token. The exit code is about the tree, not the environment: live findings
+# Part 1 runs the same gates CI runs (CI additionally installs the pinned runner
+# requirements and runs the suite verbosely), so a green scorecard here is a
+# strong predictor of a green badge there. Part 2 reports the live control plane
+# READ-ONLY: it starts nothing, stops nothing, repairs nothing, promotes nothing,
+# and spends no model tokens. It makes no state change beyond what reading takes
+# -- `bossctl status` takes the worker lock, so a first run on a fresh machine
+# creates ~/.boss and its lock file. The exit code is about the tree, not the environment: live findings
 # print as ACTION NEEDED and are counted in the last line, but only unreadable
 # control state (a corrupt ~/.boss, not merely an empty one) fails the run.
 #
@@ -77,10 +80,11 @@ say "BOSS check — deterministic gates first, live report second."
 say ""
 say "[1/2] Deterministic gates (what CI runs)"
 
+gate "SHELL SYNTAX" shell bash -n install.sh bin/pi-boss bin/pi-boss-quit check.sh
+
 if [ -z "$PYTHON" ]; then
   record "PYTHON GATES SKIPPED (no Python 3.10+ with cryptography; run install.sh)" skip
 else
-  gate "SHELL SYNTAX" shellcheck bash -n install.sh bin/pi-boss bin/pi-boss-quit check.sh
   gate "COMPILEALL" compileall "$PYTHON" -m compileall -q bossctl tests
   if [ "$FAST" -eq 1 ]; then
     record "PYTHON SUITE SKIPPED (--fast)" skip
@@ -111,7 +115,8 @@ LIVE_LINES=()
 if [ -z "$PYTHON" ]; then
   LIVE_LINES+=("LIVE STATE unavailable (no usable Python runtime)")
 else
-  BOSS_STATUS="$("$REPO_DIR/bin/bossctl" status --json 2>"$LOG_DIR/status.err")" || BOSS_STATUS=""
+  BOSS_STATUS="$(env -u HERDR_ENV -u HERDR_SESSION -u HERDR_WORKSPACE_ID -u HERDR_BIN \
+    "$REPO_DIR/bin/bossctl" status --json 2>"$LOG_DIR/status.err")" || BOSS_STATUS=""
   if [ -z "$BOSS_STATUS" ]; then
     LIVE_LINES+=("LIVE STATE unreadable (see $LOG_DIR/status.err)")
     OVERALL_PASS=false
@@ -147,9 +152,7 @@ if planning.get("enabled"):
     if [ "${#LIVE_LINES[@]}" -eq 0 ]; then
       LIVE_LINES+=("LIVE STATE could not be summarized (see $LOG_DIR/live.err)")
     fi
-    case "${LIVE_LINES[*]}" in
-      *"DEAD PATHS"*|*"SUPERVISOR unhealthy"*) LIVE_ACTIONS=$((LIVE_ACTIONS + 1)) ;;
-    esac
+    LIVE_ACTIONS=$(printf '%s\n' "${LIVE_LINES[@]}" | grep -Ec "DEAD PATHS|SUPERVISOR unhealthy") || LIVE_ACTIONS=0
   fi
 fi
 

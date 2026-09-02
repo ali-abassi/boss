@@ -2,7 +2,7 @@ try:
     import _gitenv  # noqa: F401  (git hygiene for temp repos)
 except ImportError:
     from tests import _gitenv  # noqa: F401
-import json, os, shlex, shutil, subprocess, tempfile, time, unittest
+import json, os, re, shlex, shutil, subprocess, tempfile, time, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -647,7 +647,9 @@ class BossctlTests(unittest.TestCase):
         out = self.bossctl("inbox").stdout
         self.assertIn(it["id"], out)
         self.assertIn("Which login flow do you mean?", out)
-        self.assertRegex(out, r"\(\S+ · \d+[smhd]\)")
+        # The separator is ASCII-escaped under TERM=dumb / BOSS_PLAIN=1, so match
+        # only what is stable: the id and the age.
+        self.assertRegex(out, rf"\({re.escape(it['id'])}.*\d+[smhd]\)")
 
     def test_projects_and_status_surface_a_missing_project_path(self):
         self.add(mode="local-only", test="true")

@@ -177,8 +177,8 @@ exhausted budgets, forge outages/rate limits, and restart recovery.
 ./check.sh --fast   # same, minus the slow suite
 ```
 
-`check.sh` runs exactly what CI runs and then describes the live control plane without
-touching it: live workers, open items, decisions waiting, registered projects, any
+`check.sh` runs the same gates CI runs and then describes the live control plane without
+changing it (it starts, stops, repairs and promotes nothing, and spends no tokens): live workers, open items, decisions waiting, registered projects, any
 registered path that is no longer a Git checkout, supervisor health, and away state. A
 gate that cannot run on your machine prints `SKIPPED` and is never counted as green. Run
 the gates individually if you prefer:

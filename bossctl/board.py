@@ -105,13 +105,15 @@ def header(width: int | None = None) -> str:
 
 
 MAX_BOARD_ROWS = 12
+# A whole unmounted volume must not push live work off the screen.
+MAX_WARNING_ROWS = 3
 
 
 def render(workers, width: int | None = None) -> str:
     """The board. `workers` is the list of positively live worker pids (a bare pid is tolerated)."""
     width = width or shutil.get_terminal_size((100, 30)).columns
     pids = list(workers) if isinstance(workers, (list, tuple)) else ([workers] if workers else [])
-    projects = registry.load()["projects"]
+    projects = registry.load(check_paths=True)["projects"]
     items = work.all_items()
     open_items = [i for i in items if i["status"] in work.OPEN]
     lines = []
@@ -119,8 +121,11 @@ def render(workers, width: int | None = None) -> str:
     separator = " | " if plain() else " · "
     lines.append(f"  projects  {len(projects)}" + ("   " + separator.join(f"{p['id']} [{p['mode']}/a{p['authority']}]" for p in list(projects.values())[:6]) if projects else '   none yet - say: "add ~/code/my-repo"'))
     missing = [p for p in projects.values() if not p.get("available", True)]
-    for p in missing:
-        lines.append(f"  {'!!' if plain() else '⚠'} {p['id']}: path missing - {p['path']} is not a Git checkout; new work is refused")
+    for p in missing[:MAX_WARNING_ROWS]:
+        where = p.get("path") or "(no path recorded)"
+        lines.append(f"  {'!!' if plain() else '⚠'} {p.get('id', '?')}: path missing - {where} is not a Git checkout; new work is refused")
+    if len(missing) > MAX_WARNING_ROWS:
+        lines.append(f"  ... and {len(missing) - MAX_WARNING_ROWS} more project(s) with a missing path (bossctl projects)")
     needs = [i for i in items if i["status"] in ("needs-you", "failed", "ready", "pr-open")]
     questions = sum(i["status"] == "needs-you" for i in needs)
     ready = sum(i["status"] in ("ready", "pr-open") for i in needs)

@@ -23,19 +23,29 @@ def available(project: dict) -> bool:
     return bool(project.get("path")) and path.is_dir() and (path / ".git").exists()
 
 
-def load() -> dict:
+def load(*, check_paths: bool = False) -> dict:
+    """The registry. `check_paths` stats each project to derive `available`.
+
+    The stat is opt-in because `load` runs inside the daemon poll, the 2s board
+    redraw, and per-candidate queue claiming: a project on an unresponsive network
+    mount must not be able to block those. Callers that render or gate on
+    availability ask for it; `require_available` derives it for one project instead.
+    """
     try:
         data = read_json(projects_file(), {"projects": {}})
     except (OSError, ValueError) as exc:
         raise BossError(f"project registry is unreadable: {projects_file()} ({exc}); "
-                        "run `pi-boss doctor`") from None
+                        "run `pi-boss doctor --repair --confirm`") from None
     if not isinstance(data, dict) or not isinstance(data.get("projects", {}), dict):
-        raise BossError(f"project registry is malformed: {projects_file()}; run `pi-boss doctor`")
+        raise BossError(f"project registry is malformed: {projects_file()}; run `pi-boss doctor --repair --confirm`")
     data.setdefault("projects", {})
+    if not all(isinstance(value, dict) for value in data["projects"].values()):
+        raise BossError(f"project registry has a malformed entry: {projects_file()}; run `pi-boss doctor --repair --confirm`")
     for project in data["projects"].values():
         project["mode"] = modes.normalize(project.get("mode"))
         project.setdefault("gate", "native")
-        project["available"] = available(project)
+        if check_paths:
+            project["available"] = available(project)
     return data
 
 

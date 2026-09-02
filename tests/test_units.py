@@ -416,10 +416,10 @@ class BoardRenderTests(Isolated):
              mock.patch("bossctl.supervisor.summary", return_value={"away": False, "pending_wakes": 0}), \
              mock.patch.dict(os.environ, {"TERM": "dumb", "BOSS_PLAIN": "1"}):
             for width in (24, 52, 80):
-                rendered = board.header(width) + board.render(123, width)
+                rendered = board.header(width) + board.render([123], width)
                 self.assertTrue(all(board.cell_width(line) <= width - 1 for line in rendered.splitlines()), width)
                 self.assertTrue(all(ord(char) < 128 for char in board.header(width)), width)
-            maximum = board.render(123, 100)
+            maximum = board.render([123], 100)
             self.assertEqual(sum("investigate" in line for line in maximum.splitlines()), 12)
             self.assertTrue(all(board.cell_width(line) <= 99 for line in maximum.splitlines()))
             self.assertNotIn("超", maximum)
@@ -429,10 +429,14 @@ class BoardRenderTests(Isolated):
     def test_continuous_watch_has_no_cursor_controls_in_plain_or_no_color_modes(self):
         from unittest import mock
         from bossctl import board
-        for env in ({"TERM": "dumb", "BOSS_PLAIN": "1"}, {"TERM": "xterm-256color", "NO_COLOR": "1"}):
+        # BOSS_HOME must survive `clear=True`, and the patched name must be the one
+        # board.watch actually calls: otherwise this test reads (and locks) the
+        # developer's real ~/.boss and probes their live worker pids.
+        for env in ({"TERM": "dumb", "BOSS_PLAIN": "1", "BOSS_HOME": str(self.home)},
+                    {"TERM": "xterm-256color", "NO_COLOR": "1", "BOSS_HOME": str(self.home)}):
             stream = io.StringIO()
             with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True), \
-                 mock.patch("bossctl.cli.daemon_pid", return_value=None), \
+                 mock.patch("bossctl.cli.daemon_pids", return_value=[]), \
                  mock.patch("bossctl.board.time.sleep", side_effect=KeyboardInterrupt), \
                  contextlib.redirect_stdout(stream):
                 with self.assertRaises(KeyboardInterrupt):
@@ -705,6 +709,10 @@ class FailClosedStateTests(Isolated):
         with self.assertRaises(BossError) as ctx:
             registry.load()
         self.assertIn("malformed", ctx.exception.msg)
+        projects_file().write_text("{\"projects\": {\"p\": 1}}")
+        with self.assertRaises(BossError) as ctx:
+            registry.load()
+        self.assertIn("malformed entry", ctx.exception.msg)
         projects_file().write_text("{oops")
         with self.assertRaises(BossError):
             registry.load()
@@ -768,7 +776,10 @@ class TabRegistryTests(Isolated):
     def test_remembered_tabs_are_bounded_and_malformed_state_fails_closed(self):
         from bossctl import herdr
         from bossctl.util import BossError
-        for n in range(herdr.MAX_REMEMBERED_TABS + 25):
+        from bossctl.util import write_json
+        write_json(self.home / "herdr.json", {"tabs": [
+            {"kind": "worker", "tab_id": f"t{n}"} for n in range(herdr.MAX_REMEMBERED_TABS)]})
+        for n in range(herdr.MAX_REMEMBERED_TABS, herdr.MAX_REMEMBERED_TABS + 25):
             herdr.remember("worker", {"tab_id": f"t{n}"})
         tabs = herdr.remembered_tabs()
         self.assertEqual(len(tabs), herdr.MAX_REMEMBERED_TABS)
@@ -787,14 +798,16 @@ class DeadProjectPathTests(Isolated):
         write_json(projects_file(), {"projects": {"p": {
             "id": "p", "path": str(gone), "mode": "local-only", "authority": 1,
             "base": "main", "test_cmd": "true", "protected_paths": [], "gate": "native"}}})
-        loaded = registry.load()["projects"]["p"]
+        loaded = registry.load(check_paths=True)["projects"]["p"]
         self.assertFalse(loaded["available"])
+        # The stat is opt-in: the daemon-poll path must not pay for it.
+        self.assertNotIn("available", registry.load()["projects"]["p"])
         with self.assertRaises(BossError) as ctx:
             work.create("p", "do something", "ship", [], 3, None, None, None, None, None, None, None)
         self.assertIn("no longer a Git checkout", ctx.exception.msg)
         # The registration survives: restoring the checkout restores the project.
         gone.mkdir(parents=True); (gone / ".git").mkdir()
-        self.assertTrue(registry.load()["projects"]["p"]["available"])
+        self.assertTrue(registry.load(check_paths=True)["projects"]["p"]["available"])
         # The derived flag is never written back into the durable registry.
         registry.set_fields("p", authority=2)
         self.assertNotIn("available", json.loads(projects_file().read_text())["projects"]["p"])
@@ -847,15 +860,49 @@ class CheckScriptTests(unittest.TestCase):
         rejected = subprocess.run([str(script), "--nope"], text=True, capture_output=True)
         self.assertEqual(rejected.returncode, 2)
 
-    def test_gates_strip_herdr_coordinates_and_skips_are_never_reported_as_passes(self):
-        # The suite starts real Herdr agents when it can see a live session; check.sh
-        # must strip those coordinates from every gate it runs (see the incident note
-        # in the script header). bash 3.2 is the macOS system shell: no mapfile.
-        body = (REPO / "check.sh").read_text()
-        self.assertIn("env -u HERDR_ENV -u HERDR_SESSION -u HERDR_WORKSPACE_ID -u HERDR_BIN", body)
-        self.assertNotIn("mapfile -t", body, "mapfile does not exist in bash 3.2")
-        self.assertIn("SKIPPED", body)
-        self.assertIn("not proven, just not run", body)
+    def test_a_gate_never_sees_the_callers_herdr_session(self):
+        # The suite starts real Herdr agents when it can see a live session, and once
+        # did exactly that against a working session. Prove the stripping behaviourally:
+        # a gate that prints its own environment must not receive the poisoned values.
+        script = REPO / "check.sh"
+        body = script.read_text()
+        self.assertIn("env -u HERDR_ENV", body)
+        harness = Path(tempfile.mkdtemp()) / "probe.sh"
+        # Reuse check.sh's own gate() definition rather than a copy of it.
+        gate_src = body[body.index("gate() {"):body.index("# ------------------------------------------------------------------ runtime --")]
+        harness.write_text(
+            "set -u\n"
+            'LOG_DIR="$1"\n'
+            "RESULTS=()\n"
+            "OVERALL_PASS=true\n"
+            "SKIPPED=0\n"
+            "say() { :; }\n"
+            "record() { :; }\n"
+            + gate_src +
+            '\ngate "PROBE" probe sh -c \'env | grep -c HERDR_ || true\'\n'
+        )
+        log_dir = harness.parent
+        result = subprocess.run(["bash", str(harness), str(log_dir)], text=True, capture_output=True,
+                                env={**os.environ, "HERDR_ENV": "1", "HERDR_SESSION": "poison",
+                                     "HERDR_WORKSPACE_ID": "poison", "PATH": os.environ.get("PATH", "")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((log_dir / "probe.log").read_text().strip(), "0",
+                         "a gate saw HERDR_* coordinates from the caller")
+
+    def test_a_skipped_gate_is_never_reported_as_a_pass(self):
+        # With no bun on PATH the bun gates must print SKIPPED, and the final line
+        # must not claim an unqualified pass.
+        empty_bin = Path(tempfile.mkdtemp())
+        for tool in ("bash", "git", "python3", "sh", "env", "grep", "sed", "tail", "awk", "mktemp", "printf"):
+            source = shutil.which(tool)
+            if source:
+                (empty_bin / tool).symlink_to(source)
+        result = subprocess.run([str(REPO / "check.sh"), "--fast"], text=True, capture_output=True,
+                                env={**os.environ, "PATH": str(empty_bin)})
+        self.assertIn("SKIPPED", result.stdout)
+        self.assertNotIn("ALL GATES PASSED.", result.stdout)
+        if "ALL RUNNABLE GATES PASSED" in result.stdout:
+            self.assertIn("not proven, just not run", result.stdout)
 
 
 if __name__ == "__main__":

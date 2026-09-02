@@ -49,13 +49,13 @@ def _daemon_records_unlocked() -> list[object]:
     except FileNotFoundError:
         return []
     except OSError as exc:
-        raise BossError(f"worker ledger is unreadable: {_pid_file()} ({exc}); run `pi-boss doctor`") from None
+        raise BossError(f"worker ledger is unreadable: {_pid_file()} ({exc}); run `pi-boss doctor --repair --confirm`") from None
     if not raw:
         return []
     try:
         value = json.loads(raw)
     except ValueError as exc:
-        raise BossError(f"worker ledger is malformed: {_pid_file()} ({exc}); run `pi-boss doctor`") from None
+        raise BossError(f"worker ledger is malformed: {_pid_file()} ({exc}); run `pi-boss doctor --repair --confirm`") from None
     return value if isinstance(value, list) else [value]
 
 
@@ -132,7 +132,18 @@ def _up_herdr(a):
 def cmd_down(a):
     closed = herdr.close_all() if (home() / "herdr.json").exists() else 0
     with locked(_pid_lock()):
-        records = _daemon_records_unlocked()
+        try:
+            records = _daemon_records_unlocked()
+        except BossError:
+            # Shutdown must never become a dead end. The cause has already been
+            # reported by name; we cannot prove which processes are ours, so we
+            # signal nothing and delete nothing, and name the command that rebuilds
+            # the ledger rather than leaving the boss with no route.
+            if a.json:
+                out({"stopped": False, "ledger": "unreadable", "tabs_closed": closed}, True)
+            raise BossError("no worker identity could be signalled from that ledger; any running "
+                            "workers were left alone. Rebuild it with `pi-boss doctor --repair "
+                            "--confirm`, then re-run.")
         signalled, remaining = [], []
         for record in records:
             evidence = processes.probe(record)
@@ -177,7 +188,7 @@ def cmd_status(a):
     pids = daemon_pids()
     tabs = herdr.remembered_tabs()
     from . import planning
-    projects = registry.load()["projects"]
+    projects = registry.load(check_paths=True)["projects"]
     data = {"workers": pids[0] if pids else None, "worker_count": len(pids), "herdr_tabs": tabs,
             "projects": len(projects),
             "projects_unavailable": sorted(p["id"] for p in projects.values() if not p.get("available", True)),
@@ -442,7 +453,7 @@ def cmd_set(a):
 
 
 def cmd_projects(a):
-    ps = registry.load()["projects"]
+    ps = registry.load(check_paths=True)["projects"]
     if a.json:
         return out(ps, True)
     items = work.all_items()

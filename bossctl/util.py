@@ -165,9 +165,18 @@ def _rotate_log(path: Path) -> None:
             return
     except FileNotFoundError:
         return
-    # One generation is enough: the durable audit trail lives in item history and
-    # the wake/planning ledgers; this file is the operator's tail.
-    os.replace(path, path.with_name(path.name + ".1"))
+    # Every worker logs to this file. Without the lock two of them can both see an
+    # oversized log and rotate in turn, and the second rename overwrites the first
+    # generation with a one-line file -- losing the whole trail instead of half of it.
+    with locked(path.with_name(path.name + ".rotate.lock")):
+        try:
+            if path.stat().st_size < MAX_LOG_BYTES:
+                return                      # somebody else rotated while we waited
+        except FileNotFoundError:
+            return
+        # One generation is enough: the durable audit trail lives in item history and
+        # the wake/planning ledgers; this file is the operator's tail.
+        os.replace(path, path.with_name(path.name + ".1"))
 
 
 def log(msg: str, *, console: bool = True) -> None:

@@ -418,7 +418,8 @@ def load(work_id: str) -> dict:
     try:
         it = read_json(item_path(work_id))
     except (OSError, ValueError) as exc:
-        raise BossError(f"work item state is unreadable: {item_path(work_id)} ({exc}); run `pi-boss doctor`") from None
+        raise BossError(f"work item state is unreadable: {item_path(work_id)} ({exc}); "
+                        "run `pi-boss doctor --repair --confirm`") from None
     if not it:
         raise BossError(f"unknown work item '{work_id}'")
     if it.get("id") != work_id:
@@ -461,8 +462,10 @@ def transition(it: dict, status: str, note: str = "") -> None:
 def all_items() -> list[dict]:
     """Every durable work item. An unreadable item record fails closed by name.
 
-    One corrupt `item.json` must never silently vanish from `/ops`, the inbox, the
-    supervisor, or the shutdown guard: the caller gets a `BossError` naming the file.
+    One corrupt `item.json` used to raise a bare `JSONDecodeError` out of every caller
+    -- `/ops`, the inbox, the supervisor, the shutdown guard -- as a raw traceback that
+    named no file. The caller now gets a `BossError` naming the exact item and the
+    command that repairs it.
     """
     out = []
     if work_root().is_dir():
@@ -471,7 +474,7 @@ def all_items() -> list[dict]:
                 it = read_json(d / "item.json")
             except (OSError, ValueError) as exc:
                 raise BossError(f"work item state is unreadable: {d / 'item.json'} ({exc}); "
-                                "run `pi-boss doctor`") from None
+                                "run `pi-boss doctor --repair --confirm`") from None
             if it:
                 if not ids.WORK_PATTERN.fullmatch(d.name) or d.name != it.get("id"):
                     continue
