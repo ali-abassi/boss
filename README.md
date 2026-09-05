@@ -268,7 +268,7 @@ git diff --check
 ```
 
 GitHub Actions runs the full deterministic suite on Ubuntu and macOS with Python 3.10 and 3.13.
-The badge at the top is the current default-branch receipt; this README intentionally avoids a
+Check the repository’s GitHub Actions for current default-branch results. This README avoids a
 test-count claim that will go stale.
 
 - [COO prompt contract and evaluation set](docs/boss-prompt-contract.md)
